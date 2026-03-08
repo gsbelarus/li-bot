@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LinkedIn Visit Logger Options</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="panel">
+      <h1>LinkedIn Visit Logger</h1>
+      <p>Set the backend URL that receives session and visit logs.</p>
+      <label for="backendBaseUrl">Backend base URL</label>
+      <input id="backendBaseUrl" type="url" placeholder="http://localhost:3000" />
+      <button id="saveButton" type="button">Save</button>
+      <p id="statusMessage" class="status" aria-live="polite"></p>
+    </main>
+    <script src="options.js"></script>
+  </body>
+</html>

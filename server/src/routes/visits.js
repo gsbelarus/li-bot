@@ -1,0 +1,60 @@
+const express = require("express");
+const Visit = require("../models/Visit");
+const ExtensionSession = require("../models/ExtensionSession");
+
+const router = express.Router();
+
+router.post("/", async (req, res, next) => {
+  try {
+    const {
+      sessionId,
+      url,
+      title,
+      startedAt,
+      endedAt,
+      durationMs,
+      actions,
+      scrollCount,
+      maxScrollY,
+    } = req.body;
+
+    if (!sessionId || !url || !startedAt || !endedAt || typeof durationMs !== "number") {
+      return res.status(400).json({
+        error: "sessionId, url, startedAt, endedAt, and durationMs are required.",
+      });
+    }
+
+    const session = await ExtensionSession.findById(sessionId);
+
+    if (!session) {
+      return res.status(404).json({ error: "Session not found." });
+    }
+
+    const visit = await Visit.create({
+      sessionId,
+      url,
+      title,
+      startedAt: new Date(startedAt),
+      endedAt: new Date(endedAt),
+      durationMs,
+      actions: Array.isArray(actions) ? actions : [],
+      scrollCount: Number(scrollCount || 0),
+      maxScrollY: Number(maxScrollY || 0),
+    });
+
+    return res.status(201).json(visit);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.get("/", async (_req, res, next) => {
+  try {
+    const visits = await Visit.find().sort({ startedAt: -1 }).limit(100);
+    res.json(visits);
+  } catch (error) {
+    next(error);
+  }
+});
+
+module.exports = router;
