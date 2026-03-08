@@ -14,6 +14,7 @@ router.post("/", async (req, res, next) => {
       endedAt,
       durationMs,
       actions,
+      postVisits,
       scrollCount,
       maxScrollY,
     } = req.body;
@@ -38,6 +39,17 @@ router.post("/", async (req, res, next) => {
       endedAt: new Date(endedAt),
       durationMs,
       actions: Array.isArray(actions) ? actions : [],
+      postVisits: Array.isArray(postVisits)
+        ? postVisits
+            .filter((postVisit) => postVisit && postVisit.clickedAt)
+            .map((postVisit) => ({
+              url: typeof postVisit.url === "string" ? postVisit.url : undefined,
+              postUrn: typeof postVisit.postUrn === "string" ? postVisit.postUrn : undefined,
+              textPreview:
+                typeof postVisit.textPreview === "string" ? postVisit.textPreview : undefined,
+              clickedAt: new Date(postVisit.clickedAt),
+            }))
+        : [],
       scrollCount: Number(scrollCount || 0),
       maxScrollY: Number(maxScrollY || 0),
     });

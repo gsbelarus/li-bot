@@ -1,5 +1,32 @@
 const mongoose = require("mongoose");
 
+const postVisitSchema = new mongoose.Schema(
+  {
+    url: {
+      type: String,
+      required: false,
+      trim: true,
+    },
+    postUrn: {
+      type: String,
+      required: false,
+      trim: true,
+    },
+    textPreview: {
+      type: String,
+      required: false,
+      trim: true,
+    },
+    clickedAt: {
+      type: Date,
+      required: true,
+    },
+  },
+  {
+    _id: false,
+  }
+);
+
 const visitSchema = new mongoose.Schema(
   {
     sessionId: {
@@ -33,6 +60,10 @@ const visitSchema = new mongoose.Schema(
     },
     actions: {
       type: [String],
+      default: [],
+    },
+    postVisits: {
+      type: [postVisitSchema],
       default: [],
     },
     scrollCount: {

@@ -30,6 +30,7 @@ Each visit record includes:
 - visit end time
 - time spent on page in milliseconds
 - actions taken
+- posts opened from the current profile page
 - scroll metrics
 
 ## 1. Backend setup
@@ -98,7 +99,7 @@ You should see a JSON response showing the API is up.
 2. Go to `chrome://extensions`.
 3. Turn on `Developer mode`.
 4. Click `Load unpacked`.
-5. Select the [extension](C:/Users/gs199/Documents/Playground/extension) folder.
+5. Select the `extension` folder from this repository.
 6. Open the extension details page and then `Extension options`.
 
 ### Configure the backend URL
@@ -128,6 +129,7 @@ While monitoring is enabled, the extension watches your actual LinkedIn navigati
 - time spent on each profile page
 - scroll count and max scroll position
 - click actions on buttons, links, and form controls
+- post opens when you click a post card's `...more`, `…more`, or `See more` control on a profile page
 
 ### Stop monitoring
 
@@ -136,7 +138,21 @@ While monitoring is enabled, the extension watches your actual LinkedIn navigati
 
 The extension then closes the backend session.
 
-## 4. Backend API
+## 4. Updating the Chrome extension after changes
+
+When you change files inside `extension`:
+
+1. Open `chrome://extensions`.
+2. Make sure `Developer mode` is enabled.
+3. Find `LinkedIn Visit Logger`.
+4. Click `Reload`.
+5. Refresh any open LinkedIn tabs so the updated content script is loaded.
+
+If you changed the background script or options page, re-open the options page or click the toolbar button again after reloading.
+
+If Chrome loses the unpacked extension reference, remove the old entry and use `Load unpacked` again with this repository's `extension` folder.
+
+## 5. Backend API
 
 ### `GET /api/health`
 
@@ -176,13 +192,21 @@ Example body:
     "click:button:Connect",
     "scroll:900"
   ],
+  "postVisits": [
+    {
+      "url": "https://www.linkedin.com/feed/update/urn:li:activity:123/",
+      "postUrn": "urn:li:activity:123",
+      "textPreview": "Sample post preview",
+      "clickedAt": "2026-03-08T15:02:10.000Z"
+    }
+  ],
   "scrollCount": 5,
   "maxScrollY": 1800,
   "title": "Example Person | LinkedIn"
 }
 ```
 
-## 5. Open Claw note
+## 6. Open Claw note
 
 Open Claw already ships its own Chrome extension relay for Chrome Extension Mode. If you want the agent to control a tab through Open Claw, use the official install flow from the docs:
 
@@ -191,6 +215,6 @@ Open Claw already ships its own Chrome extension relay for Chrome Extension Mode
 
 This repository's extension is separate and focused on visit logging to your own backend.
 
-## 6. Important limitation
+## 7. Important limitation
 
 This project is designed for user-driven browsing analytics. It does not automatically visit LinkedIn profiles, simulate dwell time, or perform automated friend traversal.

@@ -25,6 +25,7 @@
       title: document.title,
       startedAt: nowIso(),
       actions: [],
+      postVisits: [],
       scrollCount: 0,
       maxScrollY: window.scrollY || 0,
     };
@@ -79,6 +80,82 @@
     }
   }
 
+  function addPostVisit(postVisit) {
+    if (!state.currentVisit) {
+      return;
+    }
+
+    state.currentVisit.postVisits.push(postVisit);
+    if (state.currentVisit.postVisits.length > 50) {
+      state.currentVisit.postVisits = state.currentVisit.postVisits.slice(-50);
+    }
+  }
+
+  function normalizeText(value) {
+    return (value || "").replace(/\s+/g, " ").trim();
+  }
+
+  function isPostMoreTrigger(target) {
+    if (!target) {
+      return false;
+    }
+
+    const label = normalizeText(
+      target.innerText ||
+        target.getAttribute("aria-label") ||
+        target.getAttribute("aria-expanded") ||
+        ""
+    ).toLowerCase();
+
+    if (!label) {
+      return false;
+    }
+
+    return (
+      label === "more" ||
+      label === "...more" ||
+      label === "…more" ||
+      label === "see more"
+    );
+  }
+
+  function extractPostVisit(target) {
+    const container = target.closest(
+      "article, .feed-shared-update-v2, .occludable-update, .fie-impression-container, [data-urn]"
+    );
+
+    if (!container) {
+      return null;
+    }
+
+    const postLink = Array.from(container.querySelectorAll("a[href]")).find((link) => {
+      const href = link.href || "";
+      return (
+        href.includes("/feed/update/") ||
+        href.includes("/posts/") ||
+        href.includes("/activity-")
+      );
+    });
+
+    const postUrn =
+      container.getAttribute("data-urn") ||
+      container.querySelector("[data-urn]")?.getAttribute("data-urn") ||
+      null;
+
+    const textPreview = normalizeText(container.innerText).slice(0, 280);
+
+    if (!postLink && !postUrn && !textPreview) {
+      return null;
+    }
+
+    return {
+      url: postLink?.href || null,
+      postUrn,
+      textPreview,
+      clickedAt: nowIso(),
+    };
+  }
+
   window.addEventListener(
     "scroll",
     () => {
@@ -114,6 +191,13 @@
         "unlabeled";
 
       addAction(`click:${tag}:${label.slice(0, 80)}`);
+
+      if (isPostMoreTrigger(target)) {
+        const postVisit = extractPostVisit(target);
+        if (postVisit) {
+          addPostVisit(postVisit);
+        }
+      }
     },
     true
   );
