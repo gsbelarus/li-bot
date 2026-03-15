@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 
 import type { ScriptInstructions, ScriptStep } from "./script-contract.js";
 
@@ -64,7 +64,7 @@ export class OpenClawRuntime {
     return this.runScript(script, targetId);
   }
 
-  private oc(args: string[], { json = false }: { json?: boolean } = {}) {
+  private async oc(args: string[], { json = false }: { json?: boolean } = {}) {
     const fullArgs = ["browser", "--browser-profile", this.browserProfile];
 
     if (this.gatewayUrl) {
@@ -87,20 +87,41 @@ export class OpenClawRuntime {
         ? ["/d", "/s", "/c", this.openClawBin, ...fullArgs]
         : fullArgs;
 
-    const result = spawnSync(command, commandArgs, {
-      encoding: "utf8",
+    const stdoutChunks: string[] = [];
+    const stderrChunks: string[] = [];
+
+    const child = spawn(command, commandArgs, {
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
     });
 
-    if (result.error) {
-      throw result.error;
-    }
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
 
-    if (result.status !== 0) {
-      throw new Error((result.stderr || result.stdout || `OpenClaw exited with code ${result.status}.`).trim());
-    }
+    child.stdout.on("data", (chunk: string) => {
+      stdoutChunks.push(chunk);
+    });
 
-    const stdout = (result.stdout || "").trim();
+    child.stderr.on("data", (chunk: string) => {
+      stderrChunks.push(chunk);
+    });
+
+    const exitCode = await new Promise<number>((resolve, reject) => {
+      child.once("error", (error) => {
+        reject(error);
+      });
+
+      child.once("close", (code) => {
+        resolve(code ?? 0);
+      });
+    });
+
+    const stdout = stdoutChunks.join("").trim();
+    const stderr = stderrChunks.join("").trim();
+
+    if (exitCode !== 0) {
+      throw new Error((stderr || stdout || `OpenClaw exited with code ${exitCode}.`).trim());
+    }
 
     if (!json) {
       return stdout;
@@ -109,8 +130,8 @@ export class OpenClawRuntime {
     return stdout ? JSON.parse(stdout) : null;
   }
 
-  private getFocusedTab() {
-    const tabs = this.oc(["tabs"], { json: true });
+  private async getFocusedTab() {
+    const tabs = await this.oc(["tabs"], { json: true });
     const list = Array.isArray(tabs) ? tabs : tabs?.tabs || tabs?.items || [];
 
     if (!Array.isArray(list) || list.length === 0) {
@@ -131,12 +152,14 @@ export class OpenClawRuntime {
     };
   }
 
-  private evaluate(targetId: string, expression: string) {
-    return parseJsonish(this.oc(["evaluate", "--fn", expression, "--target-id", targetId], { json: true }));
+  private async evaluate(targetId: string, expression: string) {
+    return parseJsonish(
+      await this.oc(["evaluate", "--fn", expression, "--target-id", targetId], { json: true })
+    );
   }
 
-  private getPageState(targetId: string) {
-    return this.evaluate(
+  private async getPageState(targetId: string) {
+    return await this.evaluate(
       targetId,
       `() => ({ url: window.location.href, title: document.title, readyState: document.readyState, scrollY: window.scrollY })`
     ) as {
@@ -155,7 +178,7 @@ export class OpenClawRuntime {
     const deadline = Date.now() + timeoutMs;
 
     while (Date.now() <= deadline) {
-      const pageState = this.getPageState(targetId);
+      const pageState = await this.getPageState(targetId);
       const readyMatches = !readyState || pageState.readyState === readyState;
       const includesMatches = !urlIncludes || pageState.url.includes(urlIncludes);
       const equalsMatches = !urlEquals || pageState.url === urlEquals;
@@ -170,7 +193,7 @@ export class OpenClawRuntime {
     throw new Error(`Timed out waiting for page state for step ${step.order}.`);
   }
 
-  private runDomAction(targetId: string, step: ScriptStep) {
+  private async runDomAction(targetId: string, step: ScriptStep) {
     const payload = JSON.stringify({
       action: step.kind,
       target: step.target,
@@ -178,7 +201,7 @@ export class OpenClawRuntime {
       instruction: step.instruction,
     });
 
-    return this.evaluate(
+    return await this.evaluate(
       targetId,
       `() => {
         const payload = ${payload};
@@ -375,7 +398,7 @@ export class OpenClawRuntime {
     if (step.kind === "wait_for_page") {
       output = await this.waitForPage(targetId, step);
     } else {
-      output = this.runDomAction(targetId, step);
+      output = await this.runDomAction(targetId, step);
       if (
         typeof output === "object" &&
         output !== null &&
@@ -400,7 +423,7 @@ export class OpenClawRuntime {
   }
 
   private async runScript(script: ScriptInstructions, targetId?: string) {
-    const activeTargetId = targetId || this.getFocusedTab().id;
+    const activeTargetId = targetId || (await this.getFocusedTab()).id;
     const startedAt = new Date().toISOString();
     const stepResults: StepExecutionRecord[] = [];
 
@@ -420,7 +443,7 @@ export class OpenClawRuntime {
       targetId: activeTargetId,
       startedAt,
       finishedAt: new Date().toISOString(),
-      currentPage: this.getPageState(activeTargetId),
+      currentPage: await this.getPageState(activeTargetId),
       steps: stepResults,
     };
   }

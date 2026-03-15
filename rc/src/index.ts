@@ -2,15 +2,15 @@ import express, { type NextFunction, type Request, type Response } from "express
 
 import { log, serializeError } from "./logger.js";
 import { OpenClawRuntime } from "./openclaw.js";
-import {
-  validateExecuteScriptCommandPayload,
-  type ExecuteScriptCommandPayload,
-} from "./script-contract.js";
+import { validateExecuteScriptCommandPayload } from "./script-contract.js";
 import { TaskQueue } from "./task-queue.js";
 
 const port = Number(process.env.PORT || 3100);
 const remoteControllerSecretKey = process.env.REMOTE_CONTROLLER_SECRET_KEY || "";
 const controllerVersion = process.env.npm_package_version || "0.1.0";
+const maxRetainedTasks = Number(process.env.REMOTE_CONTROLLER_MAX_RETAINED_TASKS || 200);
+const finishedTaskTtlMs = Number(process.env.REMOTE_CONTROLLER_FINISHED_TASK_TTL_MS || 6 * 60 * 60 * 1000);
+const taskCleanupIntervalMs = Number(process.env.REMOTE_CONTROLLER_TASK_CLEANUP_INTERVAL_MS || 5 * 60 * 1000);
 
 if (!remoteControllerSecretKey) {
   throw new Error("REMOTE_CONTROLLER_SECRET_KEY must be configured.");
@@ -19,7 +19,28 @@ if (!remoteControllerSecretKey) {
 const runtime = new OpenClawRuntime();
 const queue = new TaskQueue(async (task) => {
   return runtime.executeScript(task.input.script, task.input.targetId);
+}, {
+  maxRetainedTasks,
+  finishedTaskTtlMs,
+  cleanupIntervalMs: taskCleanupIntervalMs,
 });
+
+class RequestValidationError extends Error {
+  readonly statusCode = 400;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "RequestValidationError";
+  }
+}
+
+function isJsonParseError(error: unknown): error is SyntaxError & { status: number } {
+  return (
+    error instanceof SyntaxError &&
+    typeof (error as { status?: unknown }).status === "number" &&
+    (error as { status?: number }).status === 400
+  );
+}
 
 function getProvidedSecret(request: Request) {
   const headerSecret = request.header("x-remote-controller-secret-key")?.trim();
@@ -112,6 +133,11 @@ app.post("/api/commands", (request, response, next) => {
       createdAt: task.createdAt,
     });
   } catch (error) {
+    if (error instanceof Error) {
+      next(new RequestValidationError(error.message));
+      return;
+    }
+
     next(error);
   }
 });
@@ -171,8 +197,22 @@ app.get("/api/commands/:taskId/results", (request, response) => {
 app.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => {
   log("error", "request.failed", serializeError(error));
 
+  if (error instanceof RequestValidationError) {
+    response.status(error.statusCode).json({
+      error: error.message,
+    });
+    return;
+  }
+
+  if (isJsonParseError(error)) {
+    response.status(400).json({
+      error: "Request body must contain valid JSON.",
+    });
+    return;
+  }
+
   response.status(500).json({
-    error: error instanceof Error ? error.message : "Internal server error",
+    error: "Internal server error",
   });
 });
 
