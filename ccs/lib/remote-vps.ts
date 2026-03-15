@@ -28,6 +28,62 @@ const sensitiveKeyPattern = /(password|secret|token|authorization|cookie|apiKey|
 const safeString = (value: unknown, fallback = "") =>
   typeof value === "string" ? value.trim() : fallback;
 
+function parsePositiveIntegerParam(
+  value: string | null,
+  fallback: number,
+  { min = 1, max }: { min?: number; max?: number } = {}
+) {
+  const parsed = Number.parseInt(value ?? "", 10);
+
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+
+  const normalized = Math.max(min, parsed);
+  return typeof max === "number" ? Math.min(max, normalized) : normalized;
+}
+
+function parseBooleanInput(
+  value: unknown,
+  fallback: boolean
+): { value: boolean; isValid: boolean } {
+  if (value === undefined || value === null || value === "") {
+    return { value: fallback, isValid: true };
+  }
+
+  if (typeof value === "boolean") {
+    return { value, isValid: true };
+  }
+
+  if (typeof value === "number") {
+    if (value === 1) {
+      return { value: true, isValid: true };
+    }
+
+    if (value === 0) {
+      return { value: false, isValid: true };
+    }
+
+    return { value: fallback, isValid: false };
+  }
+
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+
+    if (normalized === "true" || normalized === "1") {
+      return { value: true, isValid: true };
+    }
+
+    if (normalized === "false" || normalized === "0") {
+      return { value: false, isValid: true };
+    }
+
+    return { value: fallback, isValid: false };
+  }
+
+  return { value: fallback, isValid: false };
+}
+
 const toIsoResult = <TWarning extends string>(
   warning: TWarning,
   value: Date | string | null | undefined,
@@ -261,8 +317,7 @@ export function validateVpsPayload(input: unknown): VpsPayload {
   const notes = safeString(input.notes);
   const portNumber = Number(input.port);
   const tags = normalizeTags(input.tags);
-  const isEnabled =
-    typeof input.isEnabled === "boolean" ? input.isEnabled : Boolean(input.isEnabled);
+  const isEnabled = parseBooleanInput(input.isEnabled, false);
 
   if (!name) {
     errors.name = "Name is required.";
@@ -288,6 +343,10 @@ export function validateVpsPayload(input: unknown): VpsPayload {
     errors.provider = "Provider is required.";
   }
 
+  if (!isEnabled.isValid) {
+    errors.isEnabled = "Enabled status must be a boolean, 'true'/'false', or 1/0.";
+  }
+
   if (Object.keys(errors).length > 0) {
     throw new PayloadValidationError(errors);
   }
@@ -302,7 +361,7 @@ export function validateVpsPayload(input: unknown): VpsPayload {
     provider,
     tags,
     notes,
-    isEnabled,
+    isEnabled: isEnabled.value,
   };
 }
 
@@ -337,11 +396,10 @@ export function getActorFromRequest(request: Request) {
 }
 
 export function getListQuery(searchParams: URLSearchParams) {
-  const page = Math.max(1, Number(searchParams.get("page") ?? 1));
-  const pageSize = Math.min(
-    100,
-    Math.max(1, Number(searchParams.get("pageSize") ?? 10))
-  );
+  const page = parsePositiveIntegerParam(searchParams.get("page"), 1);
+  const pageSize = parsePositiveIntegerParam(searchParams.get("pageSize"), 10, {
+    max: 100,
+  });
   const search = safeString(searchParams.get("search"));
   const status = safeString(searchParams.get("status"));
   const environment = safeString(searchParams.get("environment"));
@@ -385,11 +443,10 @@ export function getListQuery(searchParams: URLSearchParams) {
 }
 
 export function getLogListQuery(searchParams: URLSearchParams) {
-  const page = Math.max(1, Number(searchParams.get("page") ?? 1));
-  const pageSize = Math.min(
-    100,
-    Math.max(1, Number(searchParams.get("pageSize") ?? 20))
-  );
+  const page = parsePositiveIntegerParam(searchParams.get("page"), 1);
+  const pageSize = parsePositiveIntegerParam(searchParams.get("pageSize"), 20, {
+    max: 100,
+  });
   const result = safeString(searchParams.get("result"));
   const interactionType = safeString(searchParams.get("interactionType"));
   const startAt = safeString(searchParams.get("startAt"));
