@@ -79,6 +79,7 @@ interface VpsFormValues {
   environment: RemoteVpsRecord["environment"];
   region: string;
   provider: string;
+  controllerSecretKey: string;
   tags: string;
   notes: string;
   isEnabled: boolean;
@@ -114,6 +115,7 @@ function toFormValues(record?: RemoteVpsRecord | null): VpsFormValues {
     environment: record?.environment ?? "production",
     region: record?.region ?? "",
     provider: record?.provider ?? "",
+    controllerSecretKey: "",
     tags: record?.tags.join(", ") ?? "",
     notes: record?.notes ?? "",
     isEnabled: record?.isEnabled ?? true,
@@ -284,11 +286,20 @@ function RemoteVpsFormScreen({
 
     startSubmitting(async () => {
       try {
-        const payload = {
+        const payload: Record<string, unknown> = {
           ...values,
           port: Number(values.port),
           tags: values.tags,
         };
+
+        if (
+          mode === "edit" &&
+          record?.hasControllerSecret &&
+          !values.controllerSecretKey.trim()
+        ) {
+          delete payload.controllerSecretKey;
+        }
+
         const endpoint = mode === "create" ? "/api/vps" : `/api/vps/${record?.id}`;
         const method = mode === "create" ? "POST" : "PATCH";
         const response = await requestJson<VpsMutationResponse>(endpoint, {
@@ -399,6 +410,18 @@ function RemoteVpsFormScreen({
               error={Boolean(errors.provider)}
               helperText={errors.provider}
               required
+            />
+            <TextField
+              label="Controller secret"
+              type="password"
+              value={values.controllerSecretKey}
+              onChange={(event) => handleChange("controllerSecretKey", event.target.value)}
+              helperText={
+                mode === "edit" && record?.hasControllerSecret
+                  ? `Stored on the server as ${record.controllerSecretKeyMasked}. Leave blank to keep it.`
+                  : "Shared secret used when the control center calls this VPS controller."
+              }
+              sx={{ gridColumn: { xs: "auto", md: "1 / span 2" } }}
             />
             <TextField
               label="Region"
@@ -1211,6 +1234,14 @@ export function RemoteVpsControlCenter() {
                           <DetailField label="Provider" value={selectedVps.provider} />
                           <DetailField label="Environment" value={selectedVps.environment} />
                           <DetailField label="Region" value={selectedVps.region || "-"} />
+                          <DetailField
+                            label="Controller secret"
+                            value={
+                              selectedVps.hasControllerSecret
+                                ? selectedVps.controllerSecretKeyMasked
+                                : "Not configured"
+                            }
+                          />
                           <DetailField label="Last seen" value={formatDateTime(selectedVps.lastSeenAt)} />
                           <DetailField
                             label="Last health check"

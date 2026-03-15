@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { connectToDatabase } from "@/lib/mongodb";
 import {
   findVpsById,
+  getControllerConnectionDetails,
   getActorFromRequest,
   performControllerProbe,
   serializeVps,
@@ -29,7 +30,7 @@ export async function POST(
   }
 
   const probe = await performControllerProbe({
-    vps: serializeVps(item),
+    vps: getControllerConnectionDetails(item),
     interactionType: "health_check",
     requestPath: "/health",
     initiatedByUserId: getActorFromRequest(request),

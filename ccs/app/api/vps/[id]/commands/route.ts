@@ -2,11 +2,10 @@ import { NextRequest, NextResponse } from "next/server";
 
 import { connectToDatabase } from "@/lib/mongodb";
 import {
+  dispatchExecuteScriptCommand,
   findVpsById,
-  getControllerConnectionDetails,
   getActorFromRequest,
-  performControllerProbe,
-  serializeVps,
+  getControllerConnectionDetails,
 } from "@/lib/remote-vps";
 
 export const runtime = "nodejs";
@@ -22,6 +21,7 @@ export async function POST(
   context: { params: Promise<{ id: string }> }
 ) {
   await connectToDatabase();
+
   const id = await getId(context);
   const item = await findVpsById(id);
 
@@ -29,17 +29,21 @@ export async function POST(
     return NextResponse.json({ error: "VPS record not found." }, { status: 404 });
   }
 
-  const probe = await performControllerProbe({
+  const body = await request.json().catch(() => null);
+
+  if (!body || typeof body !== "object" || body.command !== "executeScript") {
+    return NextResponse.json(
+      { error: "Only the executeScript command is currently supported." },
+      { status: 400 }
+    );
+  }
+
+  const response = await dispatchExecuteScriptCommand({
     vps: getControllerConnectionDetails(item),
-    interactionType: "manual_test",
-    requestPath: "/",
+    script: (body as { script?: unknown }).script,
     initiatedByUserId: getActorFromRequest(request),
   });
 
-  const updatedItem = await findVpsById(id);
-
-  return NextResponse.json({
-    item: updatedItem ? serializeVps(updatedItem) : serializeVps(item),
-    interaction: probe,
-  });
+  const status = response.responseStatusCode ?? (response.result === "timeout" ? 504 : 502);
+  return NextResponse.json(response.responsePayload ?? response, { status });
 }
