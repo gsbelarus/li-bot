@@ -1,6 +1,6 @@
 "use client";
 
-import { useDeferredValue, useEffect, useMemo, useState, useTransition } from "react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState, useTransition } from "react";
 
 import AddRoundedIcon from "@mui/icons-material/AddRounded";
 import ArrowBackRoundedIcon from "@mui/icons-material/ArrowBackRounded";
@@ -550,53 +550,68 @@ export function RemoteVpsControlCenter() {
   const [actionVpsId, setActionVpsId] = useState<string | null>(null);
   const [isNavigating, startNavigation] = useTransition();
   const [refreshToken, setRefreshToken] = useState(0);
+  const hasMountedRef = useRef(false);
+
+  useEffect(() => {
+    hasMountedRef.current = true;
+
+    return () => {
+      hasMountedRef.current = false;
+    };
+  }, []);
 
   function updateListPaginationModel(nextModel: GridPaginationModel) {
-    queueMicrotask(() => {
-      setPaginationModel((current) => {
-        if (
-          current.page === nextModel.page &&
-          current.pageSize === nextModel.pageSize
-        ) {
-          return current;
-        }
+    if (!hasMountedRef.current) {
+      return;
+    }
 
-        return nextModel;
-      });
+    setPaginationModel((current) => {
+      if (
+        current.page === nextModel.page &&
+        current.pageSize === nextModel.pageSize
+      ) {
+        return current;
+      }
+
+      return nextModel;
     });
   }
 
   function updateListSortModel(nextModel: GridSortModel) {
-    queueMicrotask(() => {
-      setSortModel((current) => {
-        const currentEntry = current[0];
-        const nextEntry = nextModel[0];
+    if (!hasMountedRef.current) {
+      return;
+    }
 
-        if (
-          current.length === nextModel.length &&
-          currentEntry?.field === nextEntry?.field &&
-          currentEntry?.sort === nextEntry?.sort
-        ) {
-          return current;
-        }
+    setSortModel((current) => {
+      const currentEntry = current[0];
+      const nextEntry = nextModel[0];
 
-        return nextModel;
-      });
+      if (
+        current.length === nextModel.length &&
+        currentEntry?.field === nextEntry?.field &&
+        currentEntry?.sort === nextEntry?.sort
+      ) {
+        return current;
+      }
+
+      return nextModel;
     });
   }
 
   function updateLogsPaginationModel(nextModel: GridPaginationModel) {
-    queueMicrotask(() => {
-      setLogsPaginationModel((current) => {
-        if (
-          current.page === nextModel.page &&
-          current.pageSize === nextModel.pageSize
-        ) {
-          return current;
-        }
+    if (!hasMountedRef.current) {
+      return;
+    }
 
-        return nextModel;
-      });
+    setLogsPaginationModel((current) => {
+      if (
+        current.page === nextModel.page &&
+        current.pageSize === nextModel.pageSize
+      ) {
+        return current;
+      }
+
+      return nextModel;
     });
   }
 
