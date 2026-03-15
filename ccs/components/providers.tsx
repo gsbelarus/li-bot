@@ -38,28 +38,94 @@ const theme = createTheme({
     },
   },
   shape: {
-    borderRadius: 18,
+    borderRadius: 6,
   },
   typography: {
     fontFamily: "var(--font-space-grotesk), sans-serif",
+    body1: {
+      fontSize: "0.94rem",
+      lineHeight: 1.55,
+    },
+    body2: {
+      fontSize: "0.88rem",
+      lineHeight: 1.5,
+    },
     h1: {
       fontWeight: 700,
       letterSpacing: "-0.04em",
+      fontSize: "2.05rem",
+      lineHeight: 1.08,
     },
     h2: {
       fontWeight: 700,
       letterSpacing: "-0.04em",
+      fontSize: "1.7rem",
+      lineHeight: 1.12,
     },
     h3: {
       fontWeight: 700,
       letterSpacing: "-0.03em",
+      fontSize: "1.32rem",
+      lineHeight: 1.16,
+    },
+    h4: {
+      fontWeight: 700,
+      letterSpacing: "-0.02em",
+      fontSize: "1.08rem",
+      lineHeight: 1.22,
+    },
+    h5: {
+      fontWeight: 700,
+      letterSpacing: "-0.015em",
+      fontSize: "0.96rem",
+      lineHeight: 1.28,
+    },
+    h6: {
+      fontWeight: 700,
+      letterSpacing: "-0.01em",
+      fontSize: "0.88rem",
+      lineHeight: 1.32,
+    },
+    subtitle1: {
+      fontSize: "0.92rem",
+      lineHeight: 1.45,
+    },
+    subtitle2: {
+      fontSize: "0.8rem",
+      lineHeight: 1.4,
     },
     button: {
       textTransform: "none",
       fontWeight: 600,
+      fontSize: "0.84rem",
+      letterSpacing: "-0.01em",
+    },
+    overline: {
+      fontSize: "0.68rem",
+      fontWeight: 700,
+      letterSpacing: "0.08em",
     },
   },
   components: {
+    MuiCard: {
+      styleOverrides: {
+        root: {
+          borderRadius: "8px",
+          border: "1px solid rgba(28, 25, 23, 0.07)",
+          boxShadow: "0 10px 24px rgba(28, 25, 23, 0.04)",
+        },
+      },
+    },
+    MuiCardContent: {
+      styleOverrides: {
+        root: {
+          padding: 14,
+          "&:last-child": {
+            paddingBottom: 14,
+          },
+        },
+      },
+    },
     MuiPaper: {
       styleOverrides: {
         root: {
@@ -70,15 +136,63 @@ const theme = createTheme({
     MuiButton: {
       styleOverrides: {
         root: {
-          borderRadius: 999,
-          paddingInline: 18,
+          borderRadius: "7px",
+          minHeight: "36px",
+          height: "36px",
+          paddingInline: 12,
         },
       },
     },
     MuiChip: {
       styleOverrides: {
         root: {
-          borderRadius: 999,
+          borderRadius: "5px",
+          height: 22,
+          fontSize: "0.72rem",
+        },
+      },
+    },
+    MuiIconButton: {
+      styleOverrides: {
+        root: {
+          padding: 6,
+        },
+        sizeSmall: {
+          padding: 4,
+        },
+      },
+    },
+    MuiOutlinedInput: {
+      styleOverrides: {
+        root: {
+          borderRadius: "7px",
+        },
+        input: {
+          paddingTop: 9.5,
+          paddingBottom: 9.5,
+        },
+      },
+    },
+    MuiInputBase: {
+      styleOverrides: {
+        root: {
+          fontSize: "0.9rem",
+        },
+      },
+    },
+    MuiFormLabel: {
+      styleOverrides: {
+        root: {
+          fontSize: "0.88rem",
+        },
+      },
+    },
+    MuiTab: {
+      styleOverrides: {
+        root: {
+          minHeight: 32,
+          paddingInline: 10,
+          fontSize: "0.8rem",
         },
       },
     },
