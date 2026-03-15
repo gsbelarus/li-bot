@@ -1,6 +1,8 @@
 export const scriptActionKinds = [
+  "navigate",
   "click",
   "hover",
+  "wait",
   "wait_for_page",
   "move_mouse",
   "scroll",
@@ -69,6 +71,8 @@ function normalizeTarget(value: unknown): ScriptTarget | null {
 function normalizeStep(value: unknown, index: number): ScriptStep {
   const source = isPlainObject(value) ? value : {};
   const kind = safeString(source.kind, "custom") as ScriptActionKind;
+  const fallbackDelayAfterMs =
+    kind === "navigate" || kind === "wait" || kind === "wait_for_page" ? 0 : 1000;
   const params = isPlainObject(source.params)
     ? Object.entries(source.params).reduce<ScriptStep["params"]>((accumulator, [key, entry]) => {
       if (
@@ -91,7 +95,7 @@ function normalizeStep(value: unknown, index: number): ScriptStep {
     delayAfterMs:
       Number.isFinite(source.delayAfterMs) && Number(source.delayAfterMs) >= 0
         ? Number(source.delayAfterMs)
-        : 1000,
+        : fallbackDelayAfterMs,
     timeoutMs:
       Number.isFinite(source.timeoutMs) && Number(source.timeoutMs) > 0
         ? Number(source.timeoutMs)

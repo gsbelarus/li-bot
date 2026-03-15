@@ -32,8 +32,10 @@ const conversionTool = {
               kind: {
                 type: "string",
                 enum: [
+                  "navigate",
                   "click",
                   "hover",
+                  "wait",
                   "wait_for_page",
                   "move_mouse",
                   "scroll",
@@ -106,8 +108,18 @@ export async function POST(request: NextRequest) {
       messages: [
         {
           role: "system",
-          content:
-            "You convert browser operation scripts into structured JSON instructions for a bot. Produce explicit ordered steps, delays, selectors when inferable, and conservative defaults when details are missing.",
+          content: [
+            "You convert browser operation scripts into structured JSON instructions for a bot.",
+            "Use only these action kinds: navigate, click, hover, wait, wait_for_page, move_mouse, scroll, type, press_key, extract_text, assert_visible, custom.",
+            "Prefer navigate for direct URL changes.",
+            "Use wait_for_page for page readiness checks and URL assertions. Put urlIncludes, urlEquals, and readyState into params when needed.",
+            "Use wait for dwell time on a page. For random dwell time, set params.minDelayMs and params.maxDelayMs. If the human prompt says to move the mouse around during the wait, set params.moveMouse=true.",
+            "When a step must act inside a section or inside the Nth repeated container, encode that in params using containerSelector, containerText, containerIndex, and index.",
+            "Set target.role, target.text, target.description, and target.selectors conservatively when inferable.",
+            "For wait and wait_for_page steps, usually set delayAfterMs to 0.",
+            "Use custom only when the requested behavior cannot be represented with the supported action kinds.",
+            "Return explicit ordered steps that preserve the human intent.",
+          ].join(" "),
         },
         {
           role: "user",

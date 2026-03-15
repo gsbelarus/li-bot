@@ -8,6 +8,12 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function randomInteger(min: number, max: number) {
+  const lower = Math.ceil(Math.min(min, max));
+  const upper = Math.floor(Math.max(min, max));
+  return Math.floor(Math.random() * (upper - lower + 1)) + lower;
+}
+
 function scalarString(value: unknown, fallback = "") {
   return typeof value === "string" ? value : fallback;
 }
@@ -18,6 +24,14 @@ function scalarNumber(value: unknown, fallback: number) {
 
 function scalarBoolean(value: unknown, fallback = false) {
   return typeof value === "boolean" ? value : fallback;
+}
+
+function boundedPositiveInteger(value: unknown, fallback: number, minimum = 1) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return fallback;
+  }
+
+  return Math.max(minimum, Math.floor(value));
 }
 
 function parseJsonish(value: unknown) {
@@ -193,6 +207,88 @@ export class OpenClawRuntime {
     throw new Error(`Timed out waiting for page state for step ${step.order}.`);
   }
 
+  private async moveMouseRandomly(targetId: string) {
+    return await this.evaluate(
+      targetId,
+      `() => {
+        const viewportWidth = Math.max(window.innerWidth || 0, 1);
+        const viewportHeight = Math.max(window.innerHeight || 0, 1);
+        const clientX = Math.floor(Math.random() * Math.max(1, viewportWidth - 1));
+        const clientY = Math.floor(Math.random() * Math.max(1, viewportHeight - 1));
+        const element = document.elementFromPoint(clientX, clientY) || document.body;
+        const eventInit = {
+          bubbles: true,
+          cancelable: true,
+          view: window,
+          clientX,
+          clientY,
+        };
+
+        element.dispatchEvent(new MouseEvent("mouseover", eventInit));
+        element.dispatchEvent(new MouseEvent("mousemove", eventInit));
+
+        return {
+          clientX,
+          clientY,
+          tagName: element instanceof Element ? element.tagName.toLowerCase() : "body",
+        };
+      }`
+    );
+  }
+
+  private async performWaitStep(targetId: string, step: ScriptStep) {
+    const explicitDurationMs = scalarNumber(step.params.durationMs, Number.NaN);
+    const minDelayMs = scalarNumber(
+      step.params.minDelayMs,
+      Number.isFinite(explicitDurationMs) ? explicitDurationMs : step.delayAfterMs
+    );
+    const maxDelayMs = scalarNumber(step.params.maxDelayMs, minDelayMs);
+    const waitMs = Math.max(0, randomInteger(minDelayMs, maxDelayMs));
+    const moveMouse = scalarBoolean(step.params.moveMouse, false);
+    const moveCount = moveMouse
+      ? boundedPositiveInteger(
+        step.params.moveMouseCount,
+        Math.max(1, Math.round(waitMs / 3000))
+      )
+      : 0;
+
+    if (!moveMouse || waitMs === 0) {
+      await sleep(waitMs);
+      return { ok: true, action: step.kind, waitMs, moveMouse: false, moveCount: 0 };
+    }
+
+    const segments = Math.max(1, moveCount);
+    const segmentDurationMs = Math.floor(waitMs / segments);
+
+    for (let index = 0; index < segments; index += 1) {
+      await this.moveMouseRandomly(targetId);
+
+      const remainingMs = waitMs - segmentDurationMs * index;
+      const pauseMs = index === segments - 1 ? remainingMs : segmentDurationMs;
+      if (pauseMs > 0) {
+        await sleep(pauseMs);
+      }
+    }
+
+    return { ok: true, action: step.kind, waitMs, moveMouse: true, moveCount: segments };
+  }
+
+  private async performNavigateStep(targetId: string, step: ScriptStep) {
+    const url = scalarString(step.params.url, scalarString(step.target?.text));
+
+    if (!url) {
+      throw new Error(`Step ${step.order} is missing params.url for navigation.`);
+    }
+
+    await this.oc(["navigate", url, "--target-id", targetId]);
+
+    return {
+      ok: true,
+      action: step.kind,
+      url,
+    };
+  }
+
   private async runDomAction(targetId: string, step: ScriptStep) {
     const payload = JSON.stringify({
       action: step.kind,
@@ -219,6 +315,10 @@ export class OpenClawRuntime {
         };
         const seen = new Set();
         const candidates = [];
+        const toInteger = (value, fallback = 0) => {
+          const parsed = Number(value);
+          return Number.isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : fallback;
+        };
         const textFor = (element) => {
           if (!element) {
             return "";
@@ -250,38 +350,92 @@ export class OpenClawRuntime {
           const rect = element.getBoundingClientRect();
           return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
         };
-        if (target) {
-          for (const selector of Array.isArray(target.selectors) ? target.selectors : []) {
-            if (!selector) {
-              continue;
-            }
+        const containerSelector = typeof params.containerSelector === "string" ? params.containerSelector.trim() : "";
+        const containerText = typeof params.containerText === "string" ? params.containerText.trim() : "";
+        const containerIndex = toInteger(params.containerIndex, 0);
+        const roots = (() => {
+          let result = [];
+
+          if (containerSelector) {
             try {
-              document.querySelectorAll(selector).forEach(addCandidate);
+              result = Array.from(document.querySelectorAll(containerSelector));
             } catch {
+              result = [];
             }
           }
-          const roleSelector = target.role ? (roleSelectors[target.role] || "*") : "*";
-          document.querySelectorAll(roleSelector).forEach((element) => {
-            const text = normalize(textFor(element));
-            const targetText = normalize(target.text);
-            const description = normalize(target.description);
-            if (
-              (targetText && text.includes(targetText)) ||
-              (description && text.includes(description)) ||
-              (!targetText && !description && !target.role)
-            ) {
-              addCandidate(element);
+
+          if (result.length === 0 && containerText) {
+            const containerNeedle = normalize(containerText);
+            document.querySelectorAll("section,article,main,div,li").forEach((element) => {
+              if (normalize(textFor(element)).includes(containerNeedle)) {
+                result.push(element);
+              }
+            });
+          }
+
+          if (containerIndex > 0) {
+            result = result[containerIndex - 1] ? [result[containerIndex - 1]] : [];
+          }
+
+          return result.length > 0 ? result : [document];
+        })();
+        const roleSelector = target?.role ? (roleSelectors[target.role] || "*") : "*";
+        const targetText = normalize(target?.text);
+        const description = normalize(target?.description);
+        const candidateIndex = Math.max(1, toInteger(params.index, 1));
+        const matchesTarget = (element) => {
+          const text = normalize(textFor(element));
+
+          if (targetText && !text.includes(targetText)) {
+            return false;
+          }
+
+          if (description && !text.includes(description)) {
+            return false;
+          }
+
+          return true;
+        };
+        if (target) {
+          for (const root of roots) {
+            for (const selector of Array.isArray(target.selectors) ? target.selectors : []) {
+              if (!selector) {
+                continue;
+              }
+              try {
+                root.querySelectorAll(selector).forEach((element) => {
+                  if (matchesTarget(element)) {
+                    addCandidate(element);
+                  }
+                });
+              } catch {
+              }
             }
-          });
-          if (candidates.length === 0 && target.text) {
-            document.querySelectorAll("*").forEach((element) => {
-              if (normalize(textFor(element)).includes(normalize(target.text))) {
+
+            root.querySelectorAll(roleSelector).forEach((element) => {
+              if (matchesTarget(element) || (!targetText && !description && !target?.selectors?.length)) {
                 addCandidate(element);
               }
             });
           }
+
+          if (candidates.length === 0 && target.text) {
+            for (const root of roots) {
+              root.querySelectorAll("*").forEach((element) => {
+                if (matchesTarget(element)) {
+                  addCandidate(element);
+                }
+              });
+            }
+          }
         }
-        const element = candidates.find(isVisible) || candidates[0] || null;
+        const visibleCandidates = candidates.filter(isVisible);
+        const element =
+          visibleCandidates[candidateIndex - 1] ||
+          visibleCandidates[0] ||
+          candidates[candidateIndex - 1] ||
+          candidates[0] ||
+          null;
         const summary = element
           ? {
               tagName: element.tagName.toLowerCase(),
@@ -397,6 +551,10 @@ export class OpenClawRuntime {
 
     if (step.kind === "wait_for_page") {
       output = await this.waitForPage(targetId, step);
+    } else if (step.kind === "wait") {
+      output = await this.performWaitStep(targetId, step);
+    } else if (step.kind === "navigate") {
+      output = await this.performNavigateStep(targetId, step);
     } else {
       output = await this.runDomAction(targetId, step);
       if (

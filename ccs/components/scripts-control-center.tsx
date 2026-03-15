@@ -371,7 +371,32 @@ function ScriptDetailScreen({
                     variant="outlined"
                     sx={{ height: "100%", overflowY: "auto", p: 1.25, borderRadius: "7px" }}
                   >
-                    <Box sx={{ "& p, & li": { color: "text.secondary" } }}>
+                    <Box
+                      sx={{
+                        color: "text.secondary",
+                        "& p": { color: "text.secondary", my: 0.75 },
+                        "& ol": {
+                          my: 0.75,
+                          pl: 3,
+                          listStyleType: "decimal",
+                          listStylePosition: "outside",
+                        },
+                        "& ul": {
+                          my: 0.75,
+                          pl: 3,
+                          listStyleType: "disc",
+                          listStylePosition: "outside",
+                        },
+                        "& li": {
+                          color: "text.secondary",
+                          display: "list-item",
+                          mb: 0.35,
+                        },
+                        "& li > p": {
+                          my: 0,
+                        },
+                      }}
+                    >
                       <ReactMarkdown>{values.plainText || "Nothing to preview yet."}</ReactMarkdown>
                     </Box>
                   </Card>
@@ -381,8 +406,8 @@ function ScriptDetailScreen({
           </Card>
         </Stack>
 
-        <Card sx={{ minHeight: 0, overflow: "hidden" }}>
-          <CardContent sx={{ height: "100%", display: "flex", flexDirection: "column", gap: 1.25, minHeight: 0, overflow: "hidden", p: 2 }}>
+        <Card sx={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+          <CardContent sx={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", gap: 1.25, overflow: "hidden", p: 2 }}>
             <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={2}>
               <Box>
                 <Typography variant="h6">Structured instructions</Typography>
@@ -392,7 +417,24 @@ function ScriptDetailScreen({
               </Box>
               <Chip label={`${values.structuredInstructions.steps.length} steps`} />
             </Stack>
-            <Box sx={{ flex: 1, minHeight: 0, borderRadius: "7px", overflow: "hidden", border: "1px solid rgba(28, 25, 23, 0.08)" }}>
+            <Box
+              sx={{
+                flex: 1,
+                minHeight: 0,
+                borderRadius: "7px",
+                overflowY: "auto",
+                overflowX: "hidden",
+                border: "1px solid rgba(28, 25, 23, 0.08)",
+                "& .cm-editor": {
+                  height: "auto",
+                  minHeight: "100%",
+                },
+                "& .cm-scroller": {
+                  overflow: "visible",
+                },
+              }}
+              tabIndex={0}
+            >
               <CodeMirror
                 value={JSON.stringify(values.structuredInstructions, null, 2)}
                 extensions={[json()]}
@@ -403,7 +445,6 @@ function ScriptDetailScreen({
                   highlightActiveLine: false,
                 }}
                 theme="light"
-                height="100%"
               />
             </Box>
           </CardContent>

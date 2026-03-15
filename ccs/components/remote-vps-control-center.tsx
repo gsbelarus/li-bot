@@ -33,6 +33,7 @@ import {
   MenuItem,
   Paper,
   Select,
+  Skeleton,
   Snackbar,
   Stack,
   Switch,
@@ -497,6 +498,47 @@ function RemoteVpsFormScreen({
             <Button variant="outlined" onClick={handleCancel} disabled={isSubmitting}>
               Cancel
             </Button>
+          </Stack>
+        </Stack>
+      </CardContent>
+    </Card>
+  );
+}
+
+function RemoteVpsFormLoadingScreen() {
+  return (
+    <Card sx={{ height: "100%", overflow: "auto" }}>
+      <CardContent sx={{ p: 2.5 }}>
+        <Stack spacing={2}>
+          <Box>
+            <Skeleton variant="text" width={180} height={40} />
+            <Skeleton variant="text" width={320} height={24} sx={{ mt: 0.5 }} />
+          </Box>
+
+          <Box
+            sx={{
+              display: "grid",
+              gap: 1.5,
+              gridTemplateColumns: { xs: "1fr", md: "repeat(2, minmax(0, 1fr))" },
+            }}
+          >
+            <Skeleton variant="rounded" height={56} />
+            <Skeleton variant="rounded" height={56} />
+            <Skeleton variant="rounded" height={56} />
+            <Skeleton variant="rounded" height={56} />
+            <Skeleton variant="rounded" height={56} />
+            <Skeleton variant="rounded" height={56} />
+            <Skeleton variant="rounded" height={56} sx={{ gridColumn: { xs: "auto", md: "1 / span 2" } }} />
+            <Skeleton variant="rounded" height={56} />
+            <Skeleton variant="rounded" height={56} sx={{ gridColumn: { xs: "auto", md: "1 / span 2" } }} />
+            <Skeleton variant="rounded" height={120} sx={{ gridColumn: { xs: "auto", md: "1 / span 2" } }} />
+          </Box>
+
+          <Skeleton variant="rounded" width={220} height={40} />
+
+          <Stack direction="row" spacing={2}>
+            <Skeleton variant="rounded" width={96} height={36} />
+            <Skeleton variant="rounded" width={96} height={36} />
           </Stack>
         </Stack>
       </CardContent>
@@ -1144,17 +1186,21 @@ export function RemoteVpsControlCenter() {
           ) : null}
 
           {screen.kind === "edit" ? (
-            <RemoteVpsFormScreen
-              key={`edit-${screen.vpsId}`}
-              mode="edit"
-              record={selectedVps}
-              onCancel={() => setScreen({ kind: "details", vpsId: screen.vpsId })}
-              onSaved={(item, message) => {
-                setSnackbar(message);
-                setRefreshToken((value) => value + 1);
-                setScreen({ kind: "details", vpsId: item.id });
-              }}
-            />
+            selectedVps ? (
+              <RemoteVpsFormScreen
+                key={`edit-${selectedVps.id}`}
+                mode="edit"
+                record={selectedVps}
+                onCancel={() => setScreen({ kind: "details", vpsId: screen.vpsId })}
+                onSaved={(item, message) => {
+                  setSnackbar(message);
+                  setRefreshToken((value) => value + 1);
+                  setScreen({ kind: "details", vpsId: item.id });
+                }}
+              />
+            ) : (
+              <RemoteVpsFormLoadingScreen />
+            )
           ) : null}
 
           {screen.kind === "list" ? (

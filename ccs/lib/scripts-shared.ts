@@ -1,6 +1,8 @@
 export const scriptActionKinds = [
+  "navigate",
   "click",
   "hover",
+  "wait",
   "wait_for_page",
   "move_mouse",
   "scroll",

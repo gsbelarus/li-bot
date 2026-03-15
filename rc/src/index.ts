@@ -1,9 +1,20 @@
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import express, { type NextFunction, type Request, type Response } from "express";
+import dotenv from "dotenv";
 
 import { log, serializeError } from "./logger.js";
 import { OpenClawRuntime } from "./openclaw.js";
 import { validateExecuteScriptCommandPayload } from "./script-contract.js";
 import { TaskQueue } from "./task-queue.js";
+
+const currentFilePath = fileURLToPath(import.meta.url);
+const currentDirectory = dirname(currentFilePath);
+const projectRoot = resolve(currentDirectory, "..");
+
+dotenv.config({ path: resolve(projectRoot, ".env") });
+dotenv.config({ path: resolve(projectRoot, ".env.local"), override: true });
 
 const port = Number(process.env.PORT || 3100);
 const remoteControllerSecretKey = process.env.REMOTE_CONTROLLER_SECRET_KEY || "";
