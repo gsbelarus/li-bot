@@ -551,12 +551,27 @@ export function RemoteVpsControlCenter() {
   const [isNavigating, startNavigation] = useTransition();
   const [refreshToken, setRefreshToken] = useState(0);
   const hasMountedRef = useRef(false);
+  const listPaginationTimeoutRef = useRef<number | null>(null);
+  const listSortTimeoutRef = useRef<number | null>(null);
+  const logsPaginationTimeoutRef = useRef<number | null>(null);
 
   useEffect(() => {
     hasMountedRef.current = true;
 
     return () => {
       hasMountedRef.current = false;
+
+      if (listPaginationTimeoutRef.current !== null) {
+        window.clearTimeout(listPaginationTimeoutRef.current);
+      }
+
+      if (listSortTimeoutRef.current !== null) {
+        window.clearTimeout(listSortTimeoutRef.current);
+      }
+
+      if (logsPaginationTimeoutRef.current !== null) {
+        window.clearTimeout(logsPaginationTimeoutRef.current);
+      }
     };
   }, []);
 
@@ -565,16 +580,26 @@ export function RemoteVpsControlCenter() {
       return;
     }
 
-    setPaginationModel((current) => {
-      if (
-        current.page === nextModel.page &&
-        current.pageSize === nextModel.pageSize
-      ) {
-        return current;
+    if (listPaginationTimeoutRef.current !== null) {
+      window.clearTimeout(listPaginationTimeoutRef.current);
+    }
+
+    listPaginationTimeoutRef.current = window.setTimeout(() => {
+      if (!hasMountedRef.current) {
+        return;
       }
 
-      return nextModel;
-    });
+      setPaginationModel((current) => {
+        if (
+          current.page === nextModel.page &&
+          current.pageSize === nextModel.pageSize
+        ) {
+          return current;
+        }
+
+        return nextModel;
+      });
+    }, 0);
   }
 
   function updateListSortModel(nextModel: GridSortModel) {
@@ -582,20 +607,30 @@ export function RemoteVpsControlCenter() {
       return;
     }
 
-    setSortModel((current) => {
-      const currentEntry = current[0];
-      const nextEntry = nextModel[0];
+    if (listSortTimeoutRef.current !== null) {
+      window.clearTimeout(listSortTimeoutRef.current);
+    }
 
-      if (
-        current.length === nextModel.length &&
-        currentEntry?.field === nextEntry?.field &&
-        currentEntry?.sort === nextEntry?.sort
-      ) {
-        return current;
+    listSortTimeoutRef.current = window.setTimeout(() => {
+      if (!hasMountedRef.current) {
+        return;
       }
 
-      return nextModel;
-    });
+      setSortModel((current) => {
+        const currentEntry = current[0];
+        const nextEntry = nextModel[0];
+
+        if (
+          current.length === nextModel.length &&
+          currentEntry?.field === nextEntry?.field &&
+          currentEntry?.sort === nextEntry?.sort
+        ) {
+          return current;
+        }
+
+        return nextModel;
+      });
+    }, 0);
   }
 
   function updateLogsPaginationModel(nextModel: GridPaginationModel) {
@@ -603,16 +638,26 @@ export function RemoteVpsControlCenter() {
       return;
     }
 
-    setLogsPaginationModel((current) => {
-      if (
-        current.page === nextModel.page &&
-        current.pageSize === nextModel.pageSize
-      ) {
-        return current;
+    if (logsPaginationTimeoutRef.current !== null) {
+      window.clearTimeout(logsPaginationTimeoutRef.current);
+    }
+
+    logsPaginationTimeoutRef.current = window.setTimeout(() => {
+      if (!hasMountedRef.current) {
+        return;
       }
 
-      return nextModel;
-    });
+      setLogsPaginationModel((current) => {
+        if (
+          current.page === nextModel.page &&
+          current.pageSize === nextModel.pageSize
+        ) {
+          return current;
+        }
+
+        return nextModel;
+      });
+    }, 0);
   }
 
   const activeVpsId =
