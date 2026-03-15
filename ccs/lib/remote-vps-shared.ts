@@ -49,6 +49,14 @@ export type LogInteractionType = (typeof logInteractionTypeOptions)[number];
 export type LogResult = (typeof logResultOptions)[number];
 export type InitiatedBy = (typeof initiatedByOptions)[number];
 
+export type RemoteVpsTimestampWarning =
+  | "createdAt"
+  | "updatedAt"
+  | "lastSeenAt"
+  | "lastHealthCheckAt";
+
+export type RemoteVpsInteractionLogTimestampWarning = "createdAt";
+
 export interface RemoteVpsRecord {
   id: string;
   name: string;
@@ -71,6 +79,7 @@ export interface RemoteVpsRecord {
   updatedAt: string;
   createdBy: string;
   updatedBy: string;
+  timestampWarnings: RemoteVpsTimestampWarning[];
 }
 
 export interface RemoteVpsInteractionLogRecord {
@@ -92,6 +101,7 @@ export interface RemoteVpsInteractionLogRecord {
   initiatedBy: InitiatedBy;
   initiatedByUserId: string;
   createdAt: string;
+  timestampWarnings: RemoteVpsInteractionLogTimestampWarning[];
 }
 
 export interface VpsListResponse {

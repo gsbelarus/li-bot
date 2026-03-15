@@ -37,6 +37,8 @@ export interface ScriptInstructions {
   steps: ScriptStep[];
 }
 
+export type ScriptTimestampWarning = "createdAt" | "updatedAt";
+
 export interface ScriptRecord {
   id: string;
   name: string;
@@ -48,6 +50,7 @@ export interface ScriptRecord {
   updatedAt: string;
   createdBy: string;
   updatedBy: string;
+  timestampWarnings: ScriptTimestampWarning[];
 }
 
 export interface ScriptListResponse {

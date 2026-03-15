@@ -749,9 +749,16 @@ export function RemoteVpsControlCenter() {
       {
         field: "status",
         headerName: "Status",
-        minWidth: 130,
+        minWidth: 220,
         renderCell: ({ row }) => (
-          <Chip label={row.status} color={statusColor(row.status)} size="small" />
+          <Stack direction="row" spacing={0.5} alignItems="center" flexWrap="wrap">
+            <Chip label={row.status} color={statusColor(row.status)} size="small" />
+            {row.timestampWarnings.length > 0 ? (
+              <Tooltip title={`Fallback timestamps: ${row.timestampWarnings.join(", ")}`}>
+                <Chip size="small" label="legacy timestamps" color="warning" variant="outlined" />
+              </Tooltip>
+            ) : null}
+          </Stack>
         ),
       },
       {
@@ -1185,6 +1192,11 @@ export function RemoteVpsControlCenter() {
                             color={statusColor(selectedVps.status)}
                           />
                           {!selectedVps.isEnabled ? <Chip label="disabled" /> : null}
+                          {selectedVps.timestampWarnings.length > 0 ? (
+                            <Tooltip title={`Fallback timestamps: ${selectedVps.timestampWarnings.join(", ")}`}>
+                              <Chip size="small" label="legacy timestamps" color="warning" variant="outlined" />
+                            </Tooltip>
+                          ) : null}
                         </Stack>
                         <Typography color="text.secondary">{selectedVps.statusReason}</Typography>
                         <Divider />

@@ -238,9 +238,16 @@ function ScriptDetailScreen({
         <CardContent sx={{ p: 2 }}>
           <Stack direction={{ xs: "column", md: "row" }} spacing={1.25} justifyContent="space-between" alignItems={{ xs: "stretch", md: "flex-start" }}>
             <Box>
-              <Typography variant="h5">
-                {hasExistingRecord ? values.name || "Script details" : "Create Script"}
-              </Typography>
+              <Stack direction="row" spacing={0.75} alignItems="center" flexWrap="wrap">
+                <Typography variant="h5">
+                  {hasExistingRecord ? values.name || "Script details" : "Create Script"}
+                </Typography>
+                {record && record.timestampWarnings.length > 0 ? (
+                  <Tooltip title={`Fallback timestamps: ${record.timestampWarnings.join(", ")}`}>
+                    <Chip size="small" label="legacy timestamps" color="warning" variant="outlined" />
+                  </Tooltip>
+                ) : null}
+              </Stack>
               <Typography color="text.secondary" sx={{ mt: 0.5 }}>
                 Edit markdown, convert it to JSON, and manage status.
               </Typography>
@@ -555,13 +562,20 @@ export function ScriptsControlCenter() {
       {
         field: "isDisabled",
         headerName: "Status",
-        minWidth: 120,
+        minWidth: 200,
         renderCell: ({ row }) => (
-          <Chip
-            size="small"
-            label={row.isDisabled ? "disabled" : "enabled"}
-            color={row.isDisabled ? "default" : "success"}
-          />
+          <Stack direction="row" spacing={0.5} alignItems="center" flexWrap="wrap">
+            <Chip
+              size="small"
+              label={row.isDisabled ? "disabled" : "enabled"}
+              color={row.isDisabled ? "default" : "success"}
+            />
+            {row.timestampWarnings.length > 0 ? (
+              <Tooltip title={`Fallback timestamps: ${row.timestampWarnings.join(", ")}`}>
+                <Chip size="small" label="legacy timestamps" color="warning" variant="outlined" />
+              </Tooltip>
+            ) : null}
+          </Stack>
         ),
       },
       {

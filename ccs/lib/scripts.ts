@@ -8,12 +8,14 @@ import {
   ScriptInstructions,
   ScriptRecord,
   ScriptStep,
+  ScriptTimestampWarning,
   ScriptTarget,
   createEmptyScriptInstructions,
   scriptActionKinds,
 } from "@/lib/scripts-shared";
 
 const actorFallback = "operator@control-center";
+const fallbackIsoTimestamp = new Date(0).toISOString();
 
 const safeString = (value: unknown, fallback = "") =>
   typeof value === "string" ? value.trim() : fallback;
@@ -28,8 +30,22 @@ function hasToObject(
   return typeof (value as { toObject?: unknown }).toObject === "function";
 }
 
-function toIso(value: Date | string) {
-  return new Date(value).toISOString();
+function toIsoResult<TWarning extends string>(
+  warning: TWarning,
+  value: Date | string | null | undefined,
+  fallback = fallbackIsoTimestamp
+): { value: string; warning?: TWarning } {
+  if (value === null || value === undefined) {
+    return { value: fallback, warning };
+  }
+
+  const date = value instanceof Date ? value : new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return { value: fallback, warning };
+  }
+
+  return { value: date.toISOString() };
 }
 
 function normalizeTarget(value: unknown): ScriptTarget | null {
@@ -108,6 +124,11 @@ export function serializeScript(
   document: ScriptDefinitionDocument | Record<string, unknown>
 ): ScriptRecord {
   const source = hasToObject(document) ? document.toObject() : document;
+  const createdAt = toIsoResult("createdAt", source.createdAt as Date | string | null | undefined);
+  const updatedAt = toIsoResult("updatedAt", source.updatedAt as Date | string | null | undefined);
+  const timestampWarnings = [createdAt.warning, updatedAt.warning].filter(
+    (warning): warning is ScriptTimestampWarning => Boolean(warning)
+  );
 
   return {
     id: String(source._id),
@@ -119,10 +140,11 @@ export function serializeScript(
       safeString(source.description)
     ),
     isDisabled: Boolean(source.isDisabled),
-    createdAt: toIso(source.createdAt as Date | string),
-    updatedAt: toIso(source.updatedAt as Date | string),
+    createdAt: createdAt.value,
+    updatedAt: updatedAt.value,
     createdBy: safeString(source.createdBy),
     updatedBy: safeString(source.updatedBy),
+    timestampWarnings,
   };
 }
 
