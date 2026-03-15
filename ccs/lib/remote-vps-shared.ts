@@ -66,6 +66,8 @@ export interface RemoteVpsRecord {
   environment: VpsEnvironment;
   region: string;
   provider: string;
+  hasControllerSecret: boolean;
+  controllerSecretKeyMasked: string;
   controllerVersion: string;
   status: VpsStatus;
   statusReason: string;

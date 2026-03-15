@@ -19,6 +19,7 @@ import {
   vpsEnvironmentOptions,
   vpsProtocolOptions,
 } from "@/lib/remote-vps-shared";
+import { normalizeStructuredInstructions } from "@/lib/scripts";
 
 const actorFallback = "operator@control-center";
 const fallbackIsoTimestamp = new Date(0).toISOString();
@@ -27,6 +28,18 @@ const sensitiveKeyPattern = /(password|secret|token|authorization|cookie|apiKey|
 
 const safeString = (value: unknown, fallback = "") =>
   typeof value === "string" ? value.trim() : fallback;
+
+function maskSecret(secret: string) {
+  if (!secret) {
+    return "";
+  }
+
+  if (secret.length <= 8) {
+    return "*".repeat(secret.length);
+  }
+
+  return `${secret.slice(0, 4)}${"*".repeat(Math.max(4, secret.length - 8))}${secret.slice(-4)}`;
+}
 
 function parsePositiveIntegerParam(
   value: string | null,
@@ -170,6 +183,7 @@ function hasToObject(
 
 export function serializeVps(document: RemoteVpsDocument | Record<string, unknown>) {
   const source = hasToObject(document) ? document.toObject() : document;
+  const controllerSecretKey = safeString(source.controllerSecretKey);
   const lastSeenAt = toNullableIsoResult("lastSeenAt", source.lastSeenAt as Date | string | null | undefined);
   const lastHealthCheckAt = toNullableIsoResult(
     "lastHealthCheckAt",
@@ -193,6 +207,8 @@ export function serializeVps(document: RemoteVpsDocument | Record<string, unknow
     environment: source.environment as VpsEnvironment,
     region: safeString(source.region),
     provider: safeString(source.provider),
+    hasControllerSecret: Boolean(controllerSecretKey),
+    controllerSecretKeyMasked: maskSecret(controllerSecretKey),
     controllerVersion: safeString(source.controllerVersion),
     status: source.status as VpsStatus,
     statusReason: safeString(source.statusReason),
@@ -214,6 +230,21 @@ export function serializeVps(document: RemoteVpsDocument | Record<string, unknow
     updatedBy: safeString(source.updatedBy),
     timestampWarnings,
   } satisfies RemoteVpsRecord;
+}
+
+export interface ControllerConnectionDetails extends RemoteVpsRecord {
+  controllerSecretKey: string;
+}
+
+export function getControllerConnectionDetails(
+  document: RemoteVpsDocument | Record<string, unknown>
+): ControllerConnectionDetails {
+  const source = hasToObject(document) ? document.toObject() : document;
+
+  return {
+    ...serializeVps(source),
+    controllerSecretKey: safeString(source.controllerSecretKey),
+  };
 }
 
 export function serializeInteractionLog(
@@ -283,6 +314,7 @@ export interface VpsPayload {
   environment: VpsEnvironment;
   region: string;
   provider: string;
+  controllerSecretKey: string;
   tags: string[];
   notes: string;
   isEnabled: boolean;
@@ -314,6 +346,7 @@ export function validateVpsPayload(input: unknown): VpsPayload {
   const environment = safeString(input.environment) as VpsEnvironment;
   const provider = safeString(input.provider);
   const region = safeString(input.region);
+  const controllerSecretKey = safeString(input.controllerSecretKey);
   const notes = safeString(input.notes);
   const portNumber = Number(input.port);
   const tags = normalizeTags(input.tags);
@@ -343,6 +376,14 @@ export function validateVpsPayload(input: unknown): VpsPayload {
     errors.provider = "Provider is required.";
   }
 
+  if (
+    input.controllerSecretKey !== undefined &&
+    input.controllerSecretKey !== null &&
+    typeof input.controllerSecretKey !== "string"
+  ) {
+    errors.controllerSecretKey = "Controller secret must be a string.";
+  }
+
   if (!isEnabled.isValid) {
     errors.isEnabled = "Enabled status must be a boolean, 'true'/'false', or 1/0.";
   }
@@ -359,6 +400,7 @@ export function validateVpsPayload(input: unknown): VpsPayload {
     environment,
     region,
     provider,
+    controllerSecretKey,
     tags,
     notes,
     isEnabled: isEnabled.value,
@@ -530,6 +572,18 @@ export function buildBaseUrl(vps: Pick<RemoteVpsRecord, "protocol" | "host" | "p
   return `${vps.protocol}://${vps.host}:${vps.port}`;
 }
 
+function buildControllerHeaders(secret: string, init?: HeadersInit) {
+  const headers = new Headers(init);
+
+  headers.set("accept", "application/json, text/plain;q=0.9, */*;q=0.8");
+
+  if (secret) {
+    headers.set("x-remote-controller-secret-key", secret);
+  }
+
+  return headers;
+}
+
 async function parseResponsePayload(response: Response) {
   const contentType = response.headers.get("content-type") ?? "";
 
@@ -571,7 +625,7 @@ function isTimeoutError(error: unknown) {
 }
 
 export async function performControllerProbe(options: {
-  vps: RemoteVpsRecord;
+  vps: ControllerConnectionDetails;
   interactionType: Extract<LogInteractionType, "health_check" | "manual_test">;
   requestPath: string;
   initiatedByUserId: string;
@@ -598,9 +652,7 @@ export async function performControllerProbe(options: {
   try {
     const response = await fetch(requestUrl, {
       method: "GET",
-      headers: {
-        accept: "application/json, text/plain;q=0.9, */*;q=0.8",
-      },
+      headers: buildControllerHeaders(options.vps.controllerSecretKey),
       signal: AbortSignal.timeout(5000),
       cache: "no-store",
     });
@@ -696,4 +748,178 @@ export async function performControllerProbe(options: {
       errorMessage,
     };
   }
+}
+
+async function performControllerRequest(options: {
+  vps: ControllerConnectionDetails;
+  interactionType: Extract<LogInteractionType, "command_dispatch" | "status_pull">;
+  requestMethod: "GET" | "POST";
+  requestPath: string;
+  requestPayload?: unknown;
+  initiatedByUserId: string;
+}) {
+  const correlationId = randomUUID();
+  const startedAt = Date.now();
+  const createdAt = new Date();
+  const requestUrl = new URL(options.requestPath, buildBaseUrl(options.vps)).toString();
+
+  await createInteractionLog({
+    vpsId: options.vps.id,
+    correlationId,
+    direction: "outbound_request",
+    interactionType: options.interactionType,
+    requestMethod: options.requestMethod,
+    requestPath: options.requestPath,
+    requestPayload: options.requestPayload ?? null,
+    result: "pending",
+    initiatedBy: "operator",
+    initiatedByUserId: options.initiatedByUserId,
+    createdAt,
+  });
+
+  try {
+    const response = await fetch(requestUrl, {
+      method: options.requestMethod,
+      headers: buildControllerHeaders(
+        options.vps.controllerSecretKey,
+        options.requestMethod === "POST" ? { "content-type": "application/json" } : undefined
+      ),
+      body:
+        options.requestMethod === "POST"
+          ? JSON.stringify(options.requestPayload ?? null)
+          : undefined,
+      signal: AbortSignal.timeout(15000),
+      cache: "no-store",
+    });
+
+    const durationMs = Date.now() - startedAt;
+    const responsePayload = await parseResponsePayload(response);
+    const controllerVersion = extractControllerVersion(responsePayload);
+    const result: LogResult = response.ok ? "success" : "failed";
+    const now = new Date();
+
+    await createInteractionLog({
+      vpsId: options.vps.id,
+      correlationId,
+      direction: "inbound_response",
+      interactionType: options.interactionType,
+      requestMethod: options.requestMethod,
+      requestPath: options.requestPath,
+      responseStatusCode: response.status,
+      responsePayload,
+      result,
+      durationMs,
+      initiatedBy: "operator",
+      initiatedByUserId: options.initiatedByUserId,
+      errorMessage: response.ok ? "" : `Remote controller responded with ${response.status}.`,
+      createdAt: now,
+    });
+
+    await RemoteVpsModel.findByIdAndUpdate(options.vps.id, {
+      status: options.vps.isEnabled ? (response.ok ? "online" : "degraded") : "disabled",
+      statusReason: options.vps.isEnabled
+        ? response.ok
+          ? `Last ${options.interactionType.replace("_", " ")} completed successfully.`
+          : `Remote controller returned HTTP ${response.status}.`
+        : "Record disabled by operator.",
+      lastSeenAt: response.ok ? now : options.vps.lastSeenAt,
+      controllerVersion: controllerVersion || options.vps.controllerVersion,
+      updatedBy: options.initiatedByUserId,
+    });
+
+    return {
+      correlationId,
+      result,
+      responseStatusCode: response.status,
+      durationMs,
+      responsePayload,
+    };
+  } catch (error) {
+    const durationMs = Date.now() - startedAt;
+    const now = new Date();
+    const timeout = isTimeoutError(error);
+    const errorMessage = error instanceof Error ? error.message : "Unknown controller request failure";
+
+    await createInteractionLog({
+      vpsId: options.vps.id,
+      correlationId,
+      direction: "internal_event",
+      interactionType: options.interactionType,
+      requestMethod: options.requestMethod,
+      requestPath: options.requestPath,
+      requestPayload: options.requestPayload ?? null,
+      result: timeout ? "timeout" : "failed",
+      durationMs,
+      initiatedBy: "operator",
+      initiatedByUserId: options.initiatedByUserId,
+      errorCode: timeout ? "REQUEST_TIMEOUT" : "FETCH_FAILED",
+      errorMessage,
+      createdAt: now,
+    });
+
+    await RemoteVpsModel.findByIdAndUpdate(options.vps.id, {
+      status: options.vps.isEnabled ? "offline" : "disabled",
+      statusReason: timeout
+        ? "Remote controller timed out during the latest request."
+        : "Remote controller could not be reached.",
+      updatedBy: options.initiatedByUserId,
+    });
+
+    return {
+      correlationId,
+      result: timeout ? "timeout" : "failed",
+      responseStatusCode: null,
+      durationMs,
+      responsePayload: null,
+      errorMessage,
+    };
+  }
+}
+
+export async function dispatchExecuteScriptCommand(options: {
+  vps: ControllerConnectionDetails;
+  script: unknown;
+  initiatedByUserId: string;
+}) {
+  const structuredInstructions = normalizeStructuredInstructions(options.script);
+
+  return performControllerRequest({
+    vps: options.vps,
+    interactionType: "command_dispatch",
+    requestMethod: "POST",
+    requestPath: "/api/commands",
+    requestPayload: {
+      command: "executeScript",
+      script: structuredInstructions,
+    },
+    initiatedByUserId: options.initiatedByUserId,
+  });
+}
+
+export async function fetchControllerTaskStatus(options: {
+  vps: ControllerConnectionDetails;
+  taskId: string;
+  initiatedByUserId: string;
+}) {
+  return performControllerRequest({
+    vps: options.vps,
+    interactionType: "status_pull",
+    requestMethod: "GET",
+    requestPath: `/api/commands/${encodeURIComponent(options.taskId)}/status`,
+    initiatedByUserId: options.initiatedByUserId,
+  });
+}
+
+export async function fetchControllerTaskResults(options: {
+  vps: ControllerConnectionDetails;
+  taskId: string;
+  initiatedByUserId: string;
+}) {
+  return performControllerRequest({
+    vps: options.vps,
+    interactionType: "status_pull",
+    requestMethod: "GET",
+    requestPath: `/api/commands/${encodeURIComponent(options.taskId)}/results`,
+    initiatedByUserId: options.initiatedByUserId,
+  });
 }

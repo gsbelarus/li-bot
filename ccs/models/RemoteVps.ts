@@ -45,6 +45,11 @@ const remoteVpsSchema = new Schema(
       required: true,
       trim: true,
     },
+    controllerSecretKey: {
+      type: String,
+      default: "",
+      trim: true,
+    },
     controllerVersion: {
       type: String,
       default: "",
