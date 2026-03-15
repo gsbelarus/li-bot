@@ -30,9 +30,6 @@ import {
   IconButton,
   InputAdornment,
   InputLabel,
-  List,
-  ListItemButton,
-  ListItemText,
   MenuItem,
   Paper,
   Select,
@@ -51,6 +48,7 @@ import {
   GridSortModel,
 } from "@mui/x-data-grid-premium";
 
+import { ControlCenterSidebar } from "@/components/control-center-sidebar";
 import {
   RemoteVpsInteractionLogRecord,
   RemoteVpsRecord,
@@ -186,14 +184,14 @@ function EmptyState({
     <Stack
       alignItems="center"
       justifyContent="center"
-      spacing={2}
-      sx={{ height: "100%", px: 3, textAlign: "center" }}
+      spacing={1.25}
+      sx={{ height: "100%", px: 2, textAlign: "center" }}
     >
       <Box
         sx={{
-          width: 72,
-          height: 72,
-          borderRadius: "24px",
+          width: 52,
+          height: 52,
+          borderRadius: "8px",
           background:
             "radial-gradient(circle at top, rgba(14, 98, 81, 0.18), rgba(14, 98, 81, 0.04))",
           display: "grid",
@@ -202,8 +200,8 @@ function EmptyState({
       >
         <LanRoundedIcon color="primary" />
       </Box>
-      <Typography variant="h5">{title}</Typography>
-      <Typography color="text.secondary" sx={{ maxWidth: 420 }}>
+      <Typography variant="h6">{title}</Typography>
+      <Typography color="text.secondary" sx={{ maxWidth: 360 }}>
         {body}
       </Typography>
       {action}
@@ -313,13 +311,13 @@ function RemoteVpsFormScreen({
 
   return (
     <Card sx={{ height: "100%", overflow: "auto" }}>
-      <CardContent sx={{ p: 4 }}>
-        <Stack spacing={3}>
+      <CardContent sx={{ p: 2.5 }}>
+        <Stack spacing={2}>
           <Box>
-            <Typography variant="h4">
+            <Typography variant="h5">
               {mode === "create" ? "Register VPS" : `Edit ${record?.name ?? "VPS"}`}
             </Typography>
-            <Typography color="text.secondary" sx={{ mt: 1 }}>
+            <Typography color="text.secondary" sx={{ mt: 0.5 }}>
               Capture connection details, grouping tags, and operational notes.
             </Typography>
           </Box>
@@ -329,7 +327,7 @@ function RemoteVpsFormScreen({
           <Box
             sx={{
               display: "grid",
-              gap: 2,
+              gap: 1.5,
               gridTemplateColumns: { xs: "1fr", md: "repeat(2, minmax(0, 1fr))" },
             }}
           >
@@ -751,9 +749,16 @@ export function RemoteVpsControlCenter() {
       {
         field: "status",
         headerName: "Status",
-        minWidth: 130,
+        minWidth: 220,
         renderCell: ({ row }) => (
-          <Chip label={row.status} color={statusColor(row.status)} size="small" />
+          <Stack direction="row" spacing={0.5} alignItems="center" flexWrap="wrap">
+            <Chip label={row.status} color={statusColor(row.status)} size="small" />
+            {row.timestampWarnings.length > 0 ? (
+              <Tooltip title={`Fallback timestamps: ${row.timestampWarnings.join(", ")}`}>
+                <Chip size="small" label="legacy timestamps" color="warning" variant="outlined" />
+              </Tooltip>
+            ) : null}
+          </Stack>
         ),
       },
       {
@@ -940,97 +945,49 @@ export function RemoteVpsControlCenter() {
 
   const currentSubtitle =
     screen.kind === "create"
-      ? "Register a controller endpoint in the control plane."
+      ? "Add a controller endpoint."
       : screen.kind === "edit"
-        ? "Update connection settings and operator metadata."
+        ? "Update endpoint settings."
         : screen.kind === "details"
-          ? "Inspect metadata, health posture, and recent events."
+          ? "Inspect status, metadata, and recent events."
           : screen.kind === "logs"
-            ? "Review request, response, timeout, and transport history."
-            : "Manage remote controller endpoints, search the registry, and inspect operational health.";
+            ? "Review request and health history."
+            : "Manage controller endpoints and health.";
 
   return (
     <Box sx={{ minHeight: "100vh", display: "flex", backgroundColor: "background.default" }}>
-      <Box
-        component="aside"
-        sx={{
-          width: 280,
-          flexShrink: 0,
-          borderRight: "1px solid rgba(28, 25, 23, 0.08)",
-          background:
-            "linear-gradient(180deg, rgba(255, 250, 242, 0.96), rgba(247, 239, 223, 0.9))",
-          p: 3,
-          display: { xs: "none", md: "flex" },
-          flexDirection: "column",
-          gap: 3,
-        }}
-      >
-        <Box sx={{ pb: 2.5, borderBottom: "1px solid rgba(28, 25, 23, 0.08)" }}>
-          <Typography variant="overline" color="primary.main">
-            Control Center
-          </Typography>
-          <Typography variant="h4" sx={{ mt: 0.5 }}>
-            Remote Fleet
-          </Typography>
-          <Typography color="text.secondary" sx={{ mt: 1 }}>
-            One registry for controller endpoints, diagnostics, and operator notes.
-          </Typography>
-        </Box>
-
-        <List sx={{ p: 0 }}>
-          <ListItemButton
-            selected
-            sx={{
-              mb: 1,
-              px: 0,
-              borderRadius: 0,
-              bgcolor: "transparent",
-              "&.Mui-selected": {
-                bgcolor: "transparent",
-              },
-              "&.Mui-selected:hover": {
-                bgcolor: "transparent",
-              },
-            }}
-          >
-            <ListItemText primary="Remote VPS" secondary="Registry and diagnostics" />
-          </ListItemButton>
-        </List>
-
-        <Box
-          sx={{
-            mt: "auto",
-            pt: 2.5,
-            borderTop: "1px solid rgba(28, 25, 23, 0.08)",
-          }}
-        >
-          <Typography variant="subtitle2">Registry posture</Typography>
-          <Typography color="text.secondary" sx={{ mt: 1 }}>
-            {listData.totalCount} active records tracked with retained interaction history.
-          </Typography>
-        </Box>
-      </Box>
+      <ControlCenterSidebar
+        title="Remote Fleet"
+        description="Registry for endpoints, diagnostics, and notes."
+        sections={[
+          { href: "/", label: "Remote VPS", description: "Registry and diagnostics" },
+          { href: "/scripts", label: "Scripts", description: "Authoring and conversion" },
+        ]}
+        activeHref="/"
+        footerTitle="Registry posture"
+        footerBody={`${listData.totalCount} active records with retained logs.`}
+      />
 
       <Box sx={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
         <Box
           sx={{
-            px: { xs: 2, md: 4 },
-            py: 3,
+            px: { xs: 1.25, md: 2.5 },
+            py: 1.75,
             display: "flex",
             justifyContent: "space-between",
             alignItems: { xs: "flex-start", md: "center" },
-            gap: 2,
+            gap: 1.25,
             flexWrap: "wrap",
           }}
         >
           <Box>
-            <Typography variant="h3">{currentTitle}</Typography>
-            <Typography color="text.secondary" sx={{ mt: 1, maxWidth: 680 }}>
+            <Typography variant="h4">{currentTitle}</Typography>
+            <Typography color="text.secondary" sx={{ mt: 0.5, maxWidth: 560 }}>
               {currentSubtitle}
             </Typography>
           </Box>
 
-          <Stack direction="row" spacing={1.5} alignItems="center">
+          <Stack direction="row" spacing={0.75} alignItems="center">
             {screen.kind !== "list" ? (
               <Button
                 variant="outlined"
@@ -1059,7 +1016,7 @@ export function RemoteVpsControlCenter() {
           </Stack>
         </Box>
 
-        <Box sx={{ flex: 1, minHeight: 0, px: { xs: 2, md: 4 }, pb: 4 }}>
+        <Box sx={{ flex: 1, minHeight: 0, px: { xs: 1.25, md: 2.5 }, pb: 2.5 }}>
           {screen.kind === "create" ? (
             <RemoteVpsFormScreen
               key="create-vps"
@@ -1088,10 +1045,10 @@ export function RemoteVpsControlCenter() {
           ) : null}
 
           {screen.kind === "list" ? (
-            <Stack spacing={2} sx={{ height: "100%" }}>
+            <Stack spacing={1.25} sx={{ height: "100%" }}>
               <Card>
                 <CardContent>
-                  <Stack direction={{ xs: "column", lg: "row" }} spacing={2}>
+                  <Stack direction={{ xs: "column", lg: "row" }} spacing={1.5}>
                     <TextField
                       placeholder="Search by name, host, provider, or tags"
                       value={search}
@@ -1151,10 +1108,13 @@ export function RemoteVpsControlCenter() {
               </Card>
 
               <Card sx={{ flex: 1, minHeight: 0 }}>
-                <CardContent sx={{ height: "100%", p: 1.5 }}>
+                <CardContent sx={{ height: "100%", p: 1.25 }}>
                   {listError ? <Alert severity="error">{listError}</Alert> : null}
                   <Box sx={{ height: "100%" }}>
                     <DataGridPremium
+                      density="compact"
+                      rowHeight={40}
+                      columnHeaderHeight={40}
                       rows={listData.items}
                       columns={listColumns}
                       getRowId={(row) => row.id}
@@ -1174,6 +1134,16 @@ export function RemoteVpsControlCenter() {
                       }
                       sx={{
                         border: 0,
+                        "& .MuiDataGrid-cell": {
+                          py: 0.5,
+                        },
+                        "& .MuiDataGrid-columnHeaderTitle": {
+                          fontSize: "0.79rem",
+                          fontWeight: 700,
+                        },
+                        "& .MuiDataGrid-cell, & .MuiDataGrid-footerContainer": {
+                          fontSize: "0.84rem",
+                        },
                         "& .MuiDataGrid-columnHeaders": {
                           borderBottom: "1px solid rgba(28, 25, 23, 0.08)",
                         },
@@ -1182,7 +1152,7 @@ export function RemoteVpsControlCenter() {
                         noRowsOverlay: () => (
                           <EmptyState
                             title="No VPS records yet"
-                            body="Create the first registry entry to start tracking remote controllers and their communication history."
+                            body="Add the first endpoint to start tracking controllers."
                             action={
                               <Button
                                 variant="contained"
@@ -1204,31 +1174,36 @@ export function RemoteVpsControlCenter() {
 
           {screen.kind === "details" ? (
             selectedVps ? (
-              <Stack spacing={2}>
+              <Stack spacing={1.5}>
                 <Box
                   sx={{
                     display: "grid",
-                    gap: 2,
+                    gap: 1.25,
                     gridTemplateColumns: { xs: "1fr", xl: "1.1fr 0.9fr" },
                   }}
                 >
                   <Card>
                     <CardContent>
-                      <Stack spacing={2.5}>
+                      <Stack spacing={1.5}>
                         <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
-                          <Typography variant="h4">{selectedVps.name}</Typography>
+                          <Typography variant="h5">{selectedVps.name}</Typography>
                           <Chip
                             label={selectedVps.status}
                             color={statusColor(selectedVps.status)}
                           />
                           {!selectedVps.isEnabled ? <Chip label="disabled" /> : null}
+                          {selectedVps.timestampWarnings.length > 0 ? (
+                            <Tooltip title={`Fallback timestamps: ${selectedVps.timestampWarnings.join(", ")}`}>
+                              <Chip size="small" label="legacy timestamps" color="warning" variant="outlined" />
+                            </Tooltip>
+                          ) : null}
                         </Stack>
                         <Typography color="text.secondary">{selectedVps.statusReason}</Typography>
                         <Divider />
                         <Box
                           sx={{
                             display: "grid",
-                            gap: 2,
+                            gap: 1.5,
                             gridTemplateColumns: { xs: "1fr", md: "repeat(2, minmax(0, 1fr))" },
                           }}
                         >
@@ -1256,7 +1231,7 @@ export function RemoteVpsControlCenter() {
                           <Typography variant="subtitle2" color="text.secondary">
                             Tags
                           </Typography>
-                          <Stack direction="row" spacing={1} flexWrap="wrap" sx={{ mt: 1 }}>
+                          <Stack direction="row" spacing={0.75} flexWrap="wrap" sx={{ mt: 0.75 }}>
                             {selectedVps.tags.length > 0 ? (
                               selectedVps.tags.map((tag) => <Chip key={tag} label={tag} variant="outlined" />)
                             ) : (
@@ -1268,11 +1243,11 @@ export function RemoteVpsControlCenter() {
                           <Typography variant="subtitle2" color="text.secondary">
                             Notes
                           </Typography>
-                          <Typography sx={{ mt: 1, whiteSpace: "pre-wrap" }}>
+                          <Typography sx={{ mt: 0.75, whiteSpace: "pre-wrap" }}>
                             {selectedVps.notes || "No operator notes recorded."}
                           </Typography>
                         </Box>
-                        <Stack direction="row" spacing={1.5} flexWrap="wrap">
+                        <Stack direction="row" spacing={1} flexWrap="wrap">
                           <Button
                             variant="contained"
                             startIcon={<EditRoundedIcon />}
@@ -1318,22 +1293,22 @@ export function RemoteVpsControlCenter() {
 
                   <Card>
                     <CardContent>
-                      <Typography variant="h5">Recent interaction history</Typography>
-                      <Typography color="text.secondary" sx={{ mt: 1, mb: 2 }}>
-                        The latest request, response, and failure events linked to this VPS.
+                      <Typography variant="h6">Recent interaction history</Typography>
+                      <Typography color="text.secondary" sx={{ mt: 0.35, mb: 1 }}>
+                        Latest request and failure events.
                       </Typography>
                       {detailLogs.length === 0 ? (
                         <EmptyState
                           title="No interaction logs yet"
-                          body="Run a manual test or health check to populate the communication trail."
+                          body="Run a test or health check to create log entries."
                         />
                       ) : (
-                        <Stack spacing={1.5}>
+                        <Stack spacing={0.75}>
                           {detailLogs.map((log) => (
                             <Paper
                               key={log.id}
                               variant="outlined"
-                              sx={{ p: 2, borderRadius: 4, cursor: "pointer" }}
+                              sx={{ p: 1.25, borderRadius: "7px", cursor: "pointer" }}
                               onClick={() => setScreen({ kind: "logs", vpsId: selectedVps.id })}
                             >
                               <Stack direction="row" justifyContent="space-between" spacing={2}>
@@ -1347,7 +1322,7 @@ export function RemoteVpsControlCenter() {
                                     <Typography variant="subtitle2">{log.interactionType}</Typography>
                                     <Typography color="text.secondary">{log.requestPath}</Typography>
                                   </Stack>
-                                  <Typography color="text.secondary" sx={{ mt: 1 }}>
+                                  <Typography color="text.secondary" sx={{ mt: 0.5 }}>
                                     {log.errorMessage || "Completed without reported transport errors."}
                                   </Typography>
                                 </Box>
@@ -1373,10 +1348,10 @@ export function RemoteVpsControlCenter() {
 
           {screen.kind === "logs" ? (
             selectedVps ? (
-              <Stack spacing={2} sx={{ height: "100%" }}>
+              <Stack spacing={1.25} sx={{ height: "100%" }}>
                 <Card>
                   <CardContent>
-                    <Stack direction={{ xs: "column", lg: "row" }} spacing={2}>
+                    <Stack direction={{ xs: "column", lg: "row" }} spacing={1.5}>
                       <FormControl sx={{ minWidth: 180 }}>
                         <InputLabel id="log-result-filter-label">Result</InputLabel>
                         <Select
@@ -1440,10 +1415,13 @@ export function RemoteVpsControlCenter() {
                 </Card>
 
                 <Card sx={{ flex: 1, minHeight: 0 }}>
-                  <CardContent sx={{ height: "100%", p: 1.5 }}>
+                  <CardContent sx={{ height: "100%", p: 1.25 }}>
                     {logsError ? <Alert severity="error">{logsError}</Alert> : null}
                     <Box sx={{ height: "100%" }}>
                       <DataGridPremium
+                        density="compact"
+                        rowHeight={40}
+                        columnHeaderHeight={40}
                         rows={logsData.items}
                         columns={logColumns}
                         getRowId={(row) => row.id}
@@ -1458,12 +1436,24 @@ export function RemoteVpsControlCenter() {
                         onRowClick={(params: GridRowParams<RemoteVpsInteractionLogRecord>) =>
                           void refreshSelectedLog(params.row)
                         }
-                        sx={{ border: 0 }}
+                        sx={{
+                          border: 0,
+                          "& .MuiDataGrid-cell": {
+                            py: 0.5,
+                          },
+                          "& .MuiDataGrid-columnHeaderTitle": {
+                            fontSize: "0.79rem",
+                            fontWeight: 700,
+                          },
+                          "& .MuiDataGrid-cell, & .MuiDataGrid-footerContainer": {
+                            fontSize: "0.84rem",
+                          },
+                        }}
                         slots={{
                           noRowsOverlay: () => (
                             <EmptyState
                               title="No logs match the current filters"
-                              body="Broaden the time range or run a fresh test to capture new controller interactions."
+                              body="Broaden filters or run a fresh test."
                             />
                           ),
                         }}
@@ -1475,7 +1465,7 @@ export function RemoteVpsControlCenter() {
             ) : (
               <EmptyState
                 title="Unable to load VPS logs"
-                body="The selected VPS record is unavailable, so the interaction history could not be opened."
+                body="The selected record is unavailable."
               />
             )
           ) : null}
@@ -1557,7 +1547,7 @@ function PayloadBlock({ title, value }: { title: string; value: unknown }) {
       </Typography>
       <Paper
         variant="outlined"
-        sx={{ mt: 1, p: 2, borderRadius: 4, backgroundColor: "rgba(28, 25, 23, 0.02)" }}
+        sx={{ mt: 0.5, p: 1.25, borderRadius: "7px", backgroundColor: "rgba(28, 25, 23, 0.02)" }}
       >
         <Typography
           component="pre"

@@ -8,7 +8,9 @@ import {
   LogInteractionType,
   LogResult,
   RemoteVpsInteractionLogRecord,
+  RemoteVpsInteractionLogTimestampWarning,
   RemoteVpsRecord,
+  RemoteVpsTimestampWarning,
   VpsEnvironment,
   VpsProtocol,
   VpsStatus,
@@ -19,14 +21,103 @@ import {
 } from "@/lib/remote-vps-shared";
 
 const actorFallback = "operator@control-center";
+const fallbackIsoTimestamp = new Date(0).toISOString();
 
 const sensitiveKeyPattern = /(password|secret|token|authorization|cookie|apiKey|accessKey|privateKey)/i;
 
 const safeString = (value: unknown, fallback = "") =>
   typeof value === "string" ? value.trim() : fallback;
 
-const toNullableIso = (value: Date | string | null | undefined) =>
-  value ? new Date(value).toISOString() : null;
+function parsePositiveIntegerParam(
+  value: string | null,
+  fallback: number,
+  { min = 1, max }: { min?: number; max?: number } = {}
+) {
+  const parsed = Number.parseInt(value ?? "", 10);
+
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+
+  const normalized = Math.max(min, parsed);
+  return typeof max === "number" ? Math.min(max, normalized) : normalized;
+}
+
+function parseBooleanInput(
+  value: unknown,
+  fallback: boolean
+): { value: boolean; isValid: boolean } {
+  if (value === undefined || value === null || value === "") {
+    return { value: fallback, isValid: true };
+  }
+
+  if (typeof value === "boolean") {
+    return { value, isValid: true };
+  }
+
+  if (typeof value === "number") {
+    if (value === 1) {
+      return { value: true, isValid: true };
+    }
+
+    if (value === 0) {
+      return { value: false, isValid: true };
+    }
+
+    return { value: fallback, isValid: false };
+  }
+
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+
+    if (normalized === "true" || normalized === "1") {
+      return { value: true, isValid: true };
+    }
+
+    if (normalized === "false" || normalized === "0") {
+      return { value: false, isValid: true };
+    }
+
+    return { value: fallback, isValid: false };
+  }
+
+  return { value: fallback, isValid: false };
+}
+
+const toIsoResult = <TWarning extends string>(
+  warning: TWarning,
+  value: Date | string | null | undefined,
+  fallback = fallbackIsoTimestamp
+): { value: string; warning?: TWarning } => {
+  if (value === null || value === undefined) {
+    return { value: fallback, warning };
+  }
+
+  const date = value instanceof Date ? value : new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return { value: fallback, warning };
+  }
+
+  return { value: date.toISOString() };
+};
+
+const toNullableIsoResult = <TWarning extends string>(
+  warning: TWarning,
+  value: Date | string | null | undefined
+): { value: string | null; warning?: TWarning } => {
+  if (value === null || value === undefined) {
+    return { value: null };
+  }
+
+  const date = value instanceof Date ? value : new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return { value: null, warning };
+  }
+
+  return { value: date.toISOString() };
+};
 
 function truncateString(value: string, maxLength = 600) {
   if (value.length <= maxLength) {
@@ -79,6 +170,19 @@ function hasToObject(
 
 export function serializeVps(document: RemoteVpsDocument | Record<string, unknown>) {
   const source = hasToObject(document) ? document.toObject() : document;
+  const lastSeenAt = toNullableIsoResult("lastSeenAt", source.lastSeenAt as Date | string | null | undefined);
+  const lastHealthCheckAt = toNullableIsoResult(
+    "lastHealthCheckAt",
+    source.lastHealthCheckAt as Date | string | null | undefined
+  );
+  const createdAt = toIsoResult("createdAt", source.createdAt as Date | string | null | undefined);
+  const updatedAt = toIsoResult("updatedAt", source.updatedAt as Date | string | null | undefined);
+  const timestampWarnings = [
+    lastSeenAt.warning,
+    lastHealthCheckAt.warning,
+    createdAt.warning,
+    updatedAt.warning,
+  ].filter((warning): warning is RemoteVpsTimestampWarning => Boolean(warning));
 
   return {
     id: String(source._id),
@@ -92,10 +196,8 @@ export function serializeVps(document: RemoteVpsDocument | Record<string, unknow
     controllerVersion: safeString(source.controllerVersion),
     status: source.status as VpsStatus,
     statusReason: safeString(source.statusReason),
-    lastSeenAt: toNullableIso(source.lastSeenAt as Date | string | null),
-    lastHealthCheckAt: toNullableIso(
-      source.lastHealthCheckAt as Date | string | null
-    ),
+    lastSeenAt: lastSeenAt.value,
+    lastHealthCheckAt: lastHealthCheckAt.value,
     lastHealthCheckResult: source.lastHealthCheckResult as
       | "success"
       | "failed"
@@ -106,16 +208,19 @@ export function serializeVps(document: RemoteVpsDocument | Record<string, unknow
       : [],
     notes: safeString(source.notes),
     isEnabled: Boolean(source.isEnabled),
-    createdAt: new Date(source.createdAt as Date | string).toISOString(),
-    updatedAt: new Date(source.updatedAt as Date | string).toISOString(),
+    createdAt: createdAt.value,
+    updatedAt: updatedAt.value,
     createdBy: safeString(source.createdBy),
     updatedBy: safeString(source.updatedBy),
+    timestampWarnings,
   } satisfies RemoteVpsRecord;
 }
 
 export function serializeInteractionLog(
   document: Record<string, unknown>
 ): RemoteVpsInteractionLogRecord {
+  const createdAt = toIsoResult("createdAt", document.createdAt as Date | string | null | undefined);
+
   return {
     id: String(document._id),
     vpsId: String(document.vpsId),
@@ -140,7 +245,10 @@ export function serializeInteractionLog(
     initiatedBy:
       document.initiatedBy as RemoteVpsInteractionLogRecord["initiatedBy"],
     initiatedByUserId: safeString(document.initiatedByUserId),
-    createdAt: new Date(document.createdAt as Date | string).toISOString(),
+    createdAt: createdAt.value,
+    timestampWarnings: createdAt.warning
+      ? [createdAt.warning as RemoteVpsInteractionLogTimestampWarning]
+      : [],
   };
 }
 
@@ -209,8 +317,7 @@ export function validateVpsPayload(input: unknown): VpsPayload {
   const notes = safeString(input.notes);
   const portNumber = Number(input.port);
   const tags = normalizeTags(input.tags);
-  const isEnabled =
-    typeof input.isEnabled === "boolean" ? input.isEnabled : Boolean(input.isEnabled);
+  const isEnabled = parseBooleanInput(input.isEnabled, false);
 
   if (!name) {
     errors.name = "Name is required.";
@@ -236,6 +343,10 @@ export function validateVpsPayload(input: unknown): VpsPayload {
     errors.provider = "Provider is required.";
   }
 
+  if (!isEnabled.isValid) {
+    errors.isEnabled = "Enabled status must be a boolean, 'true'/'false', or 1/0.";
+  }
+
   if (Object.keys(errors).length > 0) {
     throw new PayloadValidationError(errors);
   }
@@ -250,7 +361,7 @@ export function validateVpsPayload(input: unknown): VpsPayload {
     provider,
     tags,
     notes,
-    isEnabled,
+    isEnabled: isEnabled.value,
   };
 }
 
@@ -285,11 +396,10 @@ export function getActorFromRequest(request: Request) {
 }
 
 export function getListQuery(searchParams: URLSearchParams) {
-  const page = Math.max(1, Number(searchParams.get("page") ?? 1));
-  const pageSize = Math.min(
-    100,
-    Math.max(1, Number(searchParams.get("pageSize") ?? 10))
-  );
+  const page = parsePositiveIntegerParam(searchParams.get("page"), 1);
+  const pageSize = parsePositiveIntegerParam(searchParams.get("pageSize"), 10, {
+    max: 100,
+  });
   const search = safeString(searchParams.get("search"));
   const status = safeString(searchParams.get("status"));
   const environment = safeString(searchParams.get("environment"));
@@ -333,11 +443,10 @@ export function getListQuery(searchParams: URLSearchParams) {
 }
 
 export function getLogListQuery(searchParams: URLSearchParams) {
-  const page = Math.max(1, Number(searchParams.get("page") ?? 1));
-  const pageSize = Math.min(
-    100,
-    Math.max(1, Number(searchParams.get("pageSize") ?? 20))
-  );
+  const page = parsePositiveIntegerParam(searchParams.get("page"), 1);
+  const pageSize = parsePositiveIntegerParam(searchParams.get("pageSize"), 20, {
+    max: 100,
+  });
   const result = safeString(searchParams.get("result"));
   const interactionType = safeString(searchParams.get("interactionType"));
   const startAt = safeString(searchParams.get("startAt"));
