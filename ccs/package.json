@@ -9,16 +9,19 @@
     "lint": "eslint"
   },
   "dependencies": {
-    "next": "16.1.6",
-    "react": "19.2.3",
-    "react-dom": "19.2.3",
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.1",
     "@mui/icons-material": "^7.3.9",
     "@mui/material": "^7.3.9",
     "@mui/material-nextjs": "^7.3.9",
     "@mui/x-data-grid-generator": "^8.27.5",
     "@mui/x-data-grid-premium": "^8.27.5",
     "@mui/x-date-pickers-pro": "^8.27.2",
-    "@mui/x-license": "8.26.0"    
+    "@mui/x-license": "8.26.0",
+    "mongoose": "^9.3.0",
+    "next": "16.1.6",
+    "react": "19.2.3",
+    "react-dom": "19.2.3"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",

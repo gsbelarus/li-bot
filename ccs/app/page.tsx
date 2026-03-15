@@ -1,7 +1,5 @@
+import { RemoteVpsControlCenter } from "@/components/remote-vps-control-center";
+
 export default function Home() {
-  return (
-    <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      The start screen is under construction
-    </div>
-  );
+  return <RemoteVpsControlCenter />;
 }
