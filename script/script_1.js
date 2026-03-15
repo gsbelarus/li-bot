@@ -14,8 +14,10 @@
  */
 
 const { spawnSync } = require("node:child_process");
+const fs = require("node:fs");
 const http = require("node:http");
 const https = require("node:https");
+const path = require("node:path");
 
 const BROWSER_PROFILE = process.env.OPENCLAW_BROWSER_PROFILE || "chrome"; // chrome profile = extension relay
 const GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || "";
@@ -28,6 +30,173 @@ const MIN_SLEEP_MS = 1000;
 const MAX_SLEEP_MS = 5000;
 const BACKEND_RETRY_COUNT = 3;
 const BACKEND_RETRY_DELAY_MS = 500;
+const ERROR_LOG_DIR = path.join(__dirname, "logs");
+
+const runtimeState = {
+  startedAt: nowIso(),
+  step: "startup",
+  targetId: null,
+  sessionId: null,
+  activeTab: null,
+  lastCommand: null,
+  recentCommands: [],
+  errorLogged: false,
+};
+
+function sanitizeDetails(value, seen = new WeakSet()) {
+  if (value == null) {
+    return value;
+  }
+
+  if (typeof value === "function") {
+    return `[Function ${value.name || "anonymous"}]`;
+  }
+
+  if (typeof value !== "object") {
+    return value;
+  }
+
+  if (value instanceof Error) {
+    return serializeError(value);
+  }
+
+  if (seen.has(value)) {
+    return "[Circular]";
+  }
+
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    return value.map((entry) => sanitizeDetails(entry, seen));
+  }
+
+  return Object.fromEntries(
+    Object.entries(value).map(([key, entry]) => [key, sanitizeDetails(entry, seen)])
+  );
+}
+
+function attachErrorDetails(error, details) {
+  if (error && details) {
+    error.details = {
+      ...(error.details || {}),
+      ...details,
+    };
+  }
+
+  return error;
+}
+
+function serializeError(error) {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+      code: error.code || null,
+      details: sanitizeDetails(error.details || null),
+      cause: error.cause ? sanitizeDetails(error.cause) : null,
+    };
+  }
+
+  return {
+    name: typeof error,
+    message: String(error),
+    stack: null,
+    code: null,
+    details: sanitizeDetails(error),
+    cause: null,
+  };
+}
+
+function setRuntimeStep(step, extra = {}) {
+  runtimeState.step = step;
+  Object.assign(runtimeState, extra);
+}
+
+function trackCommand(command, commandArgs, fullArgs) {
+  const entry = {
+    at: nowIso(),
+    executable: command,
+    shellArgs: commandArgs,
+    openClawArgs: fullArgs,
+  };
+
+  runtimeState.lastCommand = entry;
+  runtimeState.recentCommands.push(entry);
+  if (runtimeState.recentCommands.length > 20) {
+    runtimeState.recentCommands = runtimeState.recentCommands.slice(-20);
+  }
+
+  return entry;
+}
+
+function createErrorLogPayload(error) {
+  return {
+    loggedAt: nowIso(),
+    process: {
+      pid: process.pid,
+      argv: process.argv,
+      cwd: process.cwd(),
+      nodeVersion: process.version,
+      platform: process.platform,
+    },
+    config: {
+      browserProfile: BROWSER_PROFILE,
+      gatewayUrl: GATEWAY_URL || null,
+      gatewayTokenConfigured: Boolean(GATEWAY_TOKEN),
+      backendBaseUrl: BACKEND_BASE_URL,
+      openClawBin: OPENCLAW_BIN,
+    },
+    runtime: {
+      startedAt: runtimeState.startedAt,
+      step: runtimeState.step,
+      targetId: runtimeState.targetId,
+      sessionId: runtimeState.sessionId,
+      activeTab: sanitizeDetails(runtimeState.activeTab),
+      lastCommand: sanitizeDetails(runtimeState.lastCommand),
+      recentCommands: sanitizeDetails(runtimeState.recentCommands),
+    },
+    error: serializeError(error),
+  };
+}
+
+function writeDetailedErrorLog(error) {
+  if (runtimeState.errorLogged) {
+    return null;
+  }
+
+  runtimeState.errorLogged = true;
+
+  const payload = createErrorLogPayload(error);
+  const fileName = `error-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+  const filePath = path.join(ERROR_LOG_DIR, fileName);
+
+  fs.mkdirSync(ERROR_LOG_DIR, { recursive: true });
+  fs.writeFileSync(filePath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+
+  return filePath;
+}
+
+function handleFatalError(error, origin) {
+  const normalizedError = error instanceof Error ? error : new Error(String(error));
+  const detailedError = attachErrorDetails(normalizedError, { origin });
+  const logPath = writeDetailedErrorLog(detailedError);
+
+  console.error("\nERROR:", detailedError.message);
+  if (logPath) {
+    console.error("Detailed log:", logPath);
+  }
+}
+
+process.on("unhandledRejection", (reason) => {
+  handleFatalError(reason instanceof Error ? reason : new Error(String(reason)), "unhandledRejection");
+  process.exit(1);
+});
+
+process.on("uncaughtException", (error) => {
+  handleFatalError(error, "uncaughtException");
+  process.exit(1);
+});
 
 function oc(args, { json = false } = {}) {
   const fullArgs = ["browser", "--browser-profile", BROWSER_PROFILE];
@@ -51,6 +220,8 @@ function oc(args, { json = false } = {}) {
     ? ["/d", "/s", "/c", OPENCLAW_BIN, ...fullArgs]
     : fullArgs;
 
+  trackCommand(command, commandArgs, fullArgs);
+
   const result = spawnSync(command, commandArgs, {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
@@ -58,21 +229,54 @@ function oc(args, { json = false } = {}) {
 
   if (result.error) {
     if (result.error.code === "ENOENT") {
-      throw new Error(
+      throw attachErrorDetails(new Error(
         `Could not launch OpenClaw CLI. Set OPENCLAW_BIN if the executable is not on PATH. Tried: ${OPENCLAW_BIN}`
-      );
+      ), {
+        type: "openclaw-launch",
+        executable: command,
+        shellArgs: commandArgs,
+        openClawArgs: fullArgs,
+        spawnError: serializeError(result.error),
+      });
     }
-    throw result.error;
+    throw attachErrorDetails(result.error, {
+      type: "openclaw-launch",
+      executable: command,
+      shellArgs: commandArgs,
+      openClawArgs: fullArgs,
+    });
   }
 
   if (result.status !== 0) {
     const stderr = (result.stderr || "").trim();
     const stdout = (result.stdout || "").trim();
-    throw new Error(stderr || stdout || `OpenClaw exited with code ${result.status}.`);
+    throw attachErrorDetails(new Error(stderr || stdout || `OpenClaw exited with code ${result.status}.`), {
+      type: "openclaw-exit",
+      executable: command,
+      shellArgs: commandArgs,
+      openClawArgs: fullArgs,
+      exitCode: result.status,
+      stdout,
+      stderr,
+    });
   }
 
   const stdout = result.stdout || "";
-  return json ? JSON.parse(stdout) : stdout.trim();
+  if (!json) {
+    return stdout.trim();
+  }
+
+  try {
+    return JSON.parse(stdout);
+  } catch (error) {
+    throw attachErrorDetails(error, {
+      type: "openclaw-json-parse",
+      executable: command,
+      shellArgs: commandArgs,
+      openClawArgs: fullArgs,
+      stdout: stdout.trim(),
+    });
+  }
 }
 
 function sleep(ms) {
@@ -155,9 +359,17 @@ async function postJson(path, body, { method = "POST" } = {}) {
 
               if (statusCode < 200 || statusCode >= 300) {
                 reject(
-                  new Error(
+                  attachErrorDetails(new Error(
                     `Backend request failed: ${method} ${path} -> ${statusCode} ${responseText}`.trim()
-                  )
+                  ), {
+                    type: "backend-response",
+                    method,
+                    path,
+                    url: url.toString(),
+                    statusCode,
+                    requestBody: body,
+                    responseText,
+                  })
                 );
                 return;
               }
@@ -170,7 +382,14 @@ async function postJson(path, body, { method = "POST" } = {}) {
               try {
                 resolve(JSON.parse(responseText));
               } catch (error) {
-                reject(error);
+                reject(attachErrorDetails(error, {
+                  type: "backend-json-parse",
+                  method,
+                  path,
+                  url: url.toString(),
+                  requestBody: body,
+                  responseText,
+                }));
               }
             });
           }
@@ -181,7 +400,15 @@ async function postJson(path, body, { method = "POST" } = {}) {
         request.end();
       });
     } catch (error) {
-      lastError = error;
+      lastError = attachErrorDetails(error, {
+        type: error?.details?.type || "backend-request",
+        method,
+        path,
+        url: url.toString(),
+        requestBody: body,
+        attempt: attempt + 1,
+        retryCount: BACKEND_RETRY_COUNT,
+      });
       if (attempt < BACKEND_RETRY_COUNT - 1) {
         await sleep(BACKEND_RETRY_DELAY_MS);
       }
@@ -715,16 +942,23 @@ function getFocusedTab() {
 }
 
 async function main() {
+  setRuntimeStep("resolve-active-tab");
   const activeTab = getFocusedTab();
   const targetId = activeTab.id;
+  setRuntimeStep("create-session", {
+    activeTab,
+    targetId,
+  });
   const session = await createSession(activeTab);
   const telemetry = createTelemetryState(session._id);
+  runtimeState.sessionId = session._id;
 
   console.log(`Using attached ${BROWSER_PROFILE} relay tab: ${activeTab.title || activeTab.url}`);
   console.log(`Using targetId: ${targetId}`);
   console.log(`Created backend session: ${session._id}`);
 
   try {
+    setRuntimeStep("start-initial-visit");
     startVisit(telemetry, {
       url: activeTab.url,
       title: activeTab.title,
@@ -734,6 +968,7 @@ async function main() {
     addAction(telemetry, `page:view:${truncate(activeTab.url, 80)}`);
 
     if (!activeTab.url.toLowerCase().includes("linkedin.com/mynetwork")) {
+      setRuntimeStep("navigate-mynetwork");
       console.log("Navigating attached tab to LinkedIn My Network");
       addAction(telemetry, "navigate:page:https://www.linkedin.com/mynetwork/");
       oc(["navigate", "https://www.linkedin.com/mynetwork/", "--target-id", targetId]);
@@ -748,20 +983,24 @@ async function main() {
         // best effort
       }
 
+      setRuntimeStep("wait-for-mynetwork");
       const myNetworkPageState = await waitForPageState(
         targetId,
         (pageState) => pageState.url.toLowerCase().includes("linkedin.com/mynetwork")
       );
 
+      setRuntimeStep("finalize-initial-visit");
       await finalizeVisit(telemetry, targetId, {
         url: "https://www.linkedin.com/mynetwork/",
       });
 
+      setRuntimeStep("start-mynetwork-visit");
       startVisit(telemetry, myNetworkPageState);
       addAction(telemetry, "page:view:https://www.linkedin.com/mynetwork/");
     }
 
     // 4. Read the page again
+    setRuntimeStep("snapshot-mynetwork");
     const snap2 = oc(["snapshot", "--target-id", targetId], { json: true });
     addAction(telemetry, "snapshot:page:mynetwork");
 
@@ -775,6 +1014,9 @@ async function main() {
 
     const firstCard = getRefDetails(snap2, firstCardRef);
     console.log(`Clicking first card ref=${firstCardRef}`);
+    setRuntimeStep("open-first-profile", {
+      selectedCard: firstCard,
+    });
     clickRef(targetId, firstCardRef, telemetry, snap2);
     const profileOpenWaitMs = getRandomSleepMs();
 
@@ -787,31 +1029,40 @@ async function main() {
       // best effort
     }
 
+    setRuntimeStep("wait-for-profile-page");
     const finalPageState = await waitForPageState(
       targetId,
       (pageState) => isLinkedInProfileUrl(pageState.url),
       { attempts: 8 }
     );
+    setRuntimeStep("finalize-profile-open-visit");
     await finalizeVisit(telemetry, targetId, finalPageState);
 
+    setRuntimeStep("start-profile-visit");
     startVisit(telemetry, finalPageState);
     addAction(telemetry, `page:view:${truncate(finalPageState.url, 80)}`);
     addAction(telemetry, "automation:profile-opened");
 
+    setRuntimeStep("snapshot-profile");
     const profileSnapshot = oc(["snapshot", "--target-id", targetId], { json: true });
     addAction(telemetry, "snapshot:page:profile");
+    setRuntimeStep("open-all-posts");
     clickShowAllPosts(targetId, telemetry, profileSnapshot, finalPageState.url);
     await waitRandomDelay(targetId, telemetry);
 
+    setRuntimeStep("wait-for-activity-page");
     const activityPageState = await waitForPageState(
       targetId,
       (pageState) => pageState.url.toLowerCase().includes("/recent-activity/all")
     );
 
+    setRuntimeStep("finalize-profile-visit");
     await finalizeVisit(telemetry, targetId, activityPageState);
+    setRuntimeStep("start-activity-visit");
     startVisit(telemetry, activityPageState);
     addAction(telemetry, `page:view:${truncate(activityPageState.url, 80)}`);
 
+    setRuntimeStep("snapshot-activity");
     const activitySnapshot = oc(["snapshot", "--target-id", targetId], { json: true });
     addAction(telemetry, "snapshot:page:activity");
 
@@ -820,6 +1071,7 @@ async function main() {
       throw new Error('Could not find the "more" control for the third post in Activity.');
     }
 
+    setRuntimeStep("open-third-post-more");
     scrollRefIntoView(targetId, thirdPostMoreRef, telemetry, activitySnapshot, "third-post");
     clickRefWithOptions(targetId, thirdPostMoreRef, telemetry, activitySnapshot, {
       postIndex: 3,
@@ -830,8 +1082,10 @@ async function main() {
     const currentUrl = activityPageState.url;
 
     console.log(`Final URL: ${JSON.stringify(currentUrl)}`);
+    setRuntimeStep("finalize-activity-visit");
     await finalizeVisit(telemetry, targetId, activityPageState);
   } finally {
+    setRuntimeStep("cleanup");
     try {
       await finalizeVisit(telemetry, targetId);
     } finally {
@@ -841,6 +1095,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error("\nERROR:", err.message);
+  handleFatalError(err, "main.catch");
   process.exit(1);
 });
