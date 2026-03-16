@@ -1268,7 +1268,6 @@ export class OpenClawRuntime {
     const deadline = Date.now() + Math.max(250, step.timeoutMs);
     const desiredIndex = this.getCandidateIndex(step);
     const hasExplicitIndex = hasExplicitTargetIndex(step);
-    let previousScrollY = Number.NaN;
 
     while (Date.now() <= deadline) {
       const snapshot = await this.getSnapshot(targetId, context);
@@ -1299,26 +1298,15 @@ export class OpenClawRuntime {
       }
 
       if (shouldAutoScrollSearch(step)) {
-        const pageState = await this.getPageState(targetId, context);
-        const currentScrollY = scalarNumber(pageState.scrollY, Number.NaN);
-        const nextScroll = await this.evaluate(
+        const nextScroll = await this.scrollPageOrPostContainer(
           targetId,
-          `() => {
-            const viewportHeight = Math.max(window.innerHeight || 0, 1);
-            const delta = Math.max(500, Math.floor(viewportHeight * 0.85));
-            window.scrollBy({ top: delta, behavior: "auto" });
-            return { scrollY: window.scrollY, delta };
-          }`,
+          { behavior: "auto", direction: "down" },
           context
-        ) as { scrollY?: number; delta?: number };
+        );
 
-        const nextScrollY = scalarNumber(nextScroll?.scrollY, currentScrollY);
-
-        if (Number.isFinite(previousScrollY) && nextScrollY <= previousScrollY) {
+        if (!nextScroll.moved) {
           break;
         }
-
-        previousScrollY = nextScrollY;
       }
 
       await sleep(Math.min(500, Math.max(100, step.delayAfterMs || 250)));
@@ -1356,7 +1344,6 @@ export class OpenClawRuntime {
     }
 
     const deadline = Date.now() + Math.max(250, step.timeoutMs);
-    let previousScrollY = Number.NaN;
 
     while (Date.now() <= deadline) {
       const snapshot = await this.getSnapshot(targetId, context);
@@ -1368,26 +1355,15 @@ export class OpenClawRuntime {
       }
 
       if (shouldAutoScrollSearch(step)) {
-        const pageState = await this.getPageState(targetId, context);
-        const currentScrollY = scalarNumber(pageState.scrollY, Number.NaN);
-        const nextScroll = await this.evaluate(
+        const nextScroll = await this.scrollPageOrPostContainer(
           targetId,
-          `() => {
-            const viewportHeight = Math.max(window.innerHeight || 0, 1);
-            const delta = Math.max(500, Math.floor(viewportHeight * 0.85));
-            window.scrollBy({ top: delta, behavior: "auto" });
-            return { scrollY: window.scrollY, delta };
-          }`,
+          { behavior: "auto", direction: "down" },
           context
-        ) as { scrollY?: number; delta?: number };
+        );
 
-        const nextScrollY = scalarNumber(nextScroll?.scrollY, currentScrollY);
-
-        if (Number.isFinite(previousScrollY) && nextScrollY <= previousScrollY) {
+        if (!nextScroll.moved) {
           break;
         }
-
-        previousScrollY = nextScrollY;
       }
 
       await sleep(Math.min(500, Math.max(100, step.delayAfterMs || 250)));
@@ -1510,6 +1486,190 @@ export class OpenClawRuntime {
     );
   }
 
+  private async scrollPageOrPostContainer(
+    targetId: string,
+    {
+      amount,
+      direction = "down",
+      behavior = "auto",
+    }: {
+      amount?: number;
+      direction?: "up" | "down";
+      behavior?: "auto" | "smooth";
+    } = {},
+    context: ExecutionContext = {}
+  ) {
+    const normalizedDirection = direction === "up" ? "up" : "down";
+    const normalizedBehavior = behavior === "smooth" ? "smooth" : "auto";
+    const explicitAmount = Number.isFinite(amount) ? Math.abs(Number(amount)) : 0;
+
+    const result = await this.evaluate(
+      targetId,
+      `() => {
+        const viewportHeight = Math.max(window.innerHeight || 0, 1);
+        const delta = ${JSON.stringify(explicitAmount)} > 0
+          ? ${JSON.stringify(explicitAmount)}
+          : Math.max(500, Math.floor(viewportHeight * 0.85));
+        const direction = ${JSON.stringify(normalizedDirection)};
+        const behavior = ${JSON.stringify(normalizedBehavior)};
+        const directionSign = direction === "up" ? -1 : 1;
+        const beforeWindowY = window.scrollY;
+
+        window.scrollBy({
+          top: directionSign * delta,
+          behavior,
+        });
+
+        const afterWindowY = window.scrollY;
+
+        if (afterWindowY !== beforeWindowY) {
+          return {
+            ok: true,
+            action: "scroll",
+            moved: true,
+            usedContainer: false,
+            scrollY: afterWindowY,
+            containerScrollTop: null,
+            delta,
+            direction,
+            tagName: null,
+            ariaLabel: null,
+          };
+        }
+
+        const articleSelector = "article, [role='article']";
+        const candidateMap = new Map();
+        const addCandidate = (element) => {
+          if (!(element instanceof HTMLElement) || candidateMap.has(element)) {
+            return;
+          }
+
+          candidateMap.set(element, true);
+        };
+
+        addCandidate(document.querySelector("main"));
+        addCandidate(document.querySelector("[role='main']"));
+
+        const articleNodes = Array.from(document.querySelectorAll(articleSelector)).slice(0, 12);
+
+        for (const node of articleNodes) {
+          let current = node instanceof HTMLElement ? node : null;
+          let depth = 0;
+
+          while (current && depth < 10) {
+            addCandidate(current);
+            current = current.parentElement;
+            depth += 1;
+          }
+        }
+
+        let bestElement = null;
+        let bestScore = Number.NEGATIVE_INFINITY;
+
+        for (const element of candidateMap.keys()) {
+          const rect = element.getBoundingClientRect();
+          const visibleHeight = Math.max(
+            0,
+            Math.min(rect.bottom, window.innerHeight) - Math.max(rect.top, 0)
+          );
+          const scrollRange = Math.max(0, element.scrollHeight - element.clientHeight);
+
+          if (visibleHeight <= 0 || scrollRange < 40) {
+            continue;
+          }
+
+          const overflowY = window.getComputedStyle(element).overflowY.toLowerCase();
+          const overflowScrollable = overflowY === "auto" || overflowY === "scroll" || overflowY === "overlay";
+          const articleCount = element.querySelectorAll(articleSelector).length;
+          const signalText = [
+            element.getAttribute("aria-label") || "",
+            element.getAttribute("data-view-name") || "",
+            element.id || "",
+            typeof element.className === "string" ? element.className : "",
+          ]
+            .join(" ")
+            .toLowerCase();
+          const score =
+            Math.min(scrollRange, 4000) +
+            visibleHeight +
+            (overflowScrollable ? 500 : 0) +
+            Math.min(articleCount, 5) * 250 +
+            (element.matches("main, [role='main']") ? 150 : 0) +
+            (/activity|posts|feed/.test(signalText) ? 120 : 0);
+
+          if (score > bestScore) {
+            bestScore = score;
+            bestElement = element;
+          }
+        }
+
+        if (bestElement instanceof HTMLElement) {
+          const beforeContainerTop = bestElement.scrollTop;
+          bestElement.scrollBy({
+            top: directionSign * delta,
+            behavior,
+          });
+          const afterContainerTop = bestElement.scrollTop;
+
+          if (afterContainerTop !== beforeContainerTop) {
+            return {
+              ok: true,
+              action: "scroll",
+              moved: true,
+              usedContainer: true,
+              scrollY: afterWindowY,
+              containerScrollTop: afterContainerTop,
+              delta,
+              direction,
+              tagName: bestElement.tagName.toLowerCase(),
+              ariaLabel: bestElement.getAttribute("aria-label"),
+            };
+          }
+        }
+
+        return {
+          ok: true,
+          action: "scroll",
+          moved: false,
+          usedContainer: false,
+          scrollY: afterWindowY,
+          containerScrollTop: null,
+          delta,
+          direction,
+          tagName: null,
+          ariaLabel: null,
+        };
+      }`,
+      context
+    );
+
+    return (typeof result === "object" && result !== null
+      ? result
+      : {
+        ok: true,
+        action: "scroll",
+        moved: false,
+        usedContainer: false,
+        scrollY: 0,
+        containerScrollTop: null,
+        delta: explicitAmount,
+        direction: normalizedDirection,
+        tagName: null,
+        ariaLabel: null,
+      }) as {
+        ok?: boolean;
+        action?: string;
+        moved?: boolean;
+        usedContainer?: boolean;
+        scrollY?: number;
+        containerScrollTop?: number | null;
+        delta?: number;
+        direction?: string;
+        tagName?: string | null;
+        ariaLabel?: string | null;
+      };
+  }
+
   private async performWaitStep(targetId: string, step: ScriptStep, context: ExecutionContext = {}) {
     const explicitDurationMs = scalarNumber(step.params.durationMs, Number.NaN);
     const fallbackWaitMs = Number.isFinite(explicitDurationMs)
@@ -1622,15 +1782,13 @@ export class OpenClawRuntime {
     const direction = String(step.params.direction ?? "down").toLowerCase();
     const behavior = String(step.params.behavior ?? "auto") === "smooth" ? "smooth" : "auto";
 
-    return await this.evaluate(
+    return await this.scrollPageOrPostContainer(
       targetId,
-      `() => {
-        window.scrollBy({
-          top: ${direction === "up" ? -1 : 1} * Math.abs(${JSON.stringify(amount)}),
-          behavior: ${JSON.stringify(behavior)}
-        });
-        return { ok: true, action: "scroll", scrollY: window.scrollY };
-      }`,
+      {
+        amount,
+        direction: direction === "up" ? "up" : "down",
+        behavior,
+      },
       context
     );
   }
@@ -1671,7 +1829,6 @@ export class OpenClawRuntime {
         const title = typeof el?.getAttribute === "function" ? el.getAttribute("title") : null;
         const ariaLabel = typeof el?.getAttribute === "function" ? el.getAttribute("aria-label") : null;
         const textContent = (el?.innerText ?? el?.textContent ?? "").replace(/\s+/g, " ").trim();
-
         const normalizedSignals = [ariaPressed, dataState, title, ariaLabel, textContent]
           .filter((value) => typeof value === "string" && value.trim().length > 0)
           .join(" ")
