@@ -118,6 +118,9 @@ function normalizeTarget(value: unknown): ScriptTarget | null {
     selectors,
     text: safeString(value.text),
     role: safeString(value.role),
+    alternativeTexts: Array.isArray(value.alternativeTexts)
+      ? value.alternativeTexts.map((entry) => safeString(entry)).filter(Boolean)
+      : [],
   };
 }
 
@@ -135,6 +138,8 @@ function normalizeStep(value: unknown, index: number): ScriptStep {
         entry === null
       ) {
         accumulator[key] = entry;
+      } else if (Array.isArray(entry) && entry.every((item) => typeof item === "string")) {
+        accumulator[key] = entry.map((item) => safeString(item)).filter(Boolean);
       }
 
       return accumulator;

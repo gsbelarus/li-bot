@@ -29,7 +29,10 @@ if (!remoteControllerSecretKey) {
 
 const runtime = new OpenClawRuntime();
 const queue = new TaskQueue(async (task) => {
-  return runtime.executeScript(task.input.script, task.input.targetId);
+  return runtime.executeScript(task.input.script, {
+    targetId: task.input.targetId,
+    taskId: task.id,
+  });
 }, {
   maxRetainedTasks,
   finishedTaskTtlMs,
@@ -168,7 +171,7 @@ app.get("/api/commands/:taskId/status", (request, response) => {
     createdAt: task.createdAt,
     startedAt: task.startedAt,
     finishedAt: task.finishedAt,
-    error: task.error,
+    error: task.failure ?? task.error,
   });
 });
 
@@ -193,7 +196,8 @@ app.get("/api/commands/:taskId/results", (request, response) => {
     response.status(200).json({
       taskId: task.id,
       status: task.status,
-      error: task.error,
+      error: task.failure ?? task.error,
+      result: task.result,
     });
     return;
   }

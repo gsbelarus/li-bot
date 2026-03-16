@@ -1,8 +1,15 @@
-import { spawn } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
+import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import type { ScriptInstructions, ScriptStep } from "./script-contract.js";
 
 const windowsShell = process.env.ComSpec || "cmd.exe";
+const currentFilePath = fileURLToPath(import.meta.url);
+const currentDirectory = dirname(currentFilePath);
+const projectRoot = resolve(currentDirectory, "..");
+const logsDirectory = resolve(projectRoot, "logs");
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -24,6 +31,12 @@ function scalarNumber(value: unknown, fallback: number) {
 
 function scalarBoolean(value: unknown, fallback = false) {
   return typeof value === "boolean" ? value : fallback;
+}
+
+function scalarStringArray(value: unknown) {
+  return Array.isArray(value)
+    ? value.map((entry) => scalarString(entry).trim()).filter(Boolean)
+    : [];
 }
 
 function boundedPositiveInteger(value: unknown, fallback: number, minimum = 1) {
@@ -60,6 +73,18 @@ function parseJsonish(value: unknown) {
   return value;
 }
 
+function maskCommandArgs(args: string[]) {
+  const maskedArgs = [...args];
+
+  for (let index = 0; index < maskedArgs.length; index += 1) {
+    if (maskedArgs[index] === "--token" && index + 1 < maskedArgs.length) {
+      maskedArgs[index + 1] = "[masked]";
+    }
+  }
+
+  return maskedArgs;
+}
+
 export interface StepExecutionRecord {
   order: number;
   kind: ScriptStep["kind"];
@@ -68,17 +93,325 @@ export interface StepExecutionRecord {
   output: unknown;
 }
 
+interface ExecutionContext {
+  taskId?: string;
+}
+
+interface ExecuteScriptOptions extends ExecutionContext {
+  targetId?: string;
+}
+
+interface OpenClawInvocation {
+  command: string;
+  commandArgsPrefix: string[];
+}
+
+interface BrowserSnapshotRef {
+  role?: string;
+  name?: string;
+  [key: string]: unknown;
+}
+
+interface BrowserSnapshot {
+  ok?: boolean;
+  format?: string;
+  snapshot?: string;
+  refs?: Record<string, BrowserSnapshotRef>;
+  targetId?: string;
+  url?: string;
+  truncated?: boolean;
+}
+
+interface ResolvedSnapshotRef {
+  ref: string;
+  role: string;
+  name: string;
+  candidateCount: number;
+}
+
+interface BranchStepResult {
+  ok: true;
+  action: "branch_if_missing";
+  branchAction: "end_script" | null;
+  conditionMet: boolean;
+  matched?: ResolvedSnapshotRef;
+}
+
+class StepExecutionError extends Error {
+  readonly stepOrder: number;
+  readonly stepKind: ScriptStep["kind"];
+  readonly instruction: string;
+  readonly causeMessage: string | null;
+
+  constructor(step: ScriptStep, cause: unknown) {
+    const causeMessage = cause instanceof Error ? cause.message : String(cause);
+    super(`Step ${step.order} (${step.kind}) failed: ${causeMessage}`);
+    this.name = "StepExecutionError";
+    this.stepOrder = step.order;
+    this.stepKind = step.kind;
+    this.instruction = step.instruction;
+    this.causeMessage = causeMessage;
+  }
+}
+
+class SnapshotRefNotFoundError extends Error {
+  readonly stepOrder: number;
+
+  constructor(step: ScriptStep) {
+    super(`Could not resolve an OpenClaw ref for step ${step.order}.`);
+    this.name = "SnapshotRefNotFoundError";
+    this.stepOrder = step.order;
+  }
+}
+
+function normalizeSearchText(value: unknown) {
+  return String(value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function isProfileCardStep(step: ScriptStep) {
+  const role = normalizeSearchText(step.target?.role);
+  const combined = normalizeSearchText(
+    [step.instruction, step.target?.description, step.target?.text].filter(Boolean).join(" ")
+  );
+
+  return (
+    role === "link" &&
+    /profile card|creator card|creator profile|person profile|person or creator profile|open the first profile|first profile/.test(combined)
+  );
+}
+
+function isHeaderActionLink(name: string) {
+  return /^(show all|manage all|see all|view all)\b/.test(normalizeSearchText(name));
+}
+
+function hasNearbyLineMatch(lines: string[], lineIndex: number, before: number, after: number, pattern: RegExp) {
+  const start = Math.max(0, lineIndex - before);
+  const end = Math.min(lines.length, lineIndex + after);
+
+  return lines.slice(start, end).some((line) => pattern.test(normalizeSearchText(line)));
+}
+
+function buildLineWindow(lines: string[], lineIndex: number, before: number, after: number) {
+  return normalizeSearchText(
+    lines.slice(Math.max(0, lineIndex - before), Math.min(lines.length, lineIndex + after)).join(" ")
+  );
+}
+
+function normalizeTextPatterns(primary: unknown, alternatives: unknown) {
+  return [scalarString(primary), ...scalarStringArray(alternatives)]
+    .map((entry) => normalizeSearchText(entry))
+    .filter(Boolean);
+}
+
+function scoreTextPattern(candidate: string, context: string, pattern: string) {
+  const normalizedPattern = normalizeSearchText(pattern);
+
+  if (!normalizedPattern) {
+    return null;
+  }
+
+  const wildcardPrefix = normalizedPattern.replace(/\s*(?:\.\.\.|…)\s*$/, "").trim();
+  const isWildcardPrefix = wildcardPrefix.length > 0 && wildcardPrefix !== normalizedPattern;
+
+  if (isWildcardPrefix) {
+    if (candidate.startsWith(wildcardPrefix)) {
+      return 140;
+    }
+
+    if (candidate.includes(wildcardPrefix)) {
+      return 100;
+    }
+
+    if (context.includes(wildcardPrefix)) {
+      return 40;
+    }
+
+    return null;
+  }
+
+  if (candidate === normalizedPattern) {
+    return 140;
+  }
+
+  if (candidate.includes(normalizedPattern)) {
+    return 100;
+  }
+
+  if (context.includes(normalizedPattern)) {
+    return 40;
+  }
+
+  return null;
+}
+
+function scoreAnyTextPattern(candidate: string, context: string, patterns: string[]) {
+  let bestScore: number | null = null;
+
+  for (const pattern of patterns) {
+    const score = scoreTextPattern(candidate, context, pattern);
+
+    if (score !== null && (bestScore === null || score > bestScore)) {
+      bestScore = score;
+    }
+  }
+
+  return bestScore;
+}
+
+function serializeUnknownError(error: unknown) {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack ?? null,
+    };
+  }
+
+  return {
+    name: typeof error,
+    message: String(error),
+    stack: null,
+  };
+}
+
+function inferInstructionIndex(instruction: string) {
+  const normalized = normalizeSearchText(instruction);
+
+  if (normalized.includes("first")) {
+    return 1;
+  }
+
+  if (normalized.includes("second")) {
+    return 2;
+  }
+
+  if (normalized.includes("third")) {
+    return 3;
+  }
+
+  if (normalized.includes("fourth")) {
+    return 4;
+  }
+
+  if (normalized.includes("fifth")) {
+    return 5;
+  }
+
+  return 0;
+}
+
+function appendTaskLog(taskId: string | undefined, message: string) {
+  if (!taskId) {
+    return;
+  }
+
+  mkdirSync(logsDirectory, { recursive: true });
+
+  appendFileSync(
+    resolve(logsDirectory, `${taskId}.log`),
+    `[${new Date().toISOString()}] ${message}\n`,
+    "utf8"
+  );
+}
+
+function initializeTaskLog(taskId: string | undefined, payload: Record<string, unknown>) {
+  if (!taskId) {
+    return;
+  }
+
+  mkdirSync(logsDirectory, { recursive: true });
+
+  writeFileSync(
+    resolve(logsDirectory, `${taskId}.log`),
+    `${JSON.stringify(payload, null, 2)}\n\n`,
+    "utf8"
+  );
+}
+
 export class OpenClawRuntime {
   private readonly browserProfile = process.env.OPENCLAW_BROWSER_PROFILE || "chrome";
   private readonly gatewayUrl = process.env.OPENCLAW_GATEWAY_URL || "";
   private readonly gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN || "";
   private readonly openClawBin = process.env.OPENCLAW_BIN || "openclaw";
+  private windowsInvocation: OpenClawInvocation | null = null;
 
-  executeScript(script: ScriptInstructions, targetId?: string) {
-    return this.runScript(script, targetId);
+  executeScript(script: ScriptInstructions, options?: string | ExecuteScriptOptions) {
+    if (typeof options === "string") {
+      return this.runScript(script, { targetId: options });
+    }
+
+    return this.runScript(script, options);
   }
 
-  private async oc(args: string[], { json = false }: { json?: boolean } = {}) {
+  private resolveWindowsOpenClawPath() {
+    if (isAbsolute(this.openClawBin) && existsSync(this.openClawBin)) {
+      return this.openClawBin;
+    }
+
+    const result = spawnSync("where.exe", [this.openClawBin], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+    });
+
+    if (result.status !== 0) {
+      return null;
+    }
+
+    const candidates = String(result.stdout || "")
+      .split(/\r?\n/)
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+
+    return (
+      candidates.find((entry) => entry.toLowerCase().endsWith(".cmd")) ||
+      candidates[0] ||
+      null
+    );
+  }
+
+  private resolveOpenClawInvocation(): OpenClawInvocation {
+    if (process.platform !== "win32") {
+      return {
+        command: this.openClawBin,
+        commandArgsPrefix: [],
+      };
+    }
+
+    if (this.windowsInvocation) {
+      return this.windowsInvocation;
+    }
+
+    const resolvedBinPath = this.resolveWindowsOpenClawPath();
+
+    if (resolvedBinPath) {
+      const binDirectory = dirname(resolvedBinPath);
+      const nodePath = resolve(binDirectory, "node.exe");
+      const cliScriptPath = resolve(binDirectory, "node_modules", "openclaw", "openclaw.mjs");
+
+      if (existsSync(cliScriptPath)) {
+        this.windowsInvocation = {
+          command: existsSync(nodePath) ? nodePath : process.execPath,
+          commandArgsPrefix: [cliScriptPath],
+        };
+
+        return this.windowsInvocation;
+      }
+    }
+
+    this.windowsInvocation = {
+      command: windowsShell,
+      commandArgsPrefix: ["/d", "/s", "/c", this.openClawBin],
+    };
+
+    return this.windowsInvocation;
+  }
+
+  private async oc(
+    args: string[],
+    options: { json?: boolean } & ExecutionContext = {}
+  ) {
+    const { json = false, taskId } = options;
     const fullArgs = ["browser", "--browser-profile", this.browserProfile];
 
     if (this.gatewayUrl) {
@@ -95,11 +428,24 @@ export class OpenClawRuntime {
       fullArgs.push("--json");
     }
 
-    const command = process.platform === "win32" ? windowsShell : this.openClawBin;
-    const commandArgs =
-      process.platform === "win32"
-        ? ["/d", "/s", "/c", this.openClawBin, ...fullArgs]
-        : fullArgs;
+    const invocation = this.resolveOpenClawInvocation();
+    const command = invocation.command;
+    const commandArgs = [...invocation.commandArgsPrefix, ...fullArgs];
+
+    console.log(
+      `[openclaw] ${command} ${maskCommandArgs(commandArgs)
+        .map((entry) => (entry.includes(" ") ? JSON.stringify(entry) : entry))
+        .join(" ")}`
+    );
+    appendTaskLog(
+      taskId,
+      `COMMAND ${JSON.stringify({
+        command,
+        commandArgs: maskCommandArgs(commandArgs),
+        openClawArgs: maskCommandArgs(fullArgs),
+        expectsJson: json,
+      })}`
+    );
 
     const stdoutChunks: string[] = [];
     const stderrChunks: string[] = [];
@@ -133,6 +479,17 @@ export class OpenClawRuntime {
     const stdout = stdoutChunks.join("").trim();
     const stderr = stderrChunks.join("").trim();
 
+    appendTaskLog(
+      taskId,
+      `RESPONSE ${JSON.stringify({
+        command,
+        commandArgs: maskCommandArgs(commandArgs),
+        exitCode,
+        stdout,
+        stderr,
+      })}`
+    );
+
     if (exitCode !== 0) {
       throw new Error((stderr || stdout || `OpenClaw exited with code ${exitCode}.`).trim());
     }
@@ -144,8 +501,8 @@ export class OpenClawRuntime {
     return stdout ? JSON.parse(stdout) : null;
   }
 
-  private async getFocusedTab() {
-    const tabs = await this.oc(["tabs"], { json: true });
+  private async getFocusedTab(context: ExecutionContext = {}) {
+    const tabs = await this.oc(["tabs"], { json: true, ...context });
     const list = Array.isArray(tabs) ? tabs : tabs?.tabs || tabs?.items || [];
 
     if (!Array.isArray(list) || list.length === 0) {
@@ -166,16 +523,49 @@ export class OpenClawRuntime {
     };
   }
 
-  private async evaluate(targetId: string, expression: string) {
-    return parseJsonish(
-      await this.oc(["evaluate", "--fn", expression, "--target-id", targetId], { json: true })
+  private async evaluate(targetId: string, expression: string, context: ExecutionContext = {}) {
+    const response = parseJsonish(
+      await this.oc(["evaluate", "--fn", expression, "--target-id", targetId], {
+        json: true,
+        ...context,
+      })
     );
+
+    return typeof response === "object" && response !== null && "result" in response
+      ? (response as { result: unknown }).result
+      : response;
   }
 
-  private async getPageState(targetId: string) {
+  private async evaluateRef(
+    targetId: string,
+    ref: string,
+    expression: string,
+    context: ExecutionContext = {}
+  ) {
+    const response = parseJsonish(
+      await this.oc(["evaluate", "--fn", expression, "--ref", ref, "--target-id", targetId], {
+        json: true,
+        ...context,
+      })
+    );
+
+    return typeof response === "object" && response !== null && "result" in response
+      ? (response as { result: unknown }).result
+      : response;
+  }
+
+  private async getSnapshot(targetId: string, context: ExecutionContext = {}) {
+    return await this.oc(["snapshot", "--target-id", targetId, "--limit", "800"], {
+      json: true,
+      ...context,
+    }) as BrowserSnapshot;
+  }
+
+  private async getPageState(targetId: string, context: ExecutionContext = {}) {
     return await this.evaluate(
       targetId,
-      `() => ({ url: window.location.href, title: document.title, readyState: document.readyState, scrollY: window.scrollY })`
+      `() => ({ url: window.location.href, title: document.title, readyState: document.readyState, scrollY: window.scrollY })`,
+      context
     ) as {
       url: string;
       title: string;
@@ -184,30 +574,260 @@ export class OpenClawRuntime {
     };
   }
 
-  private async waitForPage(targetId: string, step: ScriptStep) {
-    const timeoutMs = step.timeoutMs;
-    const readyState = scalarString(step.params.readyState, "complete");
-    const urlIncludes = scalarString(step.params.urlIncludes);
-    const urlEquals = scalarString(step.params.urlEquals);
-    const deadline = Date.now() + timeoutMs;
+  private buildSnapshotLineIndex(snapshotText: string) {
+    const lines = snapshotText.split(/\r?\n/);
+    const refLines = new Map<string, number>();
+
+    lines.forEach((line, lineIndex) => {
+      const matches = line.matchAll(/\[ref=([^\]]+)\]/g);
+
+      for (const match of matches) {
+        refLines.set(match[1], lineIndex);
+      }
+    });
+
+    return { lines, refLines };
+  }
+
+  private buildSnapshotRefs(snapshot: BrowserSnapshot, lines: string[]) {
+    const mergedRefs = { ...(snapshot.refs || {}) };
+
+    if (!snapshot.truncated) {
+      return mergedRefs;
+    }
+
+    const refPattern = /\[ref=([^\]]+)\]/g;
+
+    lines.forEach((line) => {
+      const roleMatch = line.match(/^\s*-\s+'?([a-z_]+)/i);
+      const role = roleMatch ? normalizeSearchText(roleMatch[1]) : "";
+      const nameMatch = line.match(/\s["']([^"']+)["'](?=\s+\[ref=)/);
+      const name = nameMatch ? scalarString(nameMatch[1]) : "";
+
+      for (const match of line.matchAll(refPattern)) {
+        const ref = match[1];
+
+        if (mergedRefs[ref]) {
+          continue;
+        }
+
+        mergedRefs[ref] = {
+          role,
+          name,
+        } satisfies BrowserSnapshotRef;
+      }
+    });
+
+    return mergedRefs;
+  }
+
+  private getCandidateIndex(step: ScriptStep) {
+    const explicitIndex = Number(step.params.index);
+
+    if (Number.isFinite(explicitIndex) && explicitIndex > 0) {
+      return Math.floor(explicitIndex);
+    }
+
+    const inferredIndex = inferInstructionIndex(step.instruction);
+    return inferredIndex > 0 ? inferredIndex : 1;
+  }
+
+  private getSnapshotMatches(snapshot: BrowserSnapshot, step: ScriptStep) {
+    const target = step.target;
+
+    if (!target || target.role === "document") {
+      return [];
+    }
+
+    const roleNeedle = normalizeSearchText(target.role);
+    const targetTextPatterns = normalizeTextPatterns(target.text, target.alternativeTexts);
+    const description = normalizeSearchText(target.description);
+    const profileCardStep = isProfileCardStep(step);
+    const containerTextPatterns = normalizeTextPatterns(
+      step.params.containerText,
+      step.params.containerAlternativeTexts
+    );
+    const { lines, refLines } = this.buildSnapshotLineIndex(snapshot.snapshot || "");
+    const refs = this.buildSnapshotRefs(snapshot, lines);
+    const matches = Object.entries(refs)
+      .map(([ref, meta]) => {
+        const role = normalizeSearchText(meta.role);
+        const name = normalizeSearchText(meta.name);
+
+        if (roleNeedle && role !== roleNeedle) {
+          return null;
+        }
+
+        const lineIndex = refLines.get(ref) ?? Number.MAX_SAFE_INTEGER;
+        const nearbyContext = normalizeSearchText(
+          lines.slice(Math.max(0, lineIndex - 40), Math.min(lines.length, lineIndex + 6)).join(" ")
+        );
+        const localContext = buildLineWindow(lines, lineIndex, 8, 18);
+        const hasListItemAncestor = hasNearbyLineMatch(lines, lineIndex, 8, 0, /\blistitem\b/);
+        const hasProfileUrl = /\/url:\s+https:\/\/www\.linkedin\.com\/(?:in|creator)\//.test(localContext);
+        const hasPersonCardSignals = /\binvite\b.*\bconnect\b|\bremove\b.*\bsuggestion\b/.test(localContext);
+
+        if (containerTextPatterns.length > 0 && scoreAnyTextPattern(name, nearbyContext, containerTextPatterns) === null) {
+          return null;
+        }
+
+        if (profileCardStep && isHeaderActionLink(name)) {
+          return null;
+        }
+
+        let score = 0;
+
+        if (roleNeedle) {
+          score += 40;
+        }
+
+        if (targetTextPatterns.length > 0) {
+          const textScore = scoreAnyTextPattern(name, nearbyContext, targetTextPatterns);
+
+          if (textScore === null) {
+            return null;
+          }
+
+          score += textScore;
+        }
+
+        if (description && targetTextPatterns.length === 0) {
+          if (name.includes(description)) {
+            score += 30;
+          } else if (nearbyContext.includes(description)) {
+            score += 15;
+          }
+        }
+
+        if (targetTextPatterns.length === 0 && !description) {
+          score += name ? 5 : 1;
+        }
+
+        if (containerTextPatterns.length > 0) {
+          score += 20;
+        }
+
+        if (profileCardStep) {
+          if (hasListItemAncestor) {
+            score += 90;
+          }
+
+          if (hasProfileUrl) {
+            score += 120;
+          }
+
+          if (hasPersonCardSignals) {
+            score += 45;
+          }
+
+          if (/suggestions for /.test(name)) {
+            score -= 160;
+          }
+        }
+
+        return {
+          ref,
+          role,
+          name: scalarString(meta.name),
+          lineIndex,
+          score,
+        };
+      })
+      .filter((entry): entry is { ref: string; role: string; name: string; lineIndex: number; score: number } => Boolean(entry))
+      .sort((left, right) => {
+        if (right.score !== left.score) {
+          return right.score - left.score;
+        }
+
+        if (left.lineIndex !== right.lineIndex) {
+          return left.lineIndex - right.lineIndex;
+        }
+
+        return left.ref.localeCompare(right.ref, undefined, { numeric: true });
+      });
+
+    return matches;
+  }
+
+  private async resolveSnapshotRef(targetId: string, step: ScriptStep, context: ExecutionContext = {}) {
+    const deadline = Date.now() + Math.max(250, step.timeoutMs);
+    const desiredIndex = this.getCandidateIndex(step);
 
     while (Date.now() <= deadline) {
-      const pageState = await this.getPageState(targetId);
-      const readyMatches = !readyState || pageState.readyState === readyState;
-      const includesMatches = !urlIncludes || pageState.url.includes(urlIncludes);
-      const equalsMatches = !urlEquals || pageState.url === urlEquals;
+      const snapshot = await this.getSnapshot(targetId, context);
+      const matches = this.getSnapshotMatches(snapshot, step);
+      const resolved = matches[desiredIndex - 1] || matches[0] || null;
 
-      if (readyMatches && includesMatches && equalsMatches) {
-        return pageState;
+      if (resolved) {
+        return {
+          ref: resolved.ref,
+          role: resolved.role,
+          name: resolved.name,
+          candidateCount: matches.length,
+        } satisfies ResolvedSnapshotRef;
       }
 
       await sleep(Math.min(500, Math.max(100, step.delayAfterMs || 250)));
     }
 
-    throw new Error(`Timed out waiting for page state for step ${step.order}.`);
+    throw new SnapshotRefNotFoundError(step);
   }
 
-  private async moveMouseRandomly(targetId: string) {
+  private async waitForPage(targetId: string, step: ScriptStep, context: ExecutionContext = {}) {
+    const timeoutMs = String(step.timeoutMs);
+    const readyState = scalarString(step.params.readyState, "complete");
+    const urlIncludes = scalarString(step.params.urlIncludes);
+    const urlEquals = scalarString(step.params.urlEquals);
+    const waitText = scalarString(step.params.text, scalarString(step.target?.text));
+    const loadState =
+      readyState === "complete"
+        ? "load"
+        : readyState === "interactive"
+          ? "domcontentloaded"
+          : readyState === "networkidle"
+            ? "networkidle"
+            : readyState;
+
+    if (loadState) {
+      await this.oc(["wait", "--target-id", targetId, "--timeout-ms", timeoutMs, "--load", loadState], context);
+    }
+
+    if (urlEquals || urlIncludes) {
+      const deadline = Date.now() + Math.max(250, step.timeoutMs);
+
+      while (Date.now() <= deadline) {
+        const pageState = await this.getPageState(targetId, context);
+        const currentUrl = scalarString(pageState.url);
+        const matchesEquals = !urlEquals || currentUrl === urlEquals;
+        const matchesIncludes = !urlIncludes || currentUrl.includes(urlIncludes);
+
+        if (matchesEquals && matchesIncludes) {
+          break;
+        }
+
+        await sleep(Math.min(500, Math.max(100, step.delayAfterMs || 250)));
+      }
+
+      const finalPageState = await this.getPageState(targetId, context);
+      const currentUrl = scalarString(finalPageState.url);
+      const matchesEquals = !urlEquals || currentUrl === urlEquals;
+      const matchesIncludes = !urlIncludes || currentUrl.includes(urlIncludes);
+
+      if (!matchesEquals || !matchesIncludes) {
+        throw new Error(
+          `Timed out waiting for URL condition on step ${step.order}. Expected ${JSON.stringify({ urlEquals, urlIncludes })}, got ${JSON.stringify(currentUrl)}.`
+        );
+      }
+    }
+
+    if (waitText) {
+      await this.oc(["wait", "--target-id", targetId, "--timeout-ms", timeoutMs, "--text", waitText], context);
+    }
+
+    return await this.getPageState(targetId, context);
+  }
+
+  private async moveMouseRandomly(targetId: string, context: ExecutionContext = {}) {
     return await this.evaluate(
       targetId,
       `() => {
@@ -232,11 +852,12 @@ export class OpenClawRuntime {
           clientY,
           tagName: element instanceof Element ? element.tagName.toLowerCase() : "body",
         };
-      }`
+      }`,
+      context
     );
   }
 
-  private async performWaitStep(targetId: string, step: ScriptStep) {
+  private async performWaitStep(targetId: string, step: ScriptStep, context: ExecutionContext = {}) {
     const explicitDurationMs = scalarNumber(step.params.durationMs, Number.NaN);
     const minDelayMs = scalarNumber(
       step.params.minDelayMs,
@@ -261,7 +882,7 @@ export class OpenClawRuntime {
     const segmentDurationMs = Math.floor(waitMs / segments);
 
     for (let index = 0; index < segments; index += 1) {
-      await this.moveMouseRandomly(targetId);
+      await this.moveMouseRandomly(targetId, context);
 
       const remainingMs = waitMs - segmentDurationMs * index;
       const pauseMs = index === segments - 1 ? remainingMs : segmentDurationMs;
@@ -273,14 +894,14 @@ export class OpenClawRuntime {
     return { ok: true, action: step.kind, waitMs, moveMouse: true, moveCount: segments };
   }
 
-  private async performNavigateStep(targetId: string, step: ScriptStep) {
+  private async performNavigateStep(targetId: string, step: ScriptStep, context: ExecutionContext = {}) {
     const url = scalarString(step.params.url, scalarString(step.target?.text));
 
     if (!url) {
       throw new Error(`Step ${step.order} is missing params.url for navigation.`);
     }
 
-    await this.oc(["navigate", url, "--target-id", targetId]);
+    await this.oc(["navigate", url, "--target-id", targetId], context);
 
     return {
       ok: true,
@@ -289,274 +910,257 @@ export class OpenClawRuntime {
     };
   }
 
-  private async runDomAction(targetId: string, step: ScriptStep) {
-    const payload = JSON.stringify({
+  private async assertDocumentVisible(targetId: string, step: ScriptStep, context: ExecutionContext = {}) {
+    const pageState = await this.getPageState(targetId, context);
+    const waitText = scalarString(step.params.text, scalarString(step.target?.text, scalarString(step.target?.description)));
+
+    if (waitText) {
+      const needle = normalizeSearchText(waitText);
+      const currentSignal = normalizeSearchText(
+        [pageState.title, pageState.url].filter(Boolean).join(" ")
+      );
+
+      if (!currentSignal.includes(needle)) {
+        const snapshot = await this.getSnapshot(targetId, context);
+        const snapshotSignal = normalizeSearchText(
+          [snapshot.url, snapshot.snapshot].filter(Boolean).join(" ")
+        );
+
+        if (!snapshotSignal.includes(needle)) {
+          throw new Error(`Target document signal not found for step ${step.order}.`);
+        }
+      }
+    }
+
+    return {
+      ok: true,
       action: step.kind,
-      target: step.target,
-      params: step.params,
-      instruction: step.instruction,
-    });
+      matched: {
+        role: "document",
+        title: pageState.title,
+        url: pageState.url,
+      },
+    };
+  }
+
+  private async performScrollStep(targetId: string, step: ScriptStep, context: ExecutionContext = {}) {
+    if (step.target && (step.target.text || step.target.role)) {
+      const resolved = await this.resolveSnapshotRef(targetId, step, context);
+      await this.oc([
+        "scrollintoview",
+        resolved.ref,
+        "--target-id",
+        targetId,
+        "--timeout-ms",
+        String(step.timeoutMs),
+      ], context);
+
+      return {
+        ok: true,
+        action: step.kind,
+        matched: resolved,
+      };
+    }
+
+    const amount = Number(step.params.amount ?? step.params.pixels ?? 600);
+    const direction = String(step.params.direction ?? "down").toLowerCase();
+    const behavior = String(step.params.behavior ?? "auto") === "smooth" ? "smooth" : "auto";
 
     return await this.evaluate(
       targetId,
       `() => {
-        const payload = ${payload};
-        const target = payload.target;
-        const params = payload.params || {};
-        const normalize = (value) => String(value ?? "").replace(/\\s+/g, " ").trim().toLowerCase();
-        const roleSelectors = {
-          link: "a,[role='link']",
-          button: "button,[role='button']",
-          textbox: "input,textarea,[role='textbox']",
-          heading: "h1,h2,h3,h4,h5,h6,[role='heading']",
-          img: "img,[role='img']",
-          article: "article,[role='article']",
-          checkbox: "input[type='checkbox'],[role='checkbox']"
-        };
-        const seen = new Set();
-        const candidates = [];
-        const toInteger = (value, fallback = 0) => {
-          const parsed = Number(value);
-          return Number.isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : fallback;
-        };
-        const textFor = (element) => {
-          if (!element) {
-            return "";
-          }
-          return [
-            element.innerText,
-            element.textContent,
-            element.getAttribute && element.getAttribute("aria-label"),
-            element.getAttribute && element.getAttribute("title"),
-            element.getAttribute && element.getAttribute("placeholder"),
-            "value" in element ? element.value : ""
-          ].map((entry) => String(entry ?? "")).join(" ").replace(/\\s+/g, " ").trim();
-        };
-        const addCandidate = (element) => {
-          if (!(element instanceof Element)) {
-            return;
-          }
-          if (seen.has(element)) {
-            return;
-          }
-          seen.add(element);
-          candidates.push(element);
-        };
-        const isVisible = (element) => {
-          if (!(element instanceof Element)) {
-            return false;
-          }
-          const style = window.getComputedStyle(element);
-          const rect = element.getBoundingClientRect();
-          return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
-        };
-        const containerSelector = typeof params.containerSelector === "string" ? params.containerSelector.trim() : "";
-        const containerText = typeof params.containerText === "string" ? params.containerText.trim() : "";
-        const containerIndex = toInteger(params.containerIndex, 0);
-        const roots = (() => {
-          let result = [];
-
-          if (containerSelector) {
-            try {
-              result = Array.from(document.querySelectorAll(containerSelector));
-            } catch {
-              result = [];
-            }
-          }
-
-          if (result.length === 0 && containerText) {
-            const containerNeedle = normalize(containerText);
-            document.querySelectorAll("section,article,main,div,li").forEach((element) => {
-              if (normalize(textFor(element)).includes(containerNeedle)) {
-                result.push(element);
-              }
-            });
-          }
-
-          if (containerIndex > 0) {
-            result = result[containerIndex - 1] ? [result[containerIndex - 1]] : [];
-          }
-
-          return result.length > 0 ? result : [document];
-        })();
-        const roleSelector = target?.role ? (roleSelectors[target.role] || "*") : "*";
-        const targetText = normalize(target?.text);
-        const description = normalize(target?.description);
-        const candidateIndex = Math.max(1, toInteger(params.index, 1));
-        const matchesTarget = (element) => {
-          const text = normalize(textFor(element));
-
-          if (targetText && !text.includes(targetText)) {
-            return false;
-          }
-
-          if (description && !text.includes(description)) {
-            return false;
-          }
-
-          return true;
-        };
-        if (target) {
-          for (const root of roots) {
-            for (const selector of Array.isArray(target.selectors) ? target.selectors : []) {
-              if (!selector) {
-                continue;
-              }
-              try {
-                root.querySelectorAll(selector).forEach((element) => {
-                  if (matchesTarget(element)) {
-                    addCandidate(element);
-                  }
-                });
-              } catch {
-              }
-            }
-
-            root.querySelectorAll(roleSelector).forEach((element) => {
-              if (matchesTarget(element) || (!targetText && !description && !target?.selectors?.length)) {
-                addCandidate(element);
-              }
-            });
-          }
-
-          if (candidates.length === 0 && target.text) {
-            for (const root of roots) {
-              root.querySelectorAll("*").forEach((element) => {
-                if (matchesTarget(element)) {
-                  addCandidate(element);
-                }
-              });
-            }
-          }
-        }
-        const visibleCandidates = candidates.filter(isVisible);
-        const element =
-          visibleCandidates[candidateIndex - 1] ||
-          visibleCandidates[0] ||
-          candidates[candidateIndex - 1] ||
-          candidates[0] ||
-          null;
-        const summary = element
-          ? {
-              tagName: element.tagName.toLowerCase(),
-              text: textFor(element).slice(0, 160),
-              visible: isVisible(element)
-            }
-          : null;
-        const dispatchMouseMove = (node) => {
-          node.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, cancelable: true, view: window }));
-          node.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, cancelable: true, view: window }));
-        };
-        switch (payload.action) {
-          case "click": {
-            if (!element) {
-              return { ok: false, error: "Target not found for click." };
-            }
-            element.scrollIntoView({ block: "center", inline: "center" });
-            dispatchMouseMove(element);
-            element.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
-            element.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window }));
-            element.click();
-            return { ok: true, action: payload.action, matched: summary, matchCount: candidates.length };
-          }
-          case "hover":
-          case "move_mouse": {
-            const node = element || document.body;
-            dispatchMouseMove(node);
-            return { ok: true, action: payload.action, matched: summary, matchCount: candidates.length };
-          }
-          case "scroll": {
-            if (element) {
-              element.scrollIntoView({ block: "center", inline: "nearest" });
-              return { ok: true, action: payload.action, matched: summary, scrollY: window.scrollY };
-            }
-            const amount = Number(params.amount ?? params.pixels ?? 600);
-            const direction = String(params.direction ?? "down").toLowerCase();
-            window.scrollBy({ top: direction === "up" ? -Math.abs(amount) : Math.abs(amount), behavior: String(params.behavior ?? "auto") === "smooth" ? "smooth" : "auto" });
-            return { ok: true, action: payload.action, scrollY: window.scrollY };
-          }
-          case "type": {
-            if (!element) {
-              return { ok: false, error: "Target not found for type." };
-            }
-            const text = String(params.text ?? params.value ?? target?.text ?? "");
-            const append = Boolean(params.append);
-            const clear = params.clear === false ? false : true;
-            element.scrollIntoView({ block: "center", inline: "center" });
-            if (typeof element.focus === "function") {
-              element.focus();
-            }
-            if (element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement) {
-              const nextValue = append ? String(element.value) + text : text;
-              if (clear && !append) {
-                element.value = "";
-              }
-              element.value = nextValue;
-              element.dispatchEvent(new Event("input", { bubbles: true }));
-              element.dispatchEvent(new Event("change", { bubbles: true }));
-            } else if (element.isContentEditable) {
-              const currentText = append ? (element.textContent || "") : "";
-              if (clear && !append) {
-                element.textContent = "";
-              }
-              element.textContent = String(currentText) + text;
-              element.dispatchEvent(new Event("input", { bubbles: true }));
-            } else {
-              return { ok: false, error: "Resolved target is not typable." };
-            }
-            return { ok: true, action: payload.action, matched: summary, typedLength: text.length };
-          }
-          case "press_key": {
-            const node = element || document.activeElement || document.body;
-            const key = String(params.key ?? target?.text ?? "Enter");
-            const code = String(params.code ?? key);
-            node.dispatchEvent(new KeyboardEvent("keydown", { key, code, bubbles: true, cancelable: true }));
-            node.dispatchEvent(new KeyboardEvent("keyup", { key, code, bubbles: true, cancelable: true }));
-            return { ok: true, action: payload.action, matched: summary, key };
-          }
-          case "extract_text": {
-            if (!element) {
-              return { ok: false, error: "Target not found for extract_text." };
-            }
-            const format = String(params.format ?? "text");
-            const data =
-              format === "html"
-                ? element.innerHTML
-                : format === "value" && "value" in element
-                  ? element.value
-                  : textFor(element);
-            return { ok: true, action: payload.action, matched: summary, data };
-          }
-          case "assert_visible": {
-            if (!element || !isVisible(element)) {
-              return { ok: false, error: "Target is not visible." };
-            }
-            return { ok: true, action: payload.action, matched: summary };
-          }
-          case "custom": {
-            const expression = typeof params.expression === "string" ? params.expression : "return null;";
-            const fn = new Function("element", "params", "document", "window", expression);
-            return { ok: true, action: payload.action, matched: summary, data: fn(element, params, document, window) };
-          }
-          default:
-            return { ok: false, error: "Unsupported action: " + String(payload.action) };
-        }
-      }`
+        window.scrollBy({
+          top: ${direction === "up" ? -1 : 1} * Math.abs(${JSON.stringify(amount)}),
+          behavior: ${JSON.stringify(behavior)}
+        });
+        return { ok: true, action: "scroll", scrollY: window.scrollY };
+      }`,
+      context
     );
   }
 
-  private async runStep(targetId: string, step: ScriptStep) {
+  private async extractText(targetId: string, step: ScriptStep, context: ExecutionContext = {}) {
+    const resolved = await this.resolveSnapshotRef(targetId, step, context);
+    const format = String(step.params.format ?? "text");
+    const expression =
+      format === "html"
+        ? `(el) => ({ data: el?.innerHTML ?? null })`
+        : format === "value"
+          ? `(el) => ({ data: el && typeof el === "object" && "value" in el ? el.value : null })`
+          : `(el) => ({ data: (el?.innerText ?? el?.textContent ?? "").replace(/\\s+/g, " ").trim() })`;
+    const result = await this.evaluateRef(targetId, resolved.ref, expression, context);
+
+    return {
+      ok: true,
+      action: step.kind,
+      matched: resolved,
+      ...(typeof result === "object" && result !== null ? result : { data: result }),
+    };
+  }
+
+  private buildCustomFunctionSource(step: ScriptStep, usesRef: boolean) {
+    const expression = scalarString(step.params.expression, "return null;").trim();
+
+    if (
+      expression.startsWith("(") ||
+      expression.startsWith("async (") ||
+      expression.startsWith("function") ||
+      expression.includes("=>")
+    ) {
+      return expression;
+    }
+
+    const paramsLiteral = JSON.stringify(step.params);
+    return usesRef
+      ? `(el) => { const element = el; const params = ${paramsLiteral}; ${expression} }`
+      : `() => { const params = ${paramsLiteral}; ${expression} }`;
+  }
+
+  private async runStepWithOpenClaw(targetId: string, step: ScriptStep, context: ExecutionContext = {}) {
+    if (step.kind === "assert_visible" && step.target?.role === "document") {
+      return await this.assertDocumentVisible(targetId, step, context);
+    }
+
+    if (step.kind === "press_key") {
+      const key = scalarString(step.params.key, scalarString(step.target?.text, "Enter"));
+      await this.oc(["press", key, "--target-id", targetId], context);
+      return { ok: true, action: step.kind, key };
+    }
+
+    if (step.kind === "move_mouse") {
+      if (step.target && (step.target.text || step.target.role)) {
+        const resolved = await this.resolveSnapshotRef(targetId, step, context);
+        await this.oc(["hover", resolved.ref, "--target-id", targetId], context);
+        return { ok: true, action: step.kind, matched: resolved };
+      }
+
+      return await this.moveMouseRandomly(targetId, context);
+    }
+
+    if (step.kind === "hover") {
+      const resolved = await this.resolveSnapshotRef(targetId, step, context);
+      await this.oc(["hover", resolved.ref, "--target-id", targetId], context);
+      return { ok: true, action: step.kind, matched: resolved };
+    }
+
+    if (step.kind === "scroll") {
+      return await this.performScrollStep(targetId, step, context);
+    }
+
+    if (step.kind === "type") {
+      const resolved = await this.resolveSnapshotRef(targetId, step, context);
+      const text = scalarString(step.params.text, scalarString(step.params.value, scalarString(step.target?.text)));
+
+      if (!text) {
+        throw new Error(`Step ${step.order} is missing text to type.`);
+      }
+
+      const args = ["type", resolved.ref, text, "--target-id", targetId];
+
+      if (scalarBoolean(step.params.slowly, false)) {
+        args.push("--slowly");
+      }
+
+      if (scalarBoolean(step.params.submit, false)) {
+        args.push("--submit");
+      }
+
+      await this.oc(args, context);
+      return { ok: true, action: step.kind, matched: resolved, typedLength: text.length };
+    }
+
+    if (step.kind === "click") {
+      const resolved = await this.resolveSnapshotRef(targetId, step, context);
+      const args = ["click", resolved.ref, "--target-id", targetId];
+      const button = scalarString(step.params.button);
+
+      if (button === "left" || button === "right" || button === "middle") {
+        args.push("--button", button);
+      }
+
+      if (scalarBoolean(step.params.double, false)) {
+        args.push("--double");
+      }
+
+      await this.oc(args, context);
+      return { ok: true, action: step.kind, matched: resolved };
+    }
+
+    if (step.kind === "branch_if_missing") {
+      const onMissing = scalarString(step.params.onMissing);
+
+      try {
+        const resolved = await this.resolveSnapshotRef(targetId, step, context);
+
+        return {
+          ok: true,
+          action: step.kind,
+          branchAction: null,
+          conditionMet: false,
+          matched: resolved,
+        } satisfies BranchStepResult;
+      } catch (error) {
+        if (!(error instanceof SnapshotRefNotFoundError)) {
+          throw error;
+        }
+
+        return {
+          ok: true,
+          action: step.kind,
+          branchAction: onMissing === "end_script" ? "end_script" : null,
+          conditionMet: true,
+        } satisfies BranchStepResult;
+      }
+    }
+
+    if (step.kind === "assert_visible") {
+      const resolved = await this.resolveSnapshotRef(targetId, step, context);
+      return { ok: true, action: step.kind, matched: resolved };
+    }
+
+    if (step.kind === "extract_text") {
+      return await this.extractText(targetId, step, context);
+    }
+
+    if (step.kind === "custom") {
+      const hasTarget = Boolean(step.target && (step.target.text || step.target.role));
+
+      if (hasTarget) {
+        const resolved = await this.resolveSnapshotRef(targetId, step, context);
+        const result = await this.evaluateRef(
+          targetId,
+          resolved.ref,
+          this.buildCustomFunctionSource(step, true),
+          context
+        );
+
+        return { ok: true, action: step.kind, matched: resolved, data: result };
+      }
+
+      const result = await this.evaluate(
+        targetId,
+        this.buildCustomFunctionSource(step, false),
+        context
+      );
+
+      return { ok: true, action: step.kind, data: result };
+    }
+
+    throw new Error(`Unsupported action: ${step.kind}`);
+  }
+
+  private async runStep(targetId: string, step: ScriptStep, context: ExecutionContext = {}) {
     const startedAt = Date.now();
     let output: unknown;
 
     if (step.kind === "wait_for_page") {
-      output = await this.waitForPage(targetId, step);
+      output = await this.waitForPage(targetId, step, context);
     } else if (step.kind === "wait") {
-      output = await this.performWaitStep(targetId, step);
+      output = await this.performWaitStep(targetId, step, context);
     } else if (step.kind === "navigate") {
-      output = await this.performNavigateStep(targetId, step);
+      output = await this.performNavigateStep(targetId, step, context);
     } else {
-      output = await this.runDomAction(targetId, step);
+      output = await this.runStepWithOpenClaw(targetId, step, context);
       if (
         typeof output === "object" &&
         output !== null &&
@@ -580,29 +1184,81 @@ export class OpenClawRuntime {
     } satisfies StepExecutionRecord;
   }
 
-  private async runScript(script: ScriptInstructions, targetId?: string) {
-    const activeTargetId = targetId || (await this.getFocusedTab()).id;
+  private async runScript(script: ScriptInstructions, options: ExecuteScriptOptions = {}) {
+    const { targetId, taskId } = options;
+    initializeTaskLog(taskId, {
+      taskId: taskId ?? null,
+      receivedAt: new Date().toISOString(),
+      targetId: targetId ?? null,
+      summary: script.summary,
+      stepCount: script.steps.length,
+      script,
+    });
+
+    const activeTargetId = targetId || (await this.getFocusedTab({ taskId })).id;
     const startedAt = new Date().toISOString();
     const stepResults: StepExecutionRecord[] = [];
+    let endedEarly = false;
 
     for (const step of [...script.steps].sort((left, right) => left.order - right.order)) {
-      const stepResult = await this.runStep(activeTargetId, step);
-      stepResults.push(stepResult);
+      try {
+        const stepResult = await this.runStep(activeTargetId, step, { taskId });
+        stepResults.push(stepResult);
 
-      const delayMs = Math.max(0, step.delayAfterMs || script.defaultDelayMs || 0);
+        const branchAction =
+          typeof stepResult.output === "object" &&
+            stepResult.output !== null &&
+            "branchAction" in stepResult.output
+            ? scalarString((stepResult.output as { branchAction?: unknown }).branchAction)
+            : "";
 
-      if (delayMs > 0) {
-        await sleep(delayMs);
+        if (branchAction === "end_script") {
+          endedEarly = true;
+          appendTaskLog(taskId, `TASK_BRANCH_END ${JSON.stringify({
+            taskId: taskId ?? null,
+            endedAt: new Date().toISOString(),
+            step: {
+              order: step.order,
+              kind: step.kind,
+              instruction: step.instruction,
+            },
+            reason: "target_missing",
+          })}`);
+          break;
+        }
+
+        const delayMs = Math.max(0, step.delayAfterMs || script.defaultDelayMs || 0);
+
+        if (delayMs > 0) {
+          await sleep(delayMs);
+        }
+      } catch (error) {
+        appendTaskLog(taskId, `TASK_ERROR ${JSON.stringify({
+          taskId: taskId ?? null,
+          failedAt: new Date().toISOString(),
+          step: {
+            order: step.order,
+            kind: step.kind,
+            instruction: step.instruction,
+          },
+          error: serializeUnknownError(error),
+        })}`);
+
+        throw new StepExecutionError(step, error);
       }
     }
 
-    return {
+    const result = {
       summary: script.summary,
       targetId: activeTargetId,
       startedAt,
       finishedAt: new Date().toISOString(),
-      currentPage: await this.getPageState(activeTargetId),
+      endedEarly,
+      currentPage: await this.getPageState(activeTargetId, { taskId }),
       steps: stepResults,
     };
+
+    appendTaskLog(taskId, `TASK_RESULT ${JSON.stringify(result)}`);
+    return result;
   }
 }

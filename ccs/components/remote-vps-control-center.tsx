@@ -8,6 +8,7 @@ import DeleteOutlineRoundedIcon from "@mui/icons-material/DeleteOutlineRounded";
 import EditRoundedIcon from "@mui/icons-material/EditRounded";
 import HistoryRoundedIcon from "@mui/icons-material/HistoryRounded";
 import LanRoundedIcon from "@mui/icons-material/LanRounded";
+import PlayArrowRoundedIcon from "@mui/icons-material/PlayArrowRounded";
 import RefreshRoundedIcon from "@mui/icons-material/RefreshRounded";
 import SearchRoundedIcon from "@mui/icons-material/SearchRounded";
 import SyncRoundedIcon from "@mui/icons-material/SyncRounded";
@@ -62,6 +63,7 @@ import {
   vpsProtocolOptions,
   vpsStatusOptions,
 } from "@/lib/remote-vps-shared";
+import { ScriptListResponse, ScriptRecord } from "@/lib/scripts-shared";
 
 type ScreenState =
   | { kind: "list" }
@@ -84,6 +86,69 @@ interface VpsFormValues {
   tags: string;
   notes: string;
   isEnabled: boolean;
+}
+
+interface ControllerTaskStatusResponse {
+  taskId: string;
+  status: "pending" | "in_progress" | "completed" | "failed";
+  command?: string;
+  createdAt?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  message?: string;
+  error?: unknown;
+}
+
+interface ControllerTaskResultResponse {
+  taskId: string;
+  status: "pending" | "in_progress" | "completed" | "failed";
+  message?: string;
+  result?: unknown;
+  error?: unknown;
+}
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+function getControllerTaskErrorMessage(error: unknown) {
+  if (typeof error === "string") {
+    return error;
+  }
+
+  if (error && typeof error === "object") {
+    if ("message" in error && typeof (error as { message?: unknown }).message === "string") {
+      const details = error as {
+        message: string;
+        stepOrder?: unknown;
+        stepKind?: unknown;
+        instruction?: unknown;
+      };
+      const parts = [details.message];
+
+      if (typeof details.stepOrder === "number" && Number.isFinite(details.stepOrder)) {
+        parts.push(`step ${details.stepOrder}`);
+      }
+
+      if (typeof details.stepKind === "string" && details.stepKind) {
+        parts.push(details.stepKind);
+      }
+
+      if (typeof details.instruction === "string" && details.instruction) {
+        parts.push(`"${details.instruction}"`);
+      }
+
+      return parts.join(" | ");
+    }
+
+    if ("error" in error && typeof (error as { error?: unknown }).error === "string") {
+      return (error as { error: string }).error;
+    }
+  }
+
+  return "Remote controller reported a task failure.";
 }
 
 const operatorId = "operator@control-center";
@@ -589,7 +654,15 @@ export function RemoteVpsControlCenter() {
     useState<RemoteVpsInteractionLogRecord | null>(null);
   const [snackbar, setSnackbar] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<RemoteVpsRecord | null>(null);
+  const [clearLogsTarget, setClearLogsTarget] = useState<RemoteVpsRecord | null>(null);
   const [actionVpsId, setActionVpsId] = useState<string | null>(null);
+  const [executeDialogVps, setExecuteDialogVps] = useState<RemoteVpsRecord | null>(null);
+  const [availableScripts, setAvailableScripts] = useState<ScriptRecord[]>([]);
+  const [scriptsLoading, setScriptsLoading] = useState(false);
+  const [scriptsError, setScriptsError] = useState<string | null>(null);
+  const [executeDialogError, setExecuteDialogError] = useState<string | null>(null);
+  const [selectedScriptId, setSelectedScriptId] = useState("");
+  const [isExecutingScript, setIsExecutingScript] = useState(false);
   const [isNavigating, startNavigation] = useTransition();
   const [refreshToken, setRefreshToken] = useState(0);
   const hasMountedRef = useRef(false);
@@ -707,6 +780,11 @@ export function RemoteVpsControlCenter() {
       ? screen.vpsId
       : null;
 
+  const selectedScript = useMemo(
+    () => availableScripts.find((item) => item.id === selectedScriptId) ?? null,
+    [availableScripts, selectedScriptId]
+  );
+
   useEffect(() => {
     let ignore = false;
 
@@ -784,6 +862,58 @@ export function RemoteVpsControlCenter() {
       ignore = true;
     };
   }, [activeVpsId, refreshToken]);
+
+  useEffect(() => {
+    if (!executeDialogVps) {
+      setAvailableScripts([]);
+      setScriptsLoading(false);
+      setScriptsError(null);
+      setExecuteDialogError(null);
+      setSelectedScriptId("");
+      return;
+    }
+
+    let ignore = false;
+
+    async function loadScripts() {
+      setScriptsLoading(true);
+      setScriptsError(null);
+      setExecuteDialogError(null);
+
+      try {
+        const response = await requestJson<ScriptListResponse>(
+          "/api/scripts?page=1&pageSize=100&disabled=false&sortField=updatedAt&sortDirection=desc"
+        );
+
+        if (!ignore) {
+          setAvailableScripts(response.items);
+          setSelectedScriptId((current) => {
+            if (current && response.items.some((item) => item.id === current)) {
+              return current;
+            }
+
+            return response.items[0]?.id ?? "";
+          });
+        }
+      } catch {
+        if (!ignore) {
+          setAvailableScripts([]);
+          setSelectedScriptId("");
+          setScriptsError("Unable to load available scripts.");
+        }
+      } finally {
+        if (!ignore) {
+          setScriptsLoading(false);
+        }
+      }
+    }
+
+    void loadScripts();
+
+    return () => {
+      ignore = true;
+    };
+  }, [executeDialogVps]);
 
   useEffect(() => {
     if (screen.kind !== "details") {
@@ -952,6 +1082,17 @@ export function RemoteVpsControlCenter() {
                 <EditRoundedIcon fontSize="small" />
               </IconButton>
             </Tooltip>
+            <Tooltip title="Execute script">
+              <span>
+                <IconButton
+                  size="small"
+                  disabled={actionVpsId === row.id || !row.isEnabled}
+                  onClick={() => openExecuteScriptDialog(row)}
+                >
+                  <PlayArrowRoundedIcon fontSize="small" />
+                </IconButton>
+              </span>
+            </Tooltip>
             <Tooltip title="Logs">
               <IconButton
                 size="small"
@@ -1036,6 +1177,107 @@ export function RemoteVpsControlCenter() {
     []
   );
 
+  function openExecuteScriptDialog(vps: RemoteVpsRecord) {
+    setExecuteDialogVps(vps);
+  }
+
+  async function pollScriptExecution(options: {
+    vpsId: string;
+    taskId: string;
+    scriptName: string;
+    vpsName: string;
+  }) {
+    try {
+      while (true) {
+        await sleep(4000);
+
+        const statusResponse = await requestJson<ControllerTaskStatusResponse>(
+          `/api/vps/${options.vpsId}/commands/${options.taskId}/status`
+        );
+
+        if (statusResponse.status === "pending" || statusResponse.status === "in_progress") {
+          continue;
+        }
+
+        if (statusResponse.status === "failed") {
+          setSnackbar(
+            `Script "${options.scriptName}" failed on ${options.vpsName}: ${getControllerTaskErrorMessage(statusResponse.error)}`
+          );
+          setRefreshToken((value) => value + 1);
+          return;
+        }
+
+        const resultResponse = await requestJson<ControllerTaskResultResponse>(
+          `/api/vps/${options.vpsId}/commands/${options.taskId}/results`
+        );
+
+        if (resultResponse.status === "completed") {
+          setSnackbar(`Script \"${options.scriptName}\" completed on ${options.vpsName}.`);
+        } else {
+          const message = getControllerTaskErrorMessage(resultResponse.error);
+          setSnackbar(`Script \"${options.scriptName}\" failed on ${options.vpsName}: ${message}`);
+        }
+
+        setRefreshToken((value) => value + 1);
+        return;
+      }
+    } catch {
+      setSnackbar(`Unable to finish tracking script \"${options.scriptName}\" on ${options.vpsName}. Check interaction logs.`);
+      setRefreshToken((value) => value + 1);
+    } finally {
+      setActionVpsId((current) => (current === options.vpsId ? null : current));
+    }
+  }
+
+  async function executeSelectedScript() {
+    if (!executeDialogVps) {
+      return;
+    }
+
+    if (!selectedScript) {
+      setExecuteDialogError("Select a script to execute.");
+      return;
+    }
+
+    setIsExecutingScript(true);
+    setExecuteDialogError(null);
+
+    try {
+      const response = await requestJson<ControllerTaskStatusResponse>(
+        `/api/vps/${executeDialogVps.id}/commands`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            command: "executeScript",
+            scriptId: selectedScript.id,
+            scriptName: selectedScript.name,
+            script: selectedScript.structuredInstructions,
+          }),
+        }
+      );
+
+      if (!response.taskId) {
+        throw new Error("Remote controller did not return a task ID.");
+      }
+
+      setActionVpsId(executeDialogVps.id);
+      setExecuteDialogVps(null);
+      setSnackbar(`Started script \"${selectedScript.name}\" on ${executeDialogVps.name}.`);
+      setRefreshToken((value) => value + 1);
+
+      void pollScriptExecution({
+        vpsId: executeDialogVps.id,
+        taskId: response.taskId,
+        scriptName: selectedScript.name,
+        vpsName: executeDialogVps.name,
+      });
+    } catch {
+      setExecuteDialogError("Unable to execute the selected script.");
+    } finally {
+      setIsExecutingScript(false);
+    }
+  }
+
   async function triggerProbe(vpsId: string, action: "test-connection" | "health-check") {
     setActionVpsId(vpsId);
 
@@ -1087,6 +1329,32 @@ export function RemoteVpsControlCenter() {
     }
   }
 
+  async function confirmClearLogs() {
+    if (!clearLogsTarget) {
+      return;
+    }
+
+    try {
+      await requestJson<{ deletedCount: number; message: string }>(
+        `/api/vps/${clearLogsTarget.id}/logs`,
+        {
+          method: "DELETE",
+          body: JSON.stringify({}),
+        }
+      );
+
+      setSelectedLog(null);
+      setLogsData((current) => ({ ...current, items: [], totalCount: 0 }));
+      setDetailLogs([]);
+      setClearLogsTarget(null);
+      setLogsPaginationModel((current) => ({ ...current, page: 0 }));
+      setRefreshToken((value) => value + 1);
+      setSnackbar(`Cleared interaction logs for ${clearLogsTarget.name}.`);
+    } catch {
+      setSnackbar("Unable to clear interaction logs.");
+    }
+  }
+
   const currentTitle =
     screen.kind === "create"
       ? "Create VPS"
@@ -1110,7 +1378,7 @@ export function RemoteVpsControlCenter() {
             : "Manage controller endpoints and health.";
 
   return (
-    <Box sx={{ minHeight: "100vh", display: "flex", backgroundColor: "background.default" }}>
+    <Box sx={{ height: "100vh", overflow: "hidden", display: "flex", backgroundColor: "background.default" }}>
       <ControlCenterSidebar
         title="Remote Fleet"
         description="Registry for endpoints, diagnostics, and notes."
@@ -1123,7 +1391,7 @@ export function RemoteVpsControlCenter() {
         footerBody={`${listData.totalCount} active records with retained logs.`}
       />
 
-      <Box sx={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
+      <Box sx={{ flex: 1, minWidth: 0, minHeight: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
         <Box
           sx={{
             px: { xs: 1.25, md: 2.5 },
@@ -1171,7 +1439,7 @@ export function RemoteVpsControlCenter() {
           </Stack>
         </Box>
 
-        <Box sx={{ flex: 1, minHeight: 0, px: { xs: 1.25, md: 2.5 }, pb: 2.5 }}>
+        <Box sx={{ flex: 1, minHeight: 0, overflow: "hidden", px: { xs: 1.25, md: 2.5 }, pb: 2.5 }}>
           {screen.kind === "create" ? (
             <RemoteVpsFormScreen
               key="create-vps"
@@ -1424,6 +1692,14 @@ export function RemoteVpsControlCenter() {
                           </Button>
                           <Button
                             variant="outlined"
+                            startIcon={<PlayArrowRoundedIcon />}
+                            disabled={actionVpsId === selectedVps.id || !selectedVps.isEnabled}
+                            onClick={() => openExecuteScriptDialog(selectedVps)}
+                          >
+                            Execute script
+                          </Button>
+                          <Button
+                            variant="outlined"
                             startIcon={<LanRoundedIcon />}
                             disabled={actionVpsId === selectedVps.id}
                             onClick={() => void triggerProbe(selectedVps.id, "test-connection")}
@@ -1515,7 +1791,7 @@ export function RemoteVpsControlCenter() {
 
           {screen.kind === "logs" ? (
             selectedVps ? (
-              <Stack spacing={1.25} sx={{ height: "100%" }}>
+              <Stack spacing={1.25} sx={{ height: "100%", minHeight: 0 }}>
                 <Card>
                   <CardContent>
                     <Stack direction={{ xs: "column", lg: "row" }} spacing={1.5}>
@@ -1582,9 +1858,19 @@ export function RemoteVpsControlCenter() {
                 </Card>
 
                 <Card sx={{ flex: 1, minHeight: 0 }}>
-                  <CardContent sx={{ height: "100%", p: 1.25 }}>
+                  <CardContent sx={{ height: "100%", p: 1.25, display: "flex", flexDirection: "column", minHeight: 0 }}>
+                    <Stack direction="row" justifyContent="flex-end" sx={{ mb: 1 }}>
+                      <Button
+                        color="error"
+                        variant="outlined"
+                        disabled={!selectedVps || logsLoading || logsData.totalCount === 0}
+                        onClick={() => selectedVps && setClearLogsTarget(selectedVps)}
+                      >
+                        Clear Log
+                      </Button>
+                    </Stack>
                     {logsError ? <Alert severity="error">{logsError}</Alert> : null}
-                    <Box sx={{ height: "100%" }}>
+                    <Box sx={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
                       <DataGridPremium
                         density="compact"
                         rowHeight={40}
@@ -1605,6 +1891,7 @@ export function RemoteVpsControlCenter() {
                         }
                         sx={{
                           border: 0,
+                          height: "100%",
                           "& .MuiDataGrid-cell": {
                             py: 0.5,
                           },
@@ -1614,6 +1901,12 @@ export function RemoteVpsControlCenter() {
                           },
                           "& .MuiDataGrid-cell, & .MuiDataGrid-footerContainer": {
                             fontSize: "0.84rem",
+                          },
+                          "& .MuiDataGrid-main": {
+                            minHeight: 0,
+                          },
+                          "& .MuiDataGrid-virtualScroller": {
+                            overflowY: "auto",
                           },
                         }}
                         slots={{
@@ -1668,6 +1961,78 @@ export function RemoteVpsControlCenter() {
         </DialogActions>
       </Dialog>
 
+      <Dialog
+        open={Boolean(executeDialogVps)}
+        onClose={() => {
+          if (!isExecutingScript) {
+            setExecuteDialogVps(null);
+          }
+        }}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>Execute Script</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1.5}>
+            <Typography color="text.secondary">
+              {executeDialogVps
+                ? `Select a script to run on ${executeDialogVps.name}.`
+                : "Select a script to run on the chosen VPS."}
+            </Typography>
+
+            {scriptsError ? <Alert severity="error">{scriptsError}</Alert> : null}
+            {executeDialogError ? <Alert severity="error">{executeDialogError}</Alert> : null}
+
+            <FormControl fullWidth disabled={scriptsLoading || isExecutingScript}>
+              <InputLabel id="execute-script-select-label">Script</InputLabel>
+              <Select
+                labelId="execute-script-select-label"
+                value={selectedScriptId}
+                label="Script"
+                onChange={(event) => setSelectedScriptId(String(event.target.value))}
+              >
+                {availableScripts.map((script) => (
+                  <MenuItem key={script.id} value={script.id}>
+                    {script.name}
+                  </MenuItem>
+                ))}
+              </Select>
+              <FormHelperText>
+                {scriptsLoading
+                  ? "Loading available scripts..."
+                  : availableScripts.length === 0
+                    ? "No enabled scripts are available."
+                    : "The selected script will be dispatched to the remote controller and tracked every 4 seconds."}
+              </FormHelperText>
+            </FormControl>
+
+            {selectedScript ? (
+              <Box>
+                <Typography variant="subtitle2" color="text.secondary">
+                  Description
+                </Typography>
+                <Typography sx={{ mt: 0.5 }}>
+                  {selectedScript.description || "No description provided."}
+                </Typography>
+              </Box>
+            ) : null}
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setExecuteDialogVps(null)} disabled={isExecutingScript}>
+            Cancel
+          </Button>
+          <Button
+            variant="contained"
+            startIcon={<PlayArrowRoundedIcon />}
+            onClick={() => void executeSelectedScript()}
+            disabled={isExecutingScript || scriptsLoading || !selectedScriptId}
+          >
+            Execute
+          </Button>
+        </DialogActions>
+      </Dialog>
+
       <Dialog open={Boolean(deleteTarget)} onClose={() => setDeleteTarget(null)} maxWidth="sm" fullWidth>
         <DialogTitle>Delete VPS record</DialogTitle>
         <DialogContent dividers>
@@ -1681,6 +2046,23 @@ export function RemoteVpsControlCenter() {
           <Button onClick={() => setDeleteTarget(null)}>Cancel</Button>
           <Button color="error" variant="contained" onClick={() => void confirmDelete()}>
             Delete
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={Boolean(clearLogsTarget)} onClose={() => setClearLogsTarget(null)} maxWidth="sm" fullWidth>
+        <DialogTitle>Clear interaction logs</DialogTitle>
+        <DialogContent dividers>
+          <Typography>
+            {clearLogsTarget
+              ? `Delete all interaction log records for ${clearLogsTarget.name}? This cannot be undone.`
+              : ""}
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setClearLogsTarget(null)}>Cancel</Button>
+          <Button color="error" variant="contained" onClick={() => void confirmClearLogs()}>
+            Clear Log
           </Button>
         </DialogActions>
       </Dialog>

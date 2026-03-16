@@ -306,6 +306,64 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function getControllerTaskResultState(payload: unknown) {
+  if (!isPlainObject(payload)) {
+    return { status: "unknown", endedEarly: false, error: null as unknown };
+  }
+
+  return {
+    status: safeString(payload.status),
+    endedEarly: Boolean(isPlainObject(payload.result) && payload.result.endedEarly === true),
+    error: payload.error ?? null,
+  };
+}
+
+function getControllerTaskResultLogResult(payload: unknown): LogResult {
+  const { status } = getControllerTaskResultState(payload);
+
+  if (status === "completed") {
+    return "success";
+  }
+
+  if (status === "failed") {
+    return "failed";
+  }
+
+  if (status === "pending" || status === "in_progress") {
+    return "pending";
+  }
+
+  return "failed";
+}
+
+function getControllerTaskResultMessage(payload: unknown) {
+  const { status, endedEarly, error } = getControllerTaskResultState(payload);
+
+  if (status === "completed") {
+    return endedEarly
+      ? "Script completed and ended early through branch logic."
+      : "Script completed successfully.";
+  }
+
+  if (status === "failed") {
+    if (typeof error === "string") {
+      return error;
+    }
+
+    if (isPlainObject(error) && typeof error.message === "string") {
+      return error.message;
+    }
+
+    return "Script execution failed.";
+  }
+
+  if (status === "pending" || status === "in_progress") {
+    return "Script results are not available yet.";
+  }
+
+  return "Script result payload was not recognized.";
+}
+
 export interface VpsPayload {
   name: string;
   host: string;
@@ -879,6 +937,8 @@ async function performControllerRequest(options: {
 export async function dispatchExecuteScriptCommand(options: {
   vps: ControllerConnectionDetails;
   script: unknown;
+  scriptId?: string;
+  scriptName?: string;
   initiatedByUserId: string;
 }) {
   const structuredInstructions = normalizeStructuredInstructions(options.script);
@@ -890,6 +950,8 @@ export async function dispatchExecuteScriptCommand(options: {
     requestPath: "/api/commands",
     requestPayload: {
       command: "executeScript",
+      scriptId: safeString(options.scriptId),
+      scriptName: safeString(options.scriptName),
       script: structuredInstructions,
     },
     initiatedByUserId: options.initiatedByUserId,
@@ -915,11 +977,34 @@ export async function fetchControllerTaskResults(options: {
   taskId: string;
   initiatedByUserId: string;
 }) {
-  return performControllerRequest({
+  const response = await performControllerRequest({
     vps: options.vps,
     interactionType: "status_pull",
     requestMethod: "GET",
     requestPath: `/api/commands/${encodeURIComponent(options.taskId)}/results`,
     initiatedByUserId: options.initiatedByUserId,
   });
+
+  await createInteractionLog({
+    vpsId: options.vps.id,
+    correlationId: options.taskId,
+    direction: "internal_event",
+    interactionType: "script_result",
+    requestMethod: "GET",
+    requestPath: `/api/commands/${encodeURIComponent(options.taskId)}/results`,
+    responseStatusCode: response.responseStatusCode,
+    responsePayload: response.responsePayload,
+    result: getControllerTaskResultLogResult(response.responsePayload),
+    durationMs: response.durationMs,
+    initiatedBy: "operator",
+    initiatedByUserId: options.initiatedByUserId,
+    errorCode:
+      getControllerTaskResultState(response.responsePayload).status === "failed"
+        ? "TASK_FAILED"
+        : "",
+    errorMessage: getControllerTaskResultMessage(response.responsePayload),
+    createdAt: new Date(),
+  });
+
+  return response;
 }

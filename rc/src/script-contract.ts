@@ -1,6 +1,7 @@
 export const scriptActionKinds = [
   "navigate",
   "click",
+  "branch_if_missing",
   "hover",
   "wait",
   "wait_for_page",
@@ -20,7 +21,10 @@ export interface ScriptTarget {
   selectors: string[];
   text: string;
   role: string;
+  alternativeTexts?: string[];
 }
+
+export type ScriptParamValue = string | number | boolean | null | string[];
 
 export interface ScriptStep {
   order: number;
@@ -29,7 +33,7 @@ export interface ScriptStep {
   delayAfterMs: number;
   timeoutMs: number;
   target: ScriptTarget | null;
-  params: Record<string, string | number | boolean | null>;
+  params: Record<string, ScriptParamValue>;
 }
 
 export interface ScriptInstructions {
@@ -65,6 +69,9 @@ function normalizeTarget(value: unknown): ScriptTarget | null {
       : [],
     text: safeString(value.text),
     role: safeString(value.role),
+    alternativeTexts: Array.isArray(value.alternativeTexts)
+      ? value.alternativeTexts.map((entry) => safeString(entry)).filter(Boolean)
+      : [],
   };
 }
 
@@ -82,6 +89,8 @@ function normalizeStep(value: unknown, index: number): ScriptStep {
         entry === null
       ) {
         accumulator[key] = entry;
+      } else if (Array.isArray(entry) && entry.every((item) => typeof item === "string")) {
+        accumulator[key] = entry.map((item) => safeString(item)).filter(Boolean);
       }
 
       return accumulator;

@@ -25,6 +25,7 @@ export const logInteractionTypeOptions = [
   "health_check",
   "command_dispatch",
   "status_pull",
+  "script_result",
   "configuration_update",
   "registration",
   "manual_test",

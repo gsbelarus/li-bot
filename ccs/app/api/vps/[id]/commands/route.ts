@@ -40,6 +40,14 @@ export async function POST(
 
   const response = await dispatchExecuteScriptCommand({
     vps: getControllerConnectionDetails(item),
+    scriptId:
+      typeof (body as { scriptId?: unknown }).scriptId === "string"
+        ? (body as { scriptId: string }).scriptId
+        : "",
+    scriptName:
+      typeof (body as { scriptName?: unknown }).scriptName === "string"
+        ? (body as { scriptName: string }).scriptName
+        : "",
     script: (body as { script?: unknown }).script,
     initiatedByUserId: getActorFromRequest(request),
   });

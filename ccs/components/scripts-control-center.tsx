@@ -57,7 +57,7 @@ import {
 } from "@/lib/scripts-shared";
 
 type ScreenState = { kind: "list" } | { kind: "create" } | { kind: "details"; scriptId: string };
-type ScriptFormErrors = Partial<Record<"name" | "plainText" | "form", string>>;
+type ScriptFormErrors = Partial<Record<"name" | "plainText" | "structuredInstructions" | "form", string>>;
 
 interface ScriptFormValues {
   name: string;
@@ -85,6 +85,20 @@ function toFormValues(record?: ScriptRecord | null): ScriptFormValues {
       record?.structuredInstructions ?? createEmptyScriptInstructions(),
     isDisabled: record?.isDisabled ?? false,
   };
+}
+
+function toStructuredInstructionsText(value: ScriptFormValues["structuredInstructions"]) {
+  return JSON.stringify(value, null, 2);
+}
+
+function parseStructuredInstructionsText(value: string) {
+  const parsed = JSON.parse(value) as ScriptFormValues["structuredInstructions"];
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Structured instructions must be a JSON object.");
+  }
+
+  return parsed;
 }
 
 async function requestJson<T>(input: string, init?: RequestInit): Promise<T> {
@@ -140,6 +154,9 @@ function ScriptDetailScreen({
   onDeleted: (item: ScriptRecord) => void;
 }) {
   const [values, setValues] = useState<ScriptFormValues>(toFormValues(record));
+  const [structuredInstructionsText, setStructuredInstructionsText] = useState(() =>
+    toStructuredInstructionsText(toFormValues(record).structuredInstructions)
+  );
   const [errors, setErrors] = useState<ScriptFormErrors>({});
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [markdownTab, setMarkdownTab] = useState<"source" | "preview">("source");
@@ -163,8 +180,47 @@ function ScriptDetailScreen({
       nextErrors.plainText = "Script markdown is required.";
     }
 
+    try {
+      const parsedStructuredInstructions = parseStructuredInstructionsText(structuredInstructionsText);
+      setValues((current) => ({
+        ...current,
+        structuredInstructions: parsedStructuredInstructions,
+      }));
+    } catch (error) {
+      nextErrors.structuredInstructions =
+        error instanceof Error ? error.message : "Structured instructions must be valid JSON.";
+    }
+
     setErrors(nextErrors);
     return Object.keys(nextErrors).length === 0;
+  }
+
+  function handleStructuredInstructionsChange(value: string) {
+    setStructuredInstructionsText(value);
+
+    try {
+      const parsedStructuredInstructions = parseStructuredInstructionsText(value);
+      setValues((current) => ({
+        ...current,
+        structuredInstructions: parsedStructuredInstructions,
+      }));
+      setErrors((current) => {
+        if (!current.structuredInstructions) {
+          return current;
+        }
+
+        return {
+          ...current,
+          structuredInstructions: undefined,
+        };
+      });
+    } catch (error) {
+      setErrors((current) => ({
+        ...current,
+        structuredInstructions:
+          error instanceof Error ? error.message : "Structured instructions must be valid JSON.",
+      }));
+    }
   }
 
   function handleSave() {
@@ -208,6 +264,7 @@ function ScriptDetailScreen({
           ...current,
           structuredInstructions: response.structuredInstructions,
         }));
+        setStructuredInstructionsText(toStructuredInstructionsText(response.structuredInstructions));
         setErrors({});
       } catch {
         setErrors({ form: "Unable to convert markdown to structured instructions." });
@@ -347,12 +404,24 @@ function ScriptDetailScreen({
                 {markdownTab === "source" ? (
                   <Box
                     sx={{
+                      flex: 1,
                       height: "100%",
                       minHeight: 0,
                       border: "1px solid rgba(28, 25, 23, 0.08)",
                       borderRadius: "7px",
-                      overflow: "hidden",
+                      overflow: "auto",
+                      "& .cm-editor": {
+                        height: "auto",
+                        minHeight: "100%",
+                      },
+                      "& .cm-scroller": {
+                        overflow: "auto",
+                      },
+                      "& .cm-content, & .cm-line": {
+                        whiteSpace: "pre",
+                      },
                     }}
+                    tabIndex={0}
                   >
                     <CodeMirror
                       value={values.plainText}
@@ -363,7 +432,6 @@ function ScriptDetailScreen({
                         foldGutter: false,
                       }}
                       theme="light"
-                      height="100%"
                     />
                   </Box>
                 ) : (
@@ -417,28 +485,33 @@ function ScriptDetailScreen({
               </Box>
               <Chip label={`${values.structuredInstructions.steps.length} steps`} />
             </Stack>
+            {errors.structuredInstructions ? (
+              <Alert severity="error">{errors.structuredInstructions}</Alert>
+            ) : null}
             <Box
               sx={{
                 flex: 1,
                 minHeight: 0,
                 borderRadius: "7px",
-                overflowY: "auto",
-                overflowX: "hidden",
+                overflow: "auto",
                 border: "1px solid rgba(28, 25, 23, 0.08)",
                 "& .cm-editor": {
                   height: "auto",
                   minHeight: "100%",
                 },
                 "& .cm-scroller": {
-                  overflow: "visible",
+                  overflow: "auto",
+                },
+                "& .cm-content, & .cm-line": {
+                  whiteSpace: "pre",
                 },
               }}
               tabIndex={0}
             >
               <CodeMirror
-                value={JSON.stringify(values.structuredInstructions, null, 2)}
+                value={structuredInstructionsText}
+                onChange={handleStructuredInstructionsChange}
                 extensions={[json()]}
-                editable={false}
                 basicSetup={{
                   lineNumbers: true,
                   foldGutter: false,

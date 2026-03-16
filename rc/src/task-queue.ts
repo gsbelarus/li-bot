@@ -4,6 +4,15 @@ import type { ExecuteScriptCommandPayload } from "./script-contract.js";
 
 export type TaskStatus = "pending" | "in_progress" | "completed" | "failed";
 
+export interface TaskFailureDetails {
+  message: string;
+  stepOrder: number | null;
+  stepKind: string | null;
+  instruction: string | null;
+  cause: string | null;
+  stack: string | null;
+}
+
 export interface TaskRecord {
   id: string;
   command: ExecuteScriptCommandPayload["command"];
@@ -13,6 +22,7 @@ export interface TaskRecord {
   finishedAt: string | null;
   result: unknown;
   error: string | null;
+  failure: TaskFailureDetails | null;
   input: ExecuteScriptCommandPayload;
 }
 
@@ -33,6 +43,42 @@ function parseIsoTime(value: string | null) {
 
 function isFinishedTask(task: TaskRecord) {
   return task.status === "completed" || task.status === "failed";
+}
+
+function extractTaskFailureDetails(error: unknown): TaskFailureDetails {
+  if (error instanceof Error) {
+    const annotatedError = error as Error & {
+      stepOrder?: unknown;
+      stepKind?: unknown;
+      instruction?: unknown;
+      causeMessage?: unknown;
+    };
+
+    return {
+      message: error.message,
+      stepOrder:
+        typeof annotatedError.stepOrder === "number" && Number.isFinite(annotatedError.stepOrder)
+          ? annotatedError.stepOrder
+          : null,
+      stepKind: typeof annotatedError.stepKind === "string" ? annotatedError.stepKind : null,
+      instruction:
+        typeof annotatedError.instruction === "string" ? annotatedError.instruction : null,
+      cause:
+        typeof annotatedError.causeMessage === "string"
+          ? annotatedError.causeMessage
+          : null,
+      stack: typeof error.stack === "string" ? error.stack : null,
+    };
+  }
+
+  return {
+    message: String(error),
+    stepOrder: null,
+    stepKind: null,
+    instruction: null,
+    cause: null,
+    stack: null,
+  };
 }
 
 export class TaskQueue {
@@ -68,6 +114,7 @@ export class TaskQueue {
       finishedAt: null,
       result: null,
       error: null,
+      failure: null,
       input,
     };
 
@@ -103,9 +150,13 @@ export class TaskQueue {
       task.result = await this.worker(task);
       task.status = "completed";
     } catch (error) {
+      const failure = extractTaskFailureDetails(error);
       task.status = "failed";
-      task.error = error instanceof Error ? error.message : String(error);
-      task.result = null;
+      task.error = failure.message;
+      task.failure = failure;
+      task.result = {
+        error: failure,
+      };
     } finally {
       task.finishedAt = new Date().toISOString();
       this.prune();
