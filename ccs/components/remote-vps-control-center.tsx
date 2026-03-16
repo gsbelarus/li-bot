@@ -107,6 +107,10 @@ interface ControllerTaskResultResponse {
   error?: unknown;
 }
 
+const SCRIPT_POLL_INTERVAL_MS = 4000;
+const SCRIPT_POLL_TIMEOUT_MS = 10 * 60 * 1000;
+const SCRIPT_POLL_MAX_ATTEMPTS = Math.ceil(SCRIPT_POLL_TIMEOUT_MS / SCRIPT_POLL_INTERVAL_MS);
+
 function sleep(ms: number) {
   return new Promise<void>((resolve) => {
     window.setTimeout(resolve, ms);
@@ -666,15 +670,26 @@ export function RemoteVpsControlCenter() {
   const [isNavigating, startNavigation] = useTransition();
   const [refreshToken, setRefreshToken] = useState(0);
   const hasMountedRef = useRef(false);
+  const activeScriptPollIdsRef = useRef(new Set<number>());
+  const scriptPollAbortControllersRef = useRef(new Set<AbortController>());
+  const nextScriptPollIdRef = useRef(0);
   const listPaginationTimeoutRef = useRef<number | null>(null);
   const listSortTimeoutRef = useRef<number | null>(null);
   const logsPaginationTimeoutRef = useRef<number | null>(null);
 
   useEffect(() => {
     hasMountedRef.current = true;
+    const activeScriptPollIds = activeScriptPollIdsRef.current;
+    const scriptPollAbortControllers = scriptPollAbortControllersRef.current;
 
     return () => {
       hasMountedRef.current = false;
+      activeScriptPollIds.clear();
+
+      scriptPollAbortControllers.forEach((controller) => {
+        controller.abort();
+      });
+      scriptPollAbortControllers.clear();
 
       if (listPaginationTimeoutRef.current !== null) {
         window.clearTimeout(listPaginationTimeoutRef.current);
@@ -689,6 +704,21 @@ export function RemoteVpsControlCenter() {
       }
     };
   }, []);
+
+  function isScriptPollActive(pollId: number) {
+    return hasMountedRef.current && activeScriptPollIdsRef.current.has(pollId);
+  }
+
+  async function requestJsonForScriptPoll<T>(input: string) {
+    const controller = new AbortController();
+    scriptPollAbortControllersRef.current.add(controller);
+
+    try {
+      return await requestJson<T>(input, { signal: controller.signal });
+    } finally {
+      scriptPollAbortControllersRef.current.delete(controller);
+    }
+  }
 
   function updateListPaginationModel(nextModel: GridPaginationModel) {
     if (!hasMountedRef.current) {
@@ -1187,29 +1217,64 @@ export function RemoteVpsControlCenter() {
     scriptName: string;
     vpsName: string;
   }) {
-    try {
-      while (true) {
-        await sleep(4000);
+    const pollId = nextScriptPollIdRef.current + 1;
+    nextScriptPollIdRef.current = pollId;
+    activeScriptPollIdsRef.current.add(pollId);
+    const startedAt = Date.now();
+    let attempts = 0;
 
-        const statusResponse = await requestJson<ControllerTaskStatusResponse>(
+    try {
+      while (isScriptPollActive(pollId)) {
+        if (attempts >= SCRIPT_POLL_MAX_ATTEMPTS || Date.now() - startedAt >= SCRIPT_POLL_TIMEOUT_MS) {
+          if (isScriptPollActive(pollId)) {
+            setSnackbar(
+              `Stopped tracking script "${options.scriptName}" on ${options.vpsName} after ${Math.round(
+                SCRIPT_POLL_TIMEOUT_MS / 60000
+              )} minutes. Check interaction logs for the latest status.`
+            );
+            setRefreshToken((value) => value + 1);
+          }
+
+          return;
+        }
+
+        attempts += 1;
+        await sleep(SCRIPT_POLL_INTERVAL_MS);
+
+        if (!isScriptPollActive(pollId)) {
+          return;
+        }
+
+        const statusResponse = await requestJsonForScriptPoll<ControllerTaskStatusResponse>(
           `/api/vps/${options.vpsId}/commands/${options.taskId}/status`
         );
+
+        if (!isScriptPollActive(pollId)) {
+          return;
+        }
 
         if (statusResponse.status === "pending" || statusResponse.status === "in_progress") {
           continue;
         }
 
         if (statusResponse.status === "failed") {
-          setSnackbar(
-            `Script "${options.scriptName}" failed on ${options.vpsName}: ${getControllerTaskErrorMessage(statusResponse.error)}`
-          );
-          setRefreshToken((value) => value + 1);
+          if (isScriptPollActive(pollId)) {
+            setSnackbar(
+              `Script "${options.scriptName}" failed on ${options.vpsName}: ${getControllerTaskErrorMessage(statusResponse.error)}`
+            );
+            setRefreshToken((value) => value + 1);
+          }
+
           return;
         }
 
-        const resultResponse = await requestJson<ControllerTaskResultResponse>(
+        const resultResponse = await requestJsonForScriptPoll<ControllerTaskResultResponse>(
           `/api/vps/${options.vpsId}/commands/${options.taskId}/results`
         );
+
+        if (!isScriptPollActive(pollId)) {
+          return;
+        }
 
         if (resultResponse.status === "completed") {
           setSnackbar(`Script \"${options.scriptName}\" completed on ${options.vpsName}.`);
@@ -1221,11 +1286,24 @@ export function RemoteVpsControlCenter() {
         setRefreshToken((value) => value + 1);
         return;
       }
-    } catch {
-      setSnackbar(`Unable to finish tracking script \"${options.scriptName}\" on ${options.vpsName}. Check interaction logs.`);
-      setRefreshToken((value) => value + 1);
+    } catch (error) {
+      if (
+        error instanceof DOMException &&
+        error.name === "AbortError"
+      ) {
+        return;
+      }
+
+      if (isScriptPollActive(pollId)) {
+        setSnackbar(`Unable to finish tracking script \"${options.scriptName}\" on ${options.vpsName}. Check interaction logs.`);
+        setRefreshToken((value) => value + 1);
+      }
     } finally {
-      setActionVpsId((current) => (current === options.vpsId ? null : current));
+      activeScriptPollIdsRef.current.delete(pollId);
+
+      if (hasMountedRef.current) {
+        setActionVpsId((current) => (current === options.vpsId ? null : current));
+      }
     }
   }
 

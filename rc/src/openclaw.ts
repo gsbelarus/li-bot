@@ -10,6 +10,7 @@ const currentFilePath = fileURLToPath(import.meta.url);
 const currentDirectory = dirname(currentFilePath);
 const projectRoot = resolve(currentDirectory, "..");
 const logsDirectory = resolve(projectRoot, "logs");
+const isTaskLoggingEnabled = !/^(?:0|false|off|no)$/i.test(process.env.OPENCLAW_TASK_LOGGING_ENABLED || "1");
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -301,31 +302,39 @@ function inferInstructionIndex(instruction: string) {
 }
 
 function appendTaskLog(taskId: string | undefined, message: string) {
-  if (!taskId) {
+  if (!taskId || !isTaskLoggingEnabled) {
     return;
   }
 
-  mkdirSync(logsDirectory, { recursive: true });
+  try {
+    mkdirSync(logsDirectory, { recursive: true });
 
-  appendFileSync(
-    resolve(logsDirectory, `${taskId}.log`),
-    `[${new Date().toISOString()}] ${message}\n`,
-    "utf8"
-  );
+    appendFileSync(
+      resolve(logsDirectory, `${taskId}.log`),
+      `[${new Date().toISOString()}] ${message}\n`,
+      "utf8"
+    );
+  } catch {
+    // Logging must remain best-effort so task execution does not depend on log file write access.
+  }
 }
 
 function initializeTaskLog(taskId: string | undefined, payload: Record<string, unknown>) {
-  if (!taskId) {
+  if (!taskId || !isTaskLoggingEnabled) {
     return;
   }
 
-  mkdirSync(logsDirectory, { recursive: true });
+  try {
+    mkdirSync(logsDirectory, { recursive: true });
 
-  writeFileSync(
-    resolve(logsDirectory, `${taskId}.log`),
-    `${JSON.stringify(payload, null, 2)}\n\n`,
-    "utf8"
-  );
+    writeFileSync(
+      resolve(logsDirectory, `${taskId}.log`),
+      `${JSON.stringify(payload, null, 2)}\n\n`,
+      "utf8"
+    );
+  } catch {
+    // Logging must remain best-effort so task execution does not depend on log file write access.
+  }
 }
 
 export class OpenClawRuntime {
@@ -442,8 +451,6 @@ export class OpenClawRuntime {
       `COMMAND ${JSON.stringify({
         command,
         commandArgs: maskCommandArgs(commandArgs),
-        openClawArgs: maskCommandArgs(fullArgs),
-        expectsJson: json,
       })}`
     );
 

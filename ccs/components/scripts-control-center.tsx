@@ -67,6 +67,11 @@ interface ScriptFormValues {
   isDisabled: boolean;
 }
 
+interface ValidationResult {
+  isValid: boolean;
+  parsedStructuredInstructions?: ScriptFormValues["structuredInstructions"];
+}
+
 const operatorId = "operator@control-center";
 
 function formatDateTime(value: string) {
@@ -169,8 +174,9 @@ function ScriptDetailScreen({
     setValues((current) => ({ ...current, [key]: value }));
   };
 
-  function validate() {
+  function validate(): ValidationResult {
     const nextErrors: ScriptFormErrors = {};
+    let parsedStructuredInstructions: ScriptFormValues["structuredInstructions"] | undefined;
 
     if (!values.name.trim()) {
       nextErrors.name = "Script name is required.";
@@ -181,10 +187,11 @@ function ScriptDetailScreen({
     }
 
     try {
-      const parsedStructuredInstructions = parseStructuredInstructionsText(structuredInstructionsText);
+      const nextStructuredInstructions = parseStructuredInstructionsText(structuredInstructionsText);
+      parsedStructuredInstructions = nextStructuredInstructions;
       setValues((current) => ({
         ...current,
-        structuredInstructions: parsedStructuredInstructions,
+        structuredInstructions: nextStructuredInstructions,
       }));
     } catch (error) {
       nextErrors.structuredInstructions =
@@ -192,7 +199,10 @@ function ScriptDetailScreen({
     }
 
     setErrors(nextErrors);
-    return Object.keys(nextErrors).length === 0;
+    return {
+      isValid: Object.keys(nextErrors).length === 0,
+      parsedStructuredInstructions,
+    };
   }
 
   function handleStructuredInstructionsChange(value: string) {
@@ -224,9 +234,16 @@ function ScriptDetailScreen({
   }
 
   function handleSave() {
-    if (!validate()) {
+    const validation = validate();
+
+    if (!validation.isValid || !validation.parsedStructuredInstructions) {
       return;
     }
+
+    const payload: ScriptFormValues = {
+      ...values,
+      structuredInstructions: validation.parsedStructuredInstructions,
+    };
 
     startSaving(async () => {
       try {
@@ -234,7 +251,7 @@ function ScriptDetailScreen({
         const method = hasExistingRecord ? "PATCH" : "POST";
         const response = await requestJson<ScriptMutationResponse>(endpoint, {
           method,
-          body: JSON.stringify(values),
+          body: JSON.stringify(payload),
         });
         onSaved(response.item, response.message);
       } catch (error) {
