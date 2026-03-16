@@ -48,6 +48,10 @@ export async function POST(
       typeof (body as { scriptName?: unknown }).scriptName === "string"
         ? (body as { scriptName: string }).scriptName
         : "",
+    engineMode:
+      (body as { engineMode?: unknown }).engineMode === "ai_driven"
+        ? "ai_driven"
+        : "deterministic",
     script: (body as { script?: unknown }).script,
     initiatedByUserId: getActorFromRequest(request),
   });

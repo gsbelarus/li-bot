@@ -43,6 +43,10 @@ export interface ScriptInstructions {
   steps: ScriptStep[];
 }
 
+export const scriptEngineModes = ["deterministic", "ai_driven"] as const;
+
+export type ScriptEngineMode = (typeof scriptEngineModes)[number];
+
 export type ScriptTimestampWarning = "createdAt" | "updatedAt";
 
 export interface ScriptRecord {
@@ -51,6 +55,7 @@ export interface ScriptRecord {
   description: string;
   plainText: string;
   structuredInstructions: ScriptInstructions;
+  engineMode: ScriptEngineMode;
   isDisabled: boolean;
   createdAt: string;
   updatedAt: string;

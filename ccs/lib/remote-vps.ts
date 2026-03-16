@@ -19,6 +19,7 @@ import {
   vpsEnvironmentOptions,
   vpsProtocolOptions,
 } from "@/lib/remote-vps-shared";
+import type { ScriptEngineMode } from "@/lib/scripts-shared";
 import { normalizeStructuredInstructions } from "@/lib/scripts";
 
 const actorFallback = "operator@control-center";
@@ -939,6 +940,7 @@ export async function dispatchExecuteScriptCommand(options: {
   script: unknown;
   scriptId?: string;
   scriptName?: string;
+  engineMode?: ScriptEngineMode;
   initiatedByUserId: string;
 }) {
   const structuredInstructions = normalizeStructuredInstructions(options.script);
@@ -952,6 +954,7 @@ export async function dispatchExecuteScriptCommand(options: {
       command: "executeScript",
       scriptId: safeString(options.scriptId),
       scriptName: safeString(options.scriptName),
+      engineMode: options.engineMode ?? "deterministic",
       script: structuredInstructions,
     },
     initiatedByUserId: options.initiatedByUserId,

@@ -50,22 +50,35 @@ import ReactMarkdown from "react-markdown";
 import { ControlCenterSidebar } from "@/components/control-center-sidebar";
 import {
   ScriptConvertResponse,
+  ScriptEngineMode,
   ScriptListResponse,
   ScriptMutationResponse,
   ScriptRecord,
   createEmptyScriptInstructions,
+  scriptEngineModes,
 } from "@/lib/scripts-shared";
 
 type ScreenState = { kind: "list" } | { kind: "create" } | { kind: "details"; scriptId: string };
-type ScriptFormErrors = Partial<Record<"name" | "plainText" | "structuredInstructions" | "form", string>>;
+type ScriptFormErrors = Partial<Record<"name" | "plainText" | "structuredInstructions" | "engineMode" | "form", string>>;
 
 interface ScriptFormValues {
   name: string;
   description: string;
   plainText: string;
   structuredInstructions: ScriptRecord["structuredInstructions"];
+  engineMode: ScriptEngineMode;
   isDisabled: boolean;
 }
+
+const scriptEngineModeLabels: Record<ScriptEngineMode, string> = {
+  deterministic: "Deterministic",
+  ai_driven: "AI-driven",
+};
+
+const scriptEngineModeDescriptions: Record<ScriptEngineMode, string> = {
+  deterministic: "Uses the current deterministic resolver and execution engine.",
+  ai_driven: "Requests the AI-driven engine path. rc currently records this mode and falls back to deterministic execution while the AI resolver scaffold is incomplete.",
+};
 
 interface ValidationResult {
   isValid: boolean;
@@ -88,6 +101,7 @@ function toFormValues(record?: ScriptRecord | null): ScriptFormValues {
     plainText: record?.plainText ?? "",
     structuredInstructions:
       record?.structuredInstructions ?? createEmptyScriptInstructions(),
+    engineMode: record?.engineMode ?? "deterministic",
     isDisabled: record?.isDisabled ?? false,
   };
 }
@@ -382,6 +396,24 @@ function ScriptDetailScreen({
                   multiline
                   minRows={2}
                 />
+                <FormControl fullWidth error={Boolean(errors.engineMode)}>
+                  <InputLabel id="script-engine-mode-label">Engine mode</InputLabel>
+                  <Select
+                    labelId="script-engine-mode-label"
+                    label="Engine mode"
+                    value={values.engineMode}
+                    onChange={(event) => updateField("engineMode", event.target.value as ScriptEngineMode)}
+                  >
+                    {scriptEngineModes.map((mode) => (
+                      <MenuItem key={mode} value={mode}>
+                        {scriptEngineModeLabels[mode]}
+                      </MenuItem>
+                    ))}
+                  </Select>
+                  <Typography variant="caption" color={errors.engineMode ? "error" : "text.secondary"} sx={{ mt: 0.75, px: 1.75 }}>
+                    {errors.engineMode || scriptEngineModeDescriptions[values.engineMode]}
+                  </Typography>
+                </FormControl>
                 <FormControlLabel
                   control={
                     <Switch
@@ -683,6 +715,19 @@ export function ScriptsControlCenter() {
   const columns = useMemo<GridColDef<ScriptRecord>[]>(
     () => [
       { field: "name", headerName: "Name", flex: 1, minWidth: 200 },
+      {
+        field: "engineMode",
+        headerName: "Engine",
+        minWidth: 150,
+        renderCell: ({ row }) => (
+          <Chip
+            size="small"
+            label={scriptEngineModeLabels[row.engineMode]}
+            color={row.engineMode === "ai_driven" ? "warning" : "default"}
+            variant={row.engineMode === "ai_driven" ? "filled" : "outlined"}
+          />
+        ),
+      },
       {
         field: "description",
         headerName: "Description",

@@ -5,12 +5,14 @@ import ScriptDefinitionModel, {
 } from "@/models/ScriptDefinition";
 import {
   ScriptActionKind,
+  ScriptEngineMode,
   ScriptInstructions,
   ScriptRecord,
   ScriptStep,
   ScriptTimestampWarning,
   ScriptTarget,
   createEmptyScriptInstructions,
+  scriptEngineModes,
   scriptActionKinds,
 } from "@/lib/scripts-shared";
 
@@ -163,6 +165,11 @@ function normalizeStep(value: unknown, index: number): ScriptStep {
   };
 }
 
+function normalizeEngineMode(value: unknown): ScriptEngineMode {
+  const mode = safeString(value, "deterministic") as ScriptEngineMode;
+  return scriptEngineModes.includes(mode) ? mode : "deterministic";
+}
+
 export function normalizeStructuredInstructions(
   value: unknown,
   fallbackSummary = ""
@@ -202,6 +209,7 @@ export function serializeScript(
       source.structuredInstructions,
       safeString(source.description)
     ),
+    engineMode: normalizeEngineMode(source.engineMode),
     isDisabled: Boolean(source.isDisabled),
     createdAt: createdAt.value,
     updatedAt: updatedAt.value,
@@ -216,6 +224,7 @@ export interface ScriptPayload {
   description: string;
   plainText: string;
   structuredInstructions: ScriptInstructions;
+  engineMode: ScriptEngineMode;
   isDisabled: boolean;
 }
 
@@ -236,6 +245,7 @@ export function validateScriptPayload(input: unknown): ScriptPayload {
   const description = safeString(input.description);
   const plainText = typeof input.plainText === "string" ? input.plainText.trim() : "";
   const isDisabled = parseBooleanInput(input.isDisabled, false);
+  const engineMode = normalizeEngineMode(input.engineMode);
   const structuredInstructions = normalizeStructuredInstructions(
     input.structuredInstructions,
     description || name
@@ -263,6 +273,7 @@ export function validateScriptPayload(input: unknown): ScriptPayload {
     description,
     plainText,
     structuredInstructions,
+    engineMode,
     isDisabled: isDisabled.value,
   };
 }
@@ -329,6 +340,7 @@ export function createDefaultScriptPayload(): ScriptPayload {
     description: "",
     plainText: "",
     structuredInstructions: createEmptyScriptInstructions(),
+    engineMode: "deterministic",
     isDisabled: false,
   };
 }

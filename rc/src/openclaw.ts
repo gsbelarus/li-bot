@@ -2,8 +2,13 @@ import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import OpenAI from "openai";
 
-import type { ScriptInstructions, ScriptStep } from "./script-contract.js";
+import type {
+  ExecutionEngineMode,
+  ScriptInstructions,
+  ScriptStep,
+} from "./script-contract.js";
 
 const windowsShell = process.env.ComSpec || "cmd.exe";
 const currentFilePath = fileURLToPath(import.meta.url);
@@ -11,6 +16,8 @@ const currentDirectory = dirname(currentFilePath);
 const projectRoot = resolve(currentDirectory, "..");
 const logsDirectory = resolve(projectRoot, "logs");
 const isTaskLoggingEnabled = !/^(?:0|false|off|no)$/i.test(process.env.OPENCLAW_TASK_LOGGING_ENABLED || "1");
+const openAiApiKey = process.env.OPENAI_API_KEY || "";
+const openAiProjectKey = process.env.OPENAI_PROJECT_KEY || "";
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -91,20 +98,31 @@ export interface StepExecutionRecord {
   kind: ScriptStep["kind"];
   instruction: string;
   durationMs: number;
+  resolution: StepResolutionRecord | null;
   output: unknown;
 }
 
 interface ExecutionContext {
   taskId?: string;
+  engineMode?: ExecutionEngineMode;
+  engineStats?: ExecutionEngineStats;
 }
 
 interface ExecuteScriptOptions extends ExecutionContext {
+  engineMode?: ExecutionEngineMode;
   targetId?: string;
 }
 
 interface OpenClawInvocation {
   command: string;
   commandArgsPrefix: string[];
+}
+
+interface ExecutionEngineStats {
+  aiSelections: number;
+  deterministicSelections: number;
+  aiFallbacks: number;
+  aiErrors: number;
 }
 
 interface BrowserSnapshotRef {
@@ -128,6 +146,26 @@ interface ResolvedSnapshotRef {
   role: string;
   name: string;
   candidateCount: number;
+  resolution: StepResolutionRecord;
+}
+
+interface StepResolutionRecord {
+  requestedMode: ExecutionEngineMode;
+  resolver: "deterministic" | "ai_driven" | "deterministic_fallback";
+  usedAi: boolean;
+  fallbackReason: string | null;
+  matchedRef: string | null;
+  candidateCount: number | null;
+}
+
+interface AiResolutionCandidate {
+  ref: string;
+  role: string;
+  name: string;
+  lineIndex: number;
+  score: number;
+  context: string;
+  nearbyContext: string;
 }
 
 interface BranchStepResult {
@@ -275,6 +313,36 @@ function serializeUnknownError(error: unknown) {
   };
 }
 
+function cloneStepResolution(resolution: StepResolutionRecord): StepResolutionRecord {
+  return {
+    requestedMode: resolution.requestedMode,
+    resolver: resolution.resolver,
+    usedAi: resolution.usedAi,
+    fallbackReason: resolution.fallbackReason,
+    matchedRef: resolution.matchedRef,
+    candidateCount: resolution.candidateCount,
+  };
+}
+
+function extractStepResolution(output: unknown) {
+  if (
+    typeof output === "object" &&
+    output !== null &&
+    "matched" in output &&
+    typeof (output as { matched?: unknown }).matched === "object" &&
+    (output as { matched?: unknown }).matched !== null &&
+    "resolution" in ((output as { matched: { resolution?: unknown } }).matched)
+  ) {
+    const resolution = (output as {
+      matched: { resolution?: StepResolutionRecord };
+    }).matched.resolution;
+
+    return resolution ? cloneStepResolution(resolution) : null;
+  }
+
+  return null;
+}
+
 function inferInstructionIndex(instruction: string) {
   const normalized = normalizeSearchText(instruction);
 
@@ -375,14 +443,57 @@ export class OpenClawRuntime {
   private readonly gatewayUrl = process.env.OPENCLAW_GATEWAY_URL || "";
   private readonly gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN || "";
   private readonly openClawBin = process.env.OPENCLAW_BIN || "openclaw";
+  private readonly aiModel = process.env.OPENCLAW_AI_MODEL || "gpt-4.1-mini";
+  private readonly aiCandidateLimit = Math.max(5, Number(process.env.OPENCLAW_AI_CANDIDATE_LIMIT || 24));
+  private readonly aiSnapshotExcerptChars = Math.max(1200, Number(process.env.OPENCLAW_AI_SNAPSHOT_EXCERPT_CHARS || 2500));
   private windowsInvocation: OpenClawInvocation | null = null;
+  private openAiClient: OpenAI | null | undefined;
 
   executeScript(script: ScriptInstructions, options?: string | ExecuteScriptOptions) {
     if (typeof options === "string") {
-      return this.runScript(script, { targetId: options });
+      return this.runScript(script, { targetId: options, engineMode: "deterministic" });
     }
 
-    return this.runScript(script, options);
+    const normalizedOptions: ExecuteScriptOptions = {
+      ...options,
+      engineMode: options?.engineMode === "ai_driven" ? "ai_driven" : "deterministic",
+    };
+
+    if (normalizedOptions.engineMode === "ai_driven") {
+      return this.runAiDrivenScript(script, normalizedOptions);
+    }
+
+    return this.runScript(script, normalizedOptions);
+  }
+
+  private async runAiDrivenScript(script: ScriptInstructions, options: ExecuteScriptOptions = {}) {
+    appendTaskLog(options.taskId, `ENGINE_MODE ${JSON.stringify({
+      taskId: options.taskId ?? null,
+      requestedEngineMode: "ai_driven",
+      resolver: "ai_driven",
+      note: "AI-driven resolver enabled for snapshot target selection with deterministic action execution.",
+      recordedAt: new Date().toISOString(),
+    })}`);
+
+    return this.runScript(script, { ...options, engineMode: "ai_driven" });
+  }
+
+  private getOpenAiClient() {
+    if (this.openAiClient !== undefined) {
+      return this.openAiClient;
+    }
+
+    if (!openAiApiKey) {
+      this.openAiClient = null;
+      return this.openAiClient;
+    }
+
+    this.openAiClient = new OpenAI({
+      apiKey: openAiApiKey,
+      project: openAiProjectKey || undefined,
+    });
+
+    return this.openAiClient;
   }
 
   private resolveWindowsOpenClawPath() {
@@ -800,7 +911,283 @@ export class OpenClawRuntime {
     return matches;
   }
 
-  private async resolveSnapshotRef(targetId: string, step: ScriptStep, context: ExecutionContext = {}) {
+  private buildAiResolutionCandidates(snapshot: BrowserSnapshot, step: ScriptStep) {
+    const target = step.target;
+
+    if (!target || target.role === "document") {
+      return [] as AiResolutionCandidate[];
+    }
+
+    const roleNeedle = normalizeSearchText(target.role);
+    const targetTextPatterns = normalizeTextPatterns(target.text, target.alternativeTexts);
+    const description = normalizeSearchText(target.description);
+    const profileCardStep = isProfileCardStep(step);
+    const ordinalPostContextIndex = getOrdinalPostContextIndex(step);
+    const postContextNeedle = ordinalPostContextIndex > 0 ? `feed post number ${ordinalPostContextIndex}` : "";
+    const containerTextPatterns = normalizeTextPatterns(
+      step.params.containerText,
+      step.params.containerAlternativeTexts
+    );
+    const { lines, refLines } = this.buildSnapshotLineIndex(snapshot.snapshot || "");
+    const refs = this.buildSnapshotRefs(snapshot, lines);
+
+    return Object.entries(refs)
+      .map(([ref, meta]) => {
+        const role = normalizeSearchText(meta.role);
+
+        if (roleNeedle && role !== roleNeedle) {
+          return null;
+        }
+
+        const name = scalarString(meta.name);
+        const normalizedName = normalizeSearchText(name);
+
+        if (profileCardStep && isHeaderActionLink(normalizedName)) {
+          return null;
+        }
+
+        const lineIndex = refLines.get(ref) ?? Number.MAX_SAFE_INTEGER;
+        const nearbyContext = buildLineWindow(lines, lineIndex, 10, 24);
+        const sourceLine = scalarString(lines[lineIndex]).trim();
+        let score = 0;
+
+        if (roleNeedle) {
+          score += 35;
+        }
+
+        if (targetTextPatterns.length > 0) {
+          const textScore = scoreAnyTextPattern(normalizedName, nearbyContext, targetTextPatterns);
+
+          if (textScore !== null) {
+            score += textScore;
+          }
+        }
+
+        if (description) {
+          if (normalizedName.includes(description)) {
+            score += 24;
+          } else if (nearbyContext.includes(description)) {
+            score += 12;
+          }
+        }
+
+        if (containerTextPatterns.length > 0) {
+          const containerScore = scoreAnyTextPattern(normalizedName, nearbyContext, containerTextPatterns);
+
+          if (containerScore !== null) {
+            score += Math.max(18, Math.floor(containerScore / 2));
+          }
+        }
+
+        if (postContextNeedle) {
+          if (nearbyContext.includes(postContextNeedle)) {
+            score += 80;
+          } else if (/\bfeed post number \d+\b/.test(nearbyContext)) {
+            score -= 60;
+          }
+        }
+
+        if (!normalizedName && !sourceLine) {
+          score -= 25;
+        }
+
+        return {
+          ref,
+          role: role || scalarString(meta.role),
+          name,
+          lineIndex,
+          score,
+          context: sourceLine,
+          nearbyContext,
+        } satisfies AiResolutionCandidate;
+      })
+      .filter((entry): entry is AiResolutionCandidate => Boolean(entry))
+      .sort((left, right) => {
+        if (right.score !== left.score) {
+          return right.score - left.score;
+        }
+
+        if (left.lineIndex !== right.lineIndex) {
+          return left.lineIndex - right.lineIndex;
+        }
+
+        return left.ref.localeCompare(right.ref, undefined, { numeric: true });
+      })
+      .slice(0, this.aiCandidateLimit);
+  }
+
+  private async selectSnapshotRefWithAi(
+    step: ScriptStep,
+    snapshot: BrowserSnapshot,
+    candidates: AiResolutionCandidate[],
+    context: ExecutionContext = {}
+  ) {
+    const client = this.getOpenAiClient();
+
+    if (!client || candidates.length === 0) {
+      return null;
+    }
+
+    const snapshotExcerpt = scalarString(snapshot.snapshot).slice(0, this.aiSnapshotExcerptChars);
+
+    try {
+      const completion = await client.chat.completions.create({
+        model: this.aiModel,
+        temperature: 0.1,
+        messages: [
+          {
+            role: "system",
+            content: [
+              "You select the best OpenClaw snapshot ref for one browser-automation step.",
+              "You must choose only from the provided candidates.",
+              "Do not invent refs, selectors, actions, or page states.",
+              "Prefer the candidate whose role, accessible name, and nearby snapshot context best match the operator intent.",
+              "If none of the candidates are a defensible match, return ref=null.",
+            ].join(" "),
+          },
+          {
+            role: "user",
+            content: JSON.stringify({
+              task: "select_snapshot_ref",
+              step: {
+                order: step.order,
+                kind: step.kind,
+                instruction: step.instruction,
+                target: step.target,
+                params: step.params,
+              },
+              snapshot: {
+                url: snapshot.url ?? null,
+                truncated: snapshot.truncated === true,
+                excerpt: snapshotExcerpt,
+              },
+              candidates: candidates.map((candidate) => ({
+                ref: candidate.ref,
+                role: candidate.role,
+                name: candidate.name,
+                score: candidate.score,
+                context: candidate.context,
+                nearbyContext: candidate.nearbyContext,
+              })),
+            }),
+          },
+        ],
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "select_snapshot_ref",
+              description: "Choose the single best candidate ref for the step or return null if no candidate fits.",
+              parameters: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  ref: {
+                    type: ["string", "null"],
+                    description: "The chosen candidate ref, or null if none fit.",
+                  },
+                  confidence: {
+                    type: "string",
+                    enum: ["high", "medium", "low"],
+                  },
+                  reasoning: {
+                    type: "string",
+                    description: "A short explanation grounded in the candidate names and context.",
+                  },
+                },
+                required: ["ref", "confidence", "reasoning"],
+              },
+            },
+          },
+        ],
+        tool_choice: {
+          type: "function",
+          function: { name: "select_snapshot_ref" },
+        },
+      });
+
+      const toolCall = completion.choices[0]?.message?.tool_calls?.[0];
+
+      if (!toolCall || toolCall.type !== "function") {
+        return null;
+      }
+
+      const parsed = JSON.parse(toolCall.function.arguments) as {
+        ref?: unknown;
+        confidence?: unknown;
+        reasoning?: unknown;
+      };
+      const ref = scalarString(parsed.ref);
+
+      if (!ref) {
+        appendTaskLog(context.taskId, `AI_RESOLUTION_NO_MATCH ${JSON.stringify({
+          taskId: context.taskId ?? null,
+          step: { order: step.order, kind: step.kind, instruction: step.instruction },
+          confidence: scalarString(parsed.confidence),
+          reasoning: scalarString(parsed.reasoning),
+        })}`);
+        return null;
+      }
+
+      const candidate = candidates.find((entry) => entry.ref === ref);
+
+      if (!candidate) {
+        appendTaskLog(context.taskId, `AI_RESOLUTION_INVALID_REF ${JSON.stringify({
+          taskId: context.taskId ?? null,
+          step: { order: step.order, kind: step.kind, instruction: step.instruction },
+          returnedRef: ref,
+        })}`);
+        return null;
+      }
+
+      appendTaskLog(context.taskId, `AI_RESOLUTION ${JSON.stringify({
+        taskId: context.taskId ?? null,
+        step: { order: step.order, kind: step.kind, instruction: step.instruction },
+        selected: {
+          ref: candidate.ref,
+          role: candidate.role,
+          name: candidate.name,
+        },
+        confidence: scalarString(parsed.confidence),
+        reasoning: scalarString(parsed.reasoning),
+      })}`);
+
+      context.engineStats && (context.engineStats.aiSelections += 1);
+
+      return {
+        ref: candidate.ref,
+        role: candidate.role,
+        name: candidate.name,
+        candidateCount: candidates.length,
+        resolution: {
+          requestedMode: "ai_driven",
+          resolver: "ai_driven",
+          usedAi: true,
+          fallbackReason: null,
+          matchedRef: candidate.ref,
+          candidateCount: candidates.length,
+        },
+      } satisfies ResolvedSnapshotRef;
+    } catch (error) {
+      if (context.engineStats) {
+        context.engineStats.aiErrors += 1;
+      }
+
+      appendTaskLog(context.taskId, `AI_RESOLUTION_ERROR ${JSON.stringify({
+        taskId: context.taskId ?? null,
+        step: { order: step.order, kind: step.kind, instruction: step.instruction },
+        error: serializeUnknownError(error),
+      })}`);
+
+      return null;
+    }
+  }
+
+  private async resolveSnapshotRefDeterministic(
+    targetId: string,
+    step: ScriptStep,
+    context: ExecutionContext = {}
+  ) {
     const deadline = Date.now() + Math.max(250, step.timeoutMs);
     const desiredIndex = this.getCandidateIndex(step);
     const hasExplicitIndex = hasExplicitTargetIndex(step);
@@ -814,11 +1201,23 @@ export class OpenClawRuntime {
         : matches[desiredIndex - 1] || matches[0] || null;
 
       if (resolved) {
+        if (context.engineStats) {
+          context.engineStats.deterministicSelections += 1;
+        }
+
         return {
           ref: resolved.ref,
           role: resolved.role,
           name: resolved.name,
           candidateCount: matches.length,
+          resolution: {
+            requestedMode: context.engineMode === "ai_driven" ? "ai_driven" : "deterministic",
+            resolver: "deterministic",
+            usedAi: false,
+            fallbackReason: null,
+            matchedRef: resolved.ref,
+            candidateCount: matches.length,
+          },
         } satisfies ResolvedSnapshotRef;
       }
 
@@ -849,6 +1248,105 @@ export class OpenClawRuntime {
     }
 
     throw new SnapshotRefNotFoundError(step);
+  }
+
+  private async resolveSnapshotRefWithAi(targetId: string, step: ScriptStep, context: ExecutionContext = {}) {
+    const client = this.getOpenAiClient();
+
+    if (!client) {
+      if (context.engineStats) {
+        context.engineStats.aiFallbacks += 1;
+      }
+
+      appendTaskLog(context.taskId, `AI_RESOLUTION_FALLBACK ${JSON.stringify({
+        taskId: context.taskId ?? null,
+        step: { order: step.order, kind: step.kind, instruction: step.instruction },
+        reason: "missing_openai_api_key",
+      })}`);
+      const deterministicResolution = await this.resolveSnapshotRefDeterministic(targetId, step, context);
+
+      return {
+        ...deterministicResolution,
+        resolution: {
+          requestedMode: "ai_driven",
+          resolver: "deterministic_fallback",
+          usedAi: false,
+          fallbackReason: "missing_openai_api_key",
+          matchedRef: deterministicResolution.ref,
+          candidateCount: deterministicResolution.candidateCount,
+        },
+      } satisfies ResolvedSnapshotRef;
+    }
+
+    const deadline = Date.now() + Math.max(250, step.timeoutMs);
+    let previousScrollY = Number.NaN;
+
+    while (Date.now() <= deadline) {
+      const snapshot = await this.getSnapshot(targetId, context);
+      const candidates = this.buildAiResolutionCandidates(snapshot, step);
+      const resolved = await this.selectSnapshotRefWithAi(step, snapshot, candidates, context);
+
+      if (resolved) {
+        return resolved;
+      }
+
+      if (shouldAutoScrollSearch(step)) {
+        const pageState = await this.getPageState(targetId, context);
+        const currentScrollY = scalarNumber(pageState.scrollY, Number.NaN);
+        const nextScroll = await this.evaluate(
+          targetId,
+          `() => {
+            const viewportHeight = Math.max(window.innerHeight || 0, 1);
+            const delta = Math.max(500, Math.floor(viewportHeight * 0.85));
+            window.scrollBy({ top: delta, behavior: "auto" });
+            return { scrollY: window.scrollY, delta };
+          }`,
+          context
+        ) as { scrollY?: number; delta?: number };
+
+        const nextScrollY = scalarNumber(nextScroll?.scrollY, currentScrollY);
+
+        if (Number.isFinite(previousScrollY) && nextScrollY <= previousScrollY) {
+          break;
+        }
+
+        previousScrollY = nextScrollY;
+      }
+
+      await sleep(Math.min(500, Math.max(100, step.delayAfterMs || 250)));
+    }
+
+    if (context.engineStats) {
+      context.engineStats.aiFallbacks += 1;
+    }
+
+    appendTaskLog(context.taskId, `AI_RESOLUTION_FALLBACK ${JSON.stringify({
+      taskId: context.taskId ?? null,
+      step: { order: step.order, kind: step.kind, instruction: step.instruction },
+      reason: "no_ai_candidate_selected",
+    })}`);
+
+    const deterministicResolution = await this.resolveSnapshotRefDeterministic(targetId, step, context);
+
+    return {
+      ...deterministicResolution,
+      resolution: {
+        requestedMode: "ai_driven",
+        resolver: "deterministic_fallback",
+        usedAi: false,
+        fallbackReason: "no_ai_candidate_selected",
+        matchedRef: deterministicResolution.ref,
+        candidateCount: deterministicResolution.candidateCount,
+      },
+    } satisfies ResolvedSnapshotRef;
+  }
+
+  private async resolveSnapshotRef(targetId: string, step: ScriptStep, context: ExecutionContext = {}) {
+    if (context.engineMode === "ai_driven") {
+      return this.resolveSnapshotRefWithAi(targetId, step, context);
+    }
+
+    return this.resolveSnapshotRefDeterministic(targetId, step, context);
   }
 
   private async waitForPage(targetId: string, step: ScriptStep, context: ExecutionContext = {}) {
@@ -1337,16 +1835,24 @@ export class OpenClawRuntime {
       kind: step.kind,
       instruction: step.instruction,
       durationMs,
+      resolution: extractStepResolution(output),
       output,
     } satisfies StepExecutionRecord;
   }
 
   private async runScript(script: ScriptInstructions, options: ExecuteScriptOptions = {}) {
-    const { targetId, taskId } = options;
+    const { targetId, taskId, engineMode = "deterministic" } = options;
+    const engineStats: ExecutionEngineStats = {
+      aiSelections: 0,
+      deterministicSelections: 0,
+      aiFallbacks: 0,
+      aiErrors: 0,
+    };
     initializeTaskLog(taskId, {
       taskId: taskId ?? null,
       receivedAt: new Date().toISOString(),
       targetId: targetId ?? null,
+      engineMode,
       summary: script.summary,
       stepCount: script.steps.length,
       script,
@@ -1359,7 +1865,11 @@ export class OpenClawRuntime {
 
     for (const step of [...script.steps].sort((left, right) => left.order - right.order)) {
       try {
-        const stepResult = await this.runStep(activeTargetId, step, { taskId });
+        const stepResult = await this.runStep(activeTargetId, step, {
+          taskId,
+          engineMode,
+          engineStats,
+        });
         stepResults.push(stepResult);
 
         const branchAction =
@@ -1406,12 +1916,25 @@ export class OpenClawRuntime {
     }
 
     const result = {
+      engine: {
+        requestedMode: engineMode,
+        resolver:
+          engineMode === "ai_driven"
+            ? engineStats.aiSelections > 0
+              ? "ai_driven"
+              : "deterministic_fallback"
+            : "deterministic",
+        aiSelections: engineStats.aiSelections,
+        deterministicSelections: engineStats.deterministicSelections,
+        aiFallbacks: engineStats.aiFallbacks,
+        aiErrors: engineStats.aiErrors,
+      },
       summary: script.summary,
       targetId: activeTargetId,
       startedAt,
       finishedAt: new Date().toISOString(),
       endedEarly,
-      currentPage: await this.getPageState(activeTargetId, { taskId }),
+      currentPage: await this.getPageState(activeTargetId, { taskId, engineMode, engineStats }),
       steps: stepResults,
     };
 

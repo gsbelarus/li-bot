@@ -34,6 +34,7 @@ if (!remoteControllerSecretKey) {
 const runtime = new OpenClawRuntime();
 const queue = new TaskQueue(async (task) => {
   return runtime.executeScript(task.input.script, {
+    engineMode: task.input.engineMode,
     targetId: task.input.targetId,
     taskId: task.id,
   });

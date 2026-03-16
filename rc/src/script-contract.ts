@@ -43,9 +43,14 @@ export interface ScriptInstructions {
   steps: ScriptStep[];
 }
 
+export const executionEngineModes = ["deterministic", "ai_driven"] as const;
+
+export type ExecutionEngineMode = (typeof executionEngineModes)[number];
+
 export interface ExecuteScriptCommandPayload {
   command: "executeScript";
   script: ScriptInstructions;
+  engineMode: ExecutionEngineMode;
   targetId?: string;
 }
 
@@ -55,6 +60,11 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 function safeString(value: unknown, fallback = "") {
   return typeof value === "string" ? value.trim() : fallback;
+}
+
+function normalizeExecutionEngineMode(value: unknown): ExecutionEngineMode {
+  const mode = safeString(value, "deterministic") as ExecutionEngineMode;
+  return executionEngineModes.includes(mode) ? mode : "deterministic";
 }
 
 function normalizeTarget(value: unknown): ScriptTarget | null {
@@ -145,6 +155,7 @@ export function validateExecuteScriptCommandPayload(
   return {
     command: "executeScript",
     script: normalizeStructuredInstructions(value.script),
+    engineMode: normalizeExecutionEngineMode(value.engineMode),
     targetId: safeString(value.targetId) || undefined,
   };
 }

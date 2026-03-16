@@ -108,6 +108,8 @@ interface ControllerTaskResultResponse {
   taskLog?: unknown;
 }
 
+type TaskEngineMode = "deterministic" | "ai_driven";
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -170,6 +172,179 @@ function getSkippedTaskOutputs(payload: unknown) {
     .filter((output): output is Record<string, unknown> => Boolean(output && output.skipped === true));
 }
 
+function getTaskEngineInfo(payload: unknown) {
+  const engine = isPlainObject(payload) && isPlainObject(payload.result) && isPlainObject(payload.result.engine)
+    ? payload.result.engine
+    : null;
+
+  const requestedMode = engine?.requestedMode === "ai_driven" ? "ai_driven" : engine?.requestedMode === "deterministic" ? "deterministic" : null;
+  const resolver = typeof engine?.resolver === "string" ? engine.resolver : null;
+  const aiSelections = typeof engine?.aiSelections === "number" ? engine.aiSelections : null;
+  const aiFallbacks = typeof engine?.aiFallbacks === "number" ? engine.aiFallbacks : null;
+
+  return {
+    requestedMode,
+    resolver,
+    aiSelections,
+    aiFallbacks,
+  } as {
+    requestedMode: TaskEngineMode | null;
+    resolver: string | null;
+    aiSelections: number | null;
+    aiFallbacks: number | null;
+  };
+}
+
+function getTaskEngineLabel(mode: TaskEngineMode | null) {
+  if (mode === "ai_driven") {
+    return "AI-driven";
+  }
+
+  if (mode === "deterministic") {
+    return "Deterministic";
+  }
+
+  return "-";
+}
+
+function getInteractionEngineInfo(log: RemoteVpsInteractionLogRecord) {
+  const taskEngine = getTaskEngineInfo(log.responsePayload);
+
+  if (taskEngine.requestedMode) {
+    return taskEngine;
+  }
+
+  if (isPlainObject(log.requestPayload)) {
+    const requestMode = log.requestPayload.engineMode;
+
+    if (requestMode === "ai_driven" || requestMode === "deterministic") {
+      return {
+        requestedMode: requestMode,
+        resolver: null,
+        aiSelections: null,
+        aiFallbacks: null,
+      } as {
+        requestedMode: TaskEngineMode | null;
+        resolver: string | null;
+        aiSelections: number | null;
+        aiFallbacks: number | null;
+      };
+    }
+  }
+
+  return taskEngine;
+}
+
+function getTaskStepResolutionIndicators(payload: unknown) {
+  if (!isPlainObject(payload) || !isPlainObject(payload.result) || !Array.isArray(payload.result.steps)) {
+    return [] as Array<{
+      order: number;
+      kind: string;
+      instruction: string;
+      resolver: string;
+      usedAi: boolean;
+      fallbackReason: string | null;
+    }>;
+  }
+
+  return payload.result.steps
+    .map((step) => {
+      if (!isPlainObject(step) || !isPlainObject(step.resolution)) {
+        return null;
+      }
+
+      return {
+        order: typeof step.order === "number" ? step.order : 0,
+        kind: typeof step.kind === "string" ? step.kind : "",
+        instruction: typeof step.instruction === "string" ? step.instruction : "",
+        resolver: typeof step.resolution.resolver === "string" ? step.resolution.resolver : "",
+        usedAi: step.resolution.usedAi === true,
+        fallbackReason:
+          typeof step.resolution.fallbackReason === "string"
+            ? step.resolution.fallbackReason
+            : null,
+      };
+    })
+    .filter(
+      (
+        step
+      ): step is {
+        order: number;
+        kind: string;
+        instruction: string;
+        resolver: string;
+        usedAi: boolean;
+        fallbackReason: string | null;
+      } => Boolean(step && step.resolver)
+    );
+}
+
+function getTaskStepResolutionSummary(payload: unknown) {
+  const indicators = getTaskStepResolutionIndicators(payload);
+
+  if (indicators.length === 0) {
+    return "";
+  }
+
+  const aiResolved = indicators.filter((step) => step.usedAi).length;
+  const fallbackResolved = indicators.filter((step) => step.resolver === "deterministic_fallback").length;
+  const deterministicResolved = indicators.filter((step) => step.resolver === "deterministic").length;
+  const parts: string[] = [];
+
+  if (aiResolved > 0) {
+    parts.push(`${aiResolved} AI-resolved`);
+  }
+
+  if (fallbackResolved > 0) {
+    parts.push(`${fallbackResolved} fallback`);
+  }
+
+  if (deterministicResolved > 0) {
+    parts.push(`${deterministicResolved} deterministic`);
+  }
+
+  return parts.join(" | ");
+}
+
+function formatTaskStepResolutionIndicators(payload: unknown) {
+  const indicators = getTaskStepResolutionIndicators(payload);
+
+  return indicators.map((step) => ({
+    order: step.order,
+    kind: step.kind,
+    resolver: step.resolver,
+    usedAi: step.usedAi,
+    fallbackReason: step.fallbackReason,
+    instruction: step.instruction,
+  }));
+}
+
+function resolutionChipColor(resolver: string) {
+  switch (resolver) {
+    case "ai_driven":
+      return "warning" as const;
+    case "deterministic_fallback":
+      return "info" as const;
+    case "deterministic":
+      return "default" as const;
+    default:
+      return "default" as const;
+  }
+}
+
+function resolutionChipLabel(resolver: string) {
+  switch (resolver) {
+    case "ai_driven":
+      return "AI";
+    case "deterministic_fallback":
+      return "Fallback";
+    case "deterministic":
+      return "Deterministic";
+    default:
+      return resolver || "Unknown";
+  }
+}
+
 function getTaskResultSummary(payload: unknown) {
   if (!isPlainObject(payload) || !isPlainObject(payload.result)) {
     return "";
@@ -178,18 +353,44 @@ function getTaskResultSummary(payload: unknown) {
   const skippedOutputs = getSkippedTaskOutputs(payload);
   const alreadyActiveSkips = skippedOutputs.filter((output) => output.reason === "already_pressed").length;
   const endedEarly = payload.result.endedEarly === true;
+  const engine = getTaskEngineInfo(payload);
+  const stepResolutionSummary = getTaskStepResolutionSummary(payload);
+  const parts: string[] = [];
+
+  if (engine.requestedMode) {
+    let engineSummary = `Engine: ${getTaskEngineLabel(engine.requestedMode)}`;
+
+    if (engine.requestedMode === "ai_driven") {
+      if (engine.resolver === "ai_driven") {
+        const selectionCount = engine.aiSelections ?? 0;
+        engineSummary += selectionCount > 0
+          ? ` with ${selectionCount} AI-selected target${selectionCount === 1 ? "" : "s"}`
+          : " with AI resolution enabled";
+      } else if (engine.resolver === "deterministic_fallback") {
+        engineSummary += ". Resolver fell back to deterministic matching";
+      }
+    }
+
+    parts.push(engineSummary);
+  }
 
   if (alreadyActiveSkips > 0) {
-    return alreadyActiveSkips === 1
-      ? "1 toggle step was skipped because the target was already active."
-      : `${alreadyActiveSkips} toggle steps were skipped because the target was already active.`;
+    parts.push(
+      alreadyActiveSkips === 1
+        ? "1 toggle step was skipped because the target was already active."
+        : `${alreadyActiveSkips} toggle steps were skipped because the target was already active.`
+    );
   }
 
   if (endedEarly) {
-    return "The script completed and ended early through branch logic.";
+    parts.push("The script completed and ended early through branch logic.");
   }
 
-  return "";
+  if (stepResolutionSummary) {
+    parts.push(`Step resolution: ${stepResolutionSummary}.`);
+  }
+
+  return parts.join(" ");
 }
 
 function getTaskCompletionSnackbarMessage(
@@ -1241,6 +1442,27 @@ export function RemoteVpsControlCenter() {
         ),
       },
       {
+        field: "engineMode",
+        headerName: "Engine",
+        minWidth: 140,
+        sortable: false,
+        valueGetter: (_value, row) => getInteractionEngineInfo(row).requestedMode ?? "",
+        renderCell: ({ row }) => {
+          const engine = getInteractionEngineInfo(row);
+
+          return engine.requestedMode ? (
+            <Chip
+              label={getTaskEngineLabel(engine.requestedMode)}
+              size="small"
+              color={engine.requestedMode === "ai_driven" ? "warning" : "default"}
+              variant={engine.requestedMode === "ai_driven" ? "filled" : "outlined"}
+            />
+          ) : (
+            <Typography color="text.secondary">-</Typography>
+          );
+        },
+      },
+      {
         field: "requestPath",
         headerName: "Path",
         minWidth: 180,
@@ -1389,6 +1611,7 @@ export function RemoteVpsControlCenter() {
             command: "executeScript",
             scriptId: selectedScript.id,
             scriptName: selectedScript.name,
+            engineMode: selectedScript.engineMode,
             script: selectedScript.structuredInstructions,
           }),
         }
@@ -2075,11 +2298,24 @@ export function RemoteVpsControlCenter() {
         <DialogContent dividers>
           {selectedLog ? (
             <Stack spacing={2}>
-              <Stack direction="row" spacing={1} flexWrap="wrap">
-                <Chip label={selectedLog.result} color={resultColor(selectedLog.result)} />
-                <Chip label={selectedLog.direction} variant="outlined" />
-                <Chip label={selectedLog.interactionType} variant="outlined" />
-              </Stack>
+              {(() => {
+                const engine = getInteractionEngineInfo(selectedLog);
+
+                return (
+                  <Stack direction="row" spacing={1} flexWrap="wrap">
+                    <Chip label={selectedLog.result} color={resultColor(selectedLog.result)} />
+                    <Chip label={selectedLog.direction} variant="outlined" />
+                    <Chip label={selectedLog.interactionType} variant="outlined" />
+                    {engine.requestedMode ? (
+                      <Chip
+                        label={getTaskEngineLabel(engine.requestedMode)}
+                        color={engine.requestedMode === "ai_driven" ? "warning" : "default"}
+                        variant={engine.requestedMode === "ai_driven" ? "filled" : "outlined"}
+                      />
+                    ) : null}
+                  </Stack>
+                );
+              })()}
               <DetailField label="Timestamp" value={formatDateTime(selectedLog.createdAt)} />
               <DetailField label="Request" value={`${selectedLog.requestMethod} ${selectedLog.requestPath}`} />
               <DetailField label="Correlation ID" value={selectedLog.correlationId} />
@@ -2089,9 +2325,27 @@ export function RemoteVpsControlCenter() {
               />
               <DetailField label="Duration" value={formatDuration(selectedLog.durationMs)} />
               <DetailField label="Error" value={selectedLog.errorMessage || "-"} />
+              <DetailField
+                label="Engine mode"
+                value={getTaskEngineLabel(getInteractionEngineInfo(selectedLog).requestedMode)}
+              />
+              <DetailField
+                label="Engine resolver"
+                value={getInteractionEngineInfo(selectedLog).resolver || "-"}
+              />
+              <DetailField
+                label="Step resolution"
+                value={getTaskStepResolutionSummary(selectedLog.responsePayload) || "-"}
+              />
               <DetailField label="Task summary" value={getTaskResultSummary(selectedLog.responsePayload) || "-"} />
               <PayloadBlock title="Request payload" value={selectedLog.requestPayload} />
               <PayloadBlock title="Response payload" value={selectedLog.responsePayload} />
+              {formatTaskStepResolutionIndicators(selectedLog.responsePayload).length > 0 ? (
+                <StepResolutionBlock
+                  title="Step resolution indicators"
+                  items={formatTaskStepResolutionIndicators(selectedLog.responsePayload)}
+                />
+              ) : null}
               {getTaskLogText(selectedLog.responsePayload) ? (
                 <PayloadBlock title="Task log" value={getTaskLogText(selectedLog.responsePayload)} />
               ) : null}
@@ -2147,6 +2401,19 @@ export function RemoteVpsControlCenter() {
                     : "The selected script will be dispatched to the remote controller and tracked every 4 seconds."}
               </FormHelperText>
             </FormControl>
+
+            {selectedScript ? (
+              <Box>
+                <Typography variant="subtitle2" color="text.secondary">
+                  Engine mode
+                </Typography>
+                <Typography sx={{ mt: 0.5 }}>
+                  {selectedScript.engineMode === "ai_driven"
+                    ? "AI-driven requested. rc will tag the run as AI-driven and currently fall back to deterministic execution until the AI resolver is implemented."
+                    : "Deterministic execution."}
+                </Typography>
+              </Box>
+            ) : null}
 
             {selectedScript ? (
               <Box>
@@ -2249,6 +2516,62 @@ function PayloadBlock({ title, value }: { title: string; value: unknown }) {
           {serializedValue}
         </Typography>
       </Paper>
+    </Box>
+  );
+}
+
+function StepResolutionBlock({
+  title,
+  items,
+}: {
+  title: string;
+  items: Array<{
+    order: number;
+    kind: string;
+    resolver: string;
+    usedAi: boolean;
+    fallbackReason: string | null;
+    instruction: string;
+  }>;
+}) {
+  return (
+    <Box>
+      <Typography variant="subtitle2" color="text.secondary">
+        {title}
+      </Typography>
+      <Stack spacing={1} sx={{ mt: 0.5 }}>
+        {items.map((item) => (
+          <Paper
+            key={`${item.order}-${item.kind}-${item.resolver}`}
+            variant="outlined"
+            sx={{
+              p: 1.25,
+              borderRadius: "7px",
+              backgroundColor: "rgba(28, 25, 23, 0.02)",
+            }}
+          >
+            <Stack spacing={0.75}>
+              <Stack direction="row" spacing={0.75} alignItems="center" flexWrap="wrap">
+                <Chip size="small" label={`Step ${item.order}`} variant="outlined" />
+                <Chip size="small" label={item.kind} variant="outlined" />
+                <Chip
+                  size="small"
+                  label={resolutionChipLabel(item.resolver)}
+                  color={resolutionChipColor(item.resolver)}
+                  variant={item.resolver === "deterministic" ? "outlined" : "filled"}
+                />
+                {item.usedAi ? <Chip size="small" label="AI selected" color="warning" /> : null}
+                {item.fallbackReason ? (
+                  <Chip size="small" label={`reason: ${item.fallbackReason}`} color="info" variant="outlined" />
+                ) : null}
+              </Stack>
+              <Typography sx={{ fontSize: "0.92rem" }}>
+                {item.instruction || "No instruction text recorded."}
+              </Typography>
+            </Stack>
+          </Paper>
+        ))}
+      </Stack>
     </Box>
   );
 }
