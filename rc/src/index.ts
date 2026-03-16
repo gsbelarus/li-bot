@@ -1,3 +1,4 @@
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -12,6 +13,7 @@ import { TaskQueue } from "./task-queue.js";
 const currentFilePath = fileURLToPath(import.meta.url);
 const currentDirectory = dirname(currentFilePath);
 const projectRoot = resolve(currentDirectory, "..");
+const taskLogsDirectory = resolve(projectRoot, "logs");
 
 dotenv.config({ path: resolve(projectRoot, ".env") });
 dotenv.config({ path: resolve(projectRoot, ".env.local"), override: true });
@@ -22,6 +24,8 @@ const controllerVersion = process.env.npm_package_version || "0.1.0";
 const maxRetainedTasks = Number(process.env.REMOTE_CONTROLLER_MAX_RETAINED_TASKS || 200);
 const finishedTaskTtlMs = Number(process.env.REMOTE_CONTROLLER_FINISHED_TASK_TTL_MS || 6 * 60 * 60 * 1000);
 const taskCleanupIntervalMs = Number(process.env.REMOTE_CONTROLLER_TASK_CLEANUP_INTERVAL_MS || 5 * 60 * 1000);
+const resultLogChunkSize = Math.max(200, Number(process.env.REMOTE_CONTROLLER_RESULT_LOG_CHUNK_SIZE || 600));
+const resultLogMaxChars = Math.max(resultLogChunkSize, Number(process.env.REMOTE_CONTROLLER_RESULT_LOG_MAX_CHARS || 120_000));
 
 if (!remoteControllerSecretKey) {
   throw new Error("REMOTE_CONTROLLER_SECRET_KEY must be configured.");
@@ -70,6 +74,42 @@ function getProvidedSecret(request: Request) {
   }
 
   return "";
+}
+
+function buildTaskLogPayload(taskId: string) {
+  const logPath = resolve(taskLogsDirectory, `${taskId}.log`);
+
+  if (!existsSync(logPath)) {
+    return {
+      available: false,
+      path: `logs/${taskId}.log`,
+      chunkSize: resultLogChunkSize,
+      chunkCount: 0,
+      totalChars: 0,
+      truncated: false,
+      chunks: {},
+    };
+  }
+
+  const fullText = readFileSync(logPath, "utf8");
+  const truncated = fullText.length > resultLogMaxChars;
+  const text = truncated ? fullText.slice(0, resultLogMaxChars) : fullText;
+  const chunks: Record<string, string> = {};
+
+  for (let index = 0; index < text.length; index += resultLogChunkSize) {
+    const chunkNumber = Math.floor(index / resultLogChunkSize) + 1;
+    chunks[String(chunkNumber)] = text.slice(index, index + resultLogChunkSize);
+  }
+
+  return {
+    available: true,
+    path: `logs/${taskId}.log`,
+    chunkSize: resultLogChunkSize,
+    chunkCount: Object.keys(chunks).length,
+    totalChars: fullText.length,
+    truncated,
+    chunks,
+  };
 }
 
 const app = express();
@@ -198,6 +238,7 @@ app.get("/api/commands/:taskId/results", (request, response) => {
       status: task.status,
       error: task.failure ?? task.error,
       result: task.result,
+      taskLog: buildTaskLogPayload(task.id),
     });
     return;
   }
@@ -206,6 +247,7 @@ app.get("/api/commands/:taskId/results", (request, response) => {
     taskId: task.id,
     status: task.status,
     result: task.result,
+    taskLog: buildTaskLogPayload(task.id),
   });
 });
 

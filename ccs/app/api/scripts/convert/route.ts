@@ -320,7 +320,10 @@ function isMissingEndScriptIntent(text: string) {
 
 function isOrdinalPostIntent(text: string) {
   const normalized = normalizeText(text);
-  return inferOrdinalIndex(text) > 0 && /\bposts?\b/.test(normalized);
+  return (
+    /\b(first|second|third|fourth|fifth)\s+posts?\b/.test(normalized) ||
+    /\bposts?\s+number\s+(?:1|2|3|4|5|one|two|three|four|five)\b/.test(normalized)
+  );
 }
 
 function shouldScrollPostIntoView(text: string) {
@@ -336,6 +339,66 @@ function refersToPreviousPost(text: string) {
   const normalized = normalizeText(text);
 
   return /\bthat post\b|\bsame post\b|\bthat same post\b|\bthis post\b/.test(normalized);
+}
+
+function getPostControlTarget(text: string) {
+  const normalized = normalizeText(text);
+
+  if (/\bmore\b/.test(normalized)) {
+    return {
+      description: "More button on the post",
+      role: "button",
+      text: "More",
+      alternativeTexts: ["More actions", "More options"],
+    };
+  }
+
+  if (/\blike\b/.test(normalized)) {
+    return {
+      description: "Like button on the post",
+      role: "button",
+      text: "React Like",
+      alternativeTexts: ["Like"],
+    };
+  }
+
+  if (/\brepost\b/.test(normalized)) {
+    return {
+      description: "Repost button on the post",
+      role: "button",
+      text: "Repost",
+      alternativeTexts: [],
+    };
+  }
+
+  return null;
+}
+
+function hasIdempotentToggleIntent(text: string) {
+  const normalized = normalizeText(text);
+
+  return /if (?:it is |it's |it was )?not .+ yet|if not .+ yet|unless (?:it is |it's )?already .+|if (?:it is |it's )?unliked|if not already .+/.test(normalized);
+}
+
+function getToggleActiveStateTexts(step: ScriptStep, text: string) {
+  const normalizedInstruction = normalizeText(text);
+  const normalizedTargetText = normalizeText(step.target?.text);
+  const normalizedAlternatives = normalizeAlternativeTexts(step.target?.alternativeTexts).map((entry) => normalizeText(entry));
+  const combinedTargetTexts = [normalizedTargetText, ...normalizedAlternatives].filter(Boolean).join(" ");
+
+  if (/\blike\b/.test(normalizedInstruction) || /\breact like\b|\blike\b/.test(combinedTargetTexts)) {
+    return ["liked", "unlike", "remove like"];
+  }
+
+  if (/\brepost\b/.test(normalizedInstruction) || /\brepost\b/.test(combinedTargetTexts)) {
+    return ["reposted", "undo repost", "remove repost"];
+  }
+
+  if (/\bfollow\b/.test(normalizedInstruction) || /\bfollow\b/.test(combinedTargetTexts)) {
+    return ["following", "unfollow", "requested", "pending"];
+  }
+
+  return [];
 }
 
 function isLinkedInProfileActivityIntent(text: string) {
@@ -538,6 +601,22 @@ function copyOrdinalPostContext(step: ScriptStep, sourceStep: ScriptStep | null)
   if (typeof step.params.index !== "number") {
     step.params.index = sourceStep.params.index;
   }
+}
+
+function applyPostControlTarget(step: ScriptStep) {
+  const controlTarget = getPostControlTarget(step.instruction);
+
+  if (!controlTarget) {
+    return;
+  }
+
+  step.target = {
+    description: controlTarget.description,
+    selectors: [],
+    text: controlTarget.text,
+    role: controlTarget.role,
+    alternativeTexts: controlTarget.alternativeTexts,
+  };
 }
 
 function reorderGuardBranches(steps: ScriptStep[]) {
@@ -791,6 +870,19 @@ function repairStructuredInstructions(instructions: ScriptInstructions) {
       }
     }
 
+    if (
+      step.kind === "click" &&
+      normalizeText(step.target?.role) === "button" &&
+      hasIdempotentToggleIntent(instructionText)
+    ) {
+      const activeStateTexts = getToggleActiveStateTexts(step, instructionText);
+
+      if (activeStateTexts.length > 0) {
+        step.params.skipIfPressed = true;
+        step.params.activeStateTexts = activeStateTexts;
+      }
+    }
+
     if (step.kind === "wait_for_page") {
       if (!safeString(step.params.readyState)) {
         step.params.readyState = "complete";
@@ -935,6 +1027,10 @@ function repairStructuredInstructions(instructions: ScriptInstructions) {
 
     if (refersToPreviousPost(instructionText)) {
       copyOrdinalPostContext(step, previousStep);
+    }
+
+    if (isOrdinalPostIntent(instructionText) || refersToPreviousPost(instructionText)) {
+      applyPostControlTarget(step);
     }
 
     if (step.kind !== "scroll" && shouldScrollPostIntoView(instructionText)) {
@@ -1146,6 +1242,7 @@ export async function POST(request: NextRequest) {
             "If an instruction says to open the first profile card inside a named section, do not target the section heading itself. Target a clickable profile/link inside that section using containerText and index.",
             "When the operator refers to the first, second, third, or other ordinal post shown on the page, target role='article' with params.index set to that ordinal instead of using visible text.",
             "If the operator refers to 'that post', 'the same post', or similar wording immediately after an ordinal post step, inherit the previous post index for the new step.",
+            "When the operator refers to controls on a post, map them to the visible post-scoped control labels. Use button 'More' with alternatives such as 'More actions' or 'More options', and use button 'React Like' with alternative 'Like' for the like action.",
             "If the operator says to find, focus, locate, or bring an ordinal post into view, represent that as a scroll step targeting the indexed article so the runtime scrolls it into view exactly.",
             "For LinkedIn profile activity, preserve both direct visible controls such as 'Show all activity', 'See all activity', 'See all posts', or 'Show all posts' and section/title fallbacks such as 'All activity', 'Activity', or 'All Posts' when the operator wants to open the full posts/activity list.",
             "If the operator says to scroll slightly before looking for the full posts/activity view, emit a separate small downward scroll step before the guarded lookup or click step.",

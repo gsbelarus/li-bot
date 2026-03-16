@@ -320,6 +320,20 @@ function getOrdinalPostContextIndex(step: ScriptStep) {
     : 0;
 }
 
+function hasExplicitTargetIndex(step: ScriptStep) {
+  const explicitIndex = Number(step.params.index);
+
+  return Number.isFinite(explicitIndex) && explicitIndex > 0;
+}
+
+function shouldAutoScrollSearch(step: ScriptStep) {
+  const role = normalizeSearchText(step.target?.role);
+  const explicitIndex = Number(step.params.index);
+  const hasIndexedArticleTarget = role === "article" && Number.isFinite(explicitIndex) && explicitIndex > 1;
+
+  return hasIndexedArticleTarget;
+}
+
 function appendTaskLog(taskId: string | undefined, message: string) {
   if (!taskId || !isTaskLoggingEnabled) {
     return;
@@ -618,10 +632,6 @@ export class OpenClawRuntime {
   private buildSnapshotRefs(snapshot: BrowserSnapshot, lines: string[]) {
     const mergedRefs = { ...(snapshot.refs || {}) };
 
-    if (!snapshot.truncated) {
-      return mergedRefs;
-    }
-
     const refPattern = /\[ref=([^\]]+)\]/g;
 
     lines.forEach((line) => {
@@ -712,7 +722,10 @@ export class OpenClawRuntime {
         }
 
         if (targetTextPatterns.length > 0) {
-          const textScore = scoreAnyTextPattern(name, nearbyContext, targetTextPatterns);
+          const interactiveRole = role === "button" || role === "link";
+          const textScore = interactiveRole && name
+            ? scoreAnyTextPattern(name, name, targetTextPatterns)
+            : scoreAnyTextPattern(name, nearbyContext, targetTextPatterns);
 
           if (textScore === null) {
             return null;
@@ -790,11 +803,15 @@ export class OpenClawRuntime {
   private async resolveSnapshotRef(targetId: string, step: ScriptStep, context: ExecutionContext = {}) {
     const deadline = Date.now() + Math.max(250, step.timeoutMs);
     const desiredIndex = this.getCandidateIndex(step);
+    const hasExplicitIndex = hasExplicitTargetIndex(step);
+    let previousScrollY = Number.NaN;
 
     while (Date.now() <= deadline) {
       const snapshot = await this.getSnapshot(targetId, context);
       const matches = this.getSnapshotMatches(snapshot, step);
-      const resolved = matches[desiredIndex - 1] || matches[0] || null;
+      const resolved = hasExplicitIndex
+        ? matches[desiredIndex - 1] || null
+        : matches[desiredIndex - 1] || matches[0] || null;
 
       if (resolved) {
         return {
@@ -803,6 +820,29 @@ export class OpenClawRuntime {
           name: resolved.name,
           candidateCount: matches.length,
         } satisfies ResolvedSnapshotRef;
+      }
+
+      if (shouldAutoScrollSearch(step)) {
+        const pageState = await this.getPageState(targetId, context);
+        const currentScrollY = scalarNumber(pageState.scrollY, Number.NaN);
+        const nextScroll = await this.evaluate(
+          targetId,
+          `() => {
+            const viewportHeight = Math.max(window.innerHeight || 0, 1);
+            const delta = Math.max(500, Math.floor(viewportHeight * 0.85));
+            window.scrollBy({ top: delta, behavior: "auto" });
+            return { scrollY: window.scrollY, delta };
+          }`,
+          context
+        ) as { scrollY?: number; delta?: number };
+
+        const nextScrollY = scalarNumber(nextScroll?.scrollY, currentScrollY);
+
+        if (Number.isFinite(previousScrollY) && nextScrollY <= previousScrollY) {
+          break;
+        }
+
+        previousScrollY = nextScrollY;
       }
 
       await sleep(Math.min(500, Math.max(100, step.delayAfterMs || 250)));
@@ -1036,6 +1076,62 @@ export class OpenClawRuntime {
     };
   }
 
+  private async getElementPressedState(
+    targetId: string,
+    ref: string,
+    activeStateTexts: string[] = [],
+    context: ExecutionContext = {}
+  ) {
+    const activeStateTextsLiteral = JSON.stringify(activeStateTexts);
+    const result = await this.evaluateRef(
+      targetId,
+      ref,
+      `(el) => {
+        const activeStateTexts = ${activeStateTextsLiteral};
+        const ariaPressed = el?.getAttribute?.("aria-pressed");
+        const dataState = el?.getAttribute?.("data-state");
+        const title = typeof el?.getAttribute === "function" ? el.getAttribute("title") : null;
+        const ariaLabel = typeof el?.getAttribute === "function" ? el.getAttribute("aria-label") : null;
+        const textContent = (el?.innerText ?? el?.textContent ?? "").replace(/\s+/g, " ").trim();
+
+        const normalizedSignals = [ariaPressed, dataState, title, ariaLabel, textContent]
+          .filter((value) => typeof value === "string" && value.trim().length > 0)
+          .join(" ")
+          .toLowerCase();
+
+        const activeStateMatch = activeStateTexts.some((entry) => {
+          const normalizedEntry = String(entry ?? "").trim().toLowerCase();
+          return normalizedEntry.length > 0 && normalizedSignals.includes(normalizedEntry);
+        });
+
+        const pressed =
+          ariaPressed === "true" ||
+          dataState === "pressed" ||
+          activeStateMatch ||
+          /\bpressed\b|\bliked\b|\bunlike\b/.test(normalizedSignals);
+
+        return {
+          pressed,
+          ariaPressed: ariaPressed ?? null,
+          dataState: dataState ?? null,
+          title: title ?? null,
+          ariaLabel: ariaLabel ?? null,
+          textContent,
+        };
+      }`,
+      context
+    );
+
+    return (typeof result === "object" && result !== null ? result : { pressed: false }) as {
+      pressed?: boolean;
+      ariaPressed?: string | null;
+      dataState?: string | null;
+      title?: string | null;
+      ariaLabel?: string | null;
+      textContent?: string;
+    };
+  }
+
   private buildCustomFunctionSource(step: ScriptStep, usesRef: boolean) {
     const expression = scalarString(step.params.expression, "return null;").trim();
 
@@ -1109,6 +1205,29 @@ export class OpenClawRuntime {
 
     if (step.kind === "click") {
       const resolved = await this.resolveSnapshotRef(targetId, step, context);
+      const skipIfPressed = scalarBoolean(step.params.skipIfPressed, false);
+      const activeStateTexts = scalarStringArray(step.params.activeStateTexts);
+
+      if (skipIfPressed) {
+        const pressedState = await this.getElementPressedState(
+          targetId,
+          resolved.ref,
+          activeStateTexts,
+          context
+        );
+
+        if (pressedState.pressed) {
+          return {
+            ok: true,
+            action: step.kind,
+            matched: resolved,
+            skipped: true,
+            reason: "already_pressed",
+            state: pressedState,
+          };
+        }
+      }
+
       const args = ["click", resolved.ref, "--target-id", targetId];
       const button = scalarString(step.params.button);
 

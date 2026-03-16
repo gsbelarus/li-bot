@@ -105,6 +105,11 @@ interface ControllerTaskResultResponse {
   message?: string;
   result?: unknown;
   error?: unknown;
+  taskLog?: unknown;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 const SCRIPT_POLL_INTERVAL_MS = 4000;
@@ -153,6 +158,61 @@ function getControllerTaskErrorMessage(error: unknown) {
   }
 
   return "Remote controller reported a task failure.";
+}
+
+function getSkippedTaskOutputs(payload: unknown) {
+  if (!isPlainObject(payload) || !isPlainObject(payload.result) || !Array.isArray(payload.result.steps)) {
+    return [] as Array<Record<string, unknown>>;
+  }
+
+  return payload.result.steps
+    .map((step) => (isPlainObject(step) && isPlainObject(step.output) ? step.output : null))
+    .filter((output): output is Record<string, unknown> => Boolean(output && output.skipped === true));
+}
+
+function getTaskResultSummary(payload: unknown) {
+  if (!isPlainObject(payload) || !isPlainObject(payload.result)) {
+    return "";
+  }
+
+  const skippedOutputs = getSkippedTaskOutputs(payload);
+  const alreadyActiveSkips = skippedOutputs.filter((output) => output.reason === "already_pressed").length;
+  const endedEarly = payload.result.endedEarly === true;
+
+  if (alreadyActiveSkips > 0) {
+    return alreadyActiveSkips === 1
+      ? "1 toggle step was skipped because the target was already active."
+      : `${alreadyActiveSkips} toggle steps were skipped because the target was already active.`;
+  }
+
+  if (endedEarly) {
+    return "The script completed and ended early through branch logic.";
+  }
+
+  return "";
+}
+
+function getTaskCompletionSnackbarMessage(
+  payload: ControllerTaskResultResponse,
+  scriptName: string,
+  vpsName: string
+) {
+  const summary = getTaskResultSummary(payload);
+
+  return summary
+    ? `Script "${scriptName}" completed on ${vpsName}. ${summary}`
+    : `Script "${scriptName}" completed on ${vpsName}.`;
+}
+
+function getTaskLogText(payload: unknown) {
+  if (!isPlainObject(payload) || !isPlainObject(payload.taskLog) || !isPlainObject(payload.taskLog.chunks)) {
+    return "";
+  }
+
+  return Object.entries(payload.taskLog.chunks)
+    .sort((left, right) => Number(left[0]) - Number(right[0]))
+    .map(([, chunk]) => (typeof chunk === "string" ? chunk : ""))
+    .join("");
 }
 
 const operatorId = "operator@control-center";
@@ -1277,7 +1337,7 @@ export function RemoteVpsControlCenter() {
         }
 
         if (resultResponse.status === "completed") {
-          setSnackbar(`Script \"${options.scriptName}\" completed on ${options.vpsName}.`);
+          setSnackbar(getTaskCompletionSnackbarMessage(resultResponse, options.scriptName, options.vpsName));
         } else {
           const message = getControllerTaskErrorMessage(resultResponse.error);
           setSnackbar(`Script \"${options.scriptName}\" failed on ${options.vpsName}: ${message}`);
@@ -2029,8 +2089,12 @@ export function RemoteVpsControlCenter() {
               />
               <DetailField label="Duration" value={formatDuration(selectedLog.durationMs)} />
               <DetailField label="Error" value={selectedLog.errorMessage || "-"} />
+              <DetailField label="Task summary" value={getTaskResultSummary(selectedLog.responsePayload) || "-"} />
               <PayloadBlock title="Request payload" value={selectedLog.requestPayload} />
               <PayloadBlock title="Response payload" value={selectedLog.responsePayload} />
+              {getTaskLogText(selectedLog.responsePayload) ? (
+                <PayloadBlock title="Task log" value={getTaskLogText(selectedLog.responsePayload)} />
+              ) : null}
             </Stack>
           ) : null}
         </DialogContent>
@@ -2167,6 +2231,8 @@ function DetailField({ label, value }: { label: string; value: string }) {
 }
 
 function PayloadBlock({ title, value }: { title: string; value: unknown }) {
+  const serializedValue = typeof value === "string" ? value : JSON.stringify(value ?? null, null, 2);
+
   return (
     <Box>
       <Typography variant="subtitle2" color="text.secondary">
@@ -2180,7 +2246,7 @@ function PayloadBlock({ title, value }: { title: string; value: unknown }) {
           component="pre"
           sx={{ m: 0, overflowX: "auto", fontFamily: "var(--font-ibm-plex-mono), monospace" }}
         >
-          {JSON.stringify(value ?? null, null, 2)}
+          {serializedValue}
         </Typography>
       </Paper>
     </Box>
