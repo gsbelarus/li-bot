@@ -318,6 +318,26 @@ function isMissingEndScriptIntent(text: string) {
   );
 }
 
+function isOrdinalPostIntent(text: string) {
+  const normalized = normalizeText(text);
+  return inferOrdinalIndex(text) > 0 && /\bposts?\b/.test(normalized);
+}
+
+function shouldScrollPostIntoView(text: string) {
+  const normalized = normalizeText(text);
+
+  return (
+    isOrdinalPostIntent(text) &&
+    /(\bfind\b|\blocate\b|\bfocus\b|\bmove focus\b|\bbring(?: it)? into view\b|\bscroll to\b|\bshow\b)/.test(normalized)
+  );
+}
+
+function refersToPreviousPost(text: string) {
+  const normalized = normalizeText(text);
+
+  return /\bthat post\b|\bsame post\b|\bthat same post\b|\bthis post\b/.test(normalized);
+}
+
 function isLinkedInProfileActivityIntent(text: string) {
   const normalized = normalizeText(text);
   const inferredIndex = inferOrdinalIndex(text);
@@ -332,12 +352,43 @@ function isLinkedInProfileActivityIntent(text: string) {
   );
 }
 
+function shouldScrollSlightlyBeforeActivityLookup(text: string) {
+  const normalized = normalizeText(text);
+
+  return /\bscroll\b/.test(normalized) && /\bslight(?:ly)?\b|\ba bit\b|\blittle\b/.test(normalized);
+}
+
 function getLinkedInProfileActivityControlTexts(text: string) {
   if (!/linkedin|profile/.test(normalizeText(text))) {
     return [];
   }
 
-  return ["Show all activity", "See all activity", "See all posts"];
+  return ["Show all activity", "See all activity", "See all posts", "Show all posts"];
+}
+
+function getLinkedInProfileActivitySectionTexts(text: string) {
+  const normalized = normalizeText(text);
+
+  if (!/linkedin|profile/.test(normalized)) {
+    return [];
+  }
+
+  const includesSectionFallbacks = /\bsection\b|\bheading\b|\btab\b|\barea\b|\bnamed\b/.test(normalized);
+  const texts: string[] = [];
+
+  if (includesSectionFallbacks && /\ball activity\b/.test(normalized)) {
+    texts.push("All activity");
+  }
+
+  if (includesSectionFallbacks && /\bactivity\b/.test(normalized)) {
+    texts.push("Activity");
+  }
+
+  if (includesSectionFallbacks && /\ball posts\b/.test(normalized)) {
+    texts.push("All Posts");
+  }
+
+  return dedupeTexts(texts);
 }
 
 function hasResolvableTarget(step: ScriptStep | null | undefined) {
@@ -409,22 +460,84 @@ function findBranchSourceStep(steps: ScriptStep[], branchIndex: number) {
 }
 
 function applyLinkedInProfileActivityTarget(step: ScriptStep, contextText: string) {
-  const activityTexts = getLinkedInProfileActivityControlTexts(contextText);
+  const activityControlTexts = getLinkedInProfileActivityControlTexts(contextText);
+  const activitySectionTexts = getLinkedInProfileActivitySectionTexts(contextText);
+  const activityTexts = dedupeTexts([...activityControlTexts, ...activitySectionTexts]);
 
   if (activityTexts.length === 0) {
     return;
   }
 
+  const existingContainerTexts = dedupeTexts([
+    safeString(step.params.containerText),
+    ...normalizeAlternativeTexts(step.params.containerAlternativeTexts),
+  ]);
+  const mergedContainerTexts = dedupeTexts([...existingContainerTexts, ...activitySectionTexts]);
+
+  if (mergedContainerTexts.length > 0) {
+    step.params.containerText = mergedContainerTexts[0];
+    step.params.containerAlternativeTexts = mergedContainerTexts.slice(1);
+  }
+
   step.target = {
-    description: safeString(step.target?.description) || "control to open the full profile activity list",
+    description:
+      safeString(step.target?.description) ||
+      "control or section to open the full profile posts/activity list",
     selectors: [],
     text: activityTexts[0],
-    role: "link",
+    role: activitySectionTexts.length > 0 ? "" : "link",
     alternativeTexts: dedupeTexts([
       ...normalizeAlternativeTexts(step.target?.alternativeTexts),
       ...activityTexts.slice(1),
     ]),
   };
+}
+
+function buildLinkedInProfileActivityScrollStep(sourceStep: ScriptStep): ScriptStep {
+  return {
+    order: sourceStep.order,
+    kind: "scroll",
+    instruction: "Scroll the profile page slightly to reveal the posts/activity controls.",
+    delayAfterMs: 250,
+    timeoutMs: 5000,
+    target: createEmptyTarget(),
+    params: {
+      amount: 300,
+      direction: "down",
+      behavior: "smooth",
+    },
+  } satisfies ScriptStep;
+}
+
+function applyOrdinalPostTarget(step: ScriptStep) {
+  const inferredIndex = inferOrdinalIndex(step.instruction);
+
+  if (inferredIndex <= 0) {
+    return;
+  }
+
+  step.params.index = inferredIndex;
+  step.target = {
+    description: safeString(step.target?.description) || "post",
+    selectors: [],
+    text: "",
+    role: "article",
+    alternativeTexts: [],
+  };
+}
+
+function copyOrdinalPostContext(step: ScriptStep, sourceStep: ScriptStep | null) {
+  if (!sourceStep || typeof sourceStep.params.index !== "number" || sourceStep.params.index <= 0) {
+    return;
+  }
+
+  if (!isOrdinalPostIntent(sourceStep.instruction) && safeString(sourceStep.target?.role) !== "article") {
+    return;
+  }
+
+  if (typeof step.params.index !== "number") {
+    step.params.index = sourceStep.params.index;
+  }
 }
 
 function reorderGuardBranches(steps: ScriptStep[]) {
@@ -811,6 +924,34 @@ function repairStructuredInstructions(instructions: ScriptInstructions) {
     }
 
     if (
+      (step.kind === "assert_visible" ||
+        step.kind === "branch_if_missing" ||
+        step.kind === "scroll" ||
+        step.kind === "click") &&
+      isOrdinalPostIntent(instructionText)
+    ) {
+      applyOrdinalPostTarget(step);
+    }
+
+    if (refersToPreviousPost(instructionText)) {
+      copyOrdinalPostContext(step, previousStep);
+    }
+
+    if (step.kind !== "scroll" && shouldScrollPostIntoView(instructionText)) {
+      step.kind = "scroll";
+      step.delayAfterMs = 250;
+    }
+
+    if (
+      step.kind !== "scroll" &&
+      isLinkedInProfileActivityIntent(instructionText) &&
+      shouldScrollSlightlyBeforeActivityLookup(instructionText) &&
+      repairedSteps.at(-1)?.kind !== "scroll"
+    ) {
+      repairedSteps.push(buildLinkedInProfileActivityScrollStep(step));
+    }
+
+    if (
       step.target?.role === "link" &&
       safeString(step.params.containerText) &&
       (
@@ -1003,7 +1144,11 @@ export async function POST(request: NextRequest) {
             "Do not create click or assert_visible steps with only a generic role and no visible text unless you also provide index and enough container context to disambiguate the target.",
             "For known destination pages, do not rely on selectors or page links when the operator intent is clearly navigation.",
             "If an instruction says to open the first profile card inside a named section, do not target the section heading itself. Target a clickable profile/link inside that section using containerText and index.",
-            "For LinkedIn profile activity, prefer the visible control 'Show all activity' and preserve alternatives such as 'See all activity' or 'See all posts' when the operator wants to open the full posts/activity list.",
+            "When the operator refers to the first, second, third, or other ordinal post shown on the page, target role='article' with params.index set to that ordinal instead of using visible text.",
+            "If the operator refers to 'that post', 'the same post', or similar wording immediately after an ordinal post step, inherit the previous post index for the new step.",
+            "If the operator says to find, focus, locate, or bring an ordinal post into view, represent that as a scroll step targeting the indexed article so the runtime scrolls it into view exactly.",
+            "For LinkedIn profile activity, preserve both direct visible controls such as 'Show all activity', 'See all activity', 'See all posts', or 'Show all posts' and section/title fallbacks such as 'All activity', 'Activity', or 'All Posts' when the operator wants to open the full posts/activity list.",
+            "If the operator says to scroll slightly before looking for the full posts/activity view, emit a separate small downward scroll step before the guarded lookup or click step.",
             "For wait and wait_for_page steps, usually set delayAfterMs to 0.",
             "Use custom only when the requested behavior cannot be represented with the supported action kinds.",
             "Return explicit ordered steps that preserve the human intent.",

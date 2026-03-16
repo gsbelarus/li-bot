@@ -301,6 +301,25 @@ function inferInstructionIndex(instruction: string) {
   return 0;
 }
 
+function getOrdinalPostContextIndex(step: ScriptStep) {
+  const explicitIndex = Number(step.params.index);
+  const inferredIndex = Number.isFinite(explicitIndex) && explicitIndex > 0
+    ? Math.floor(explicitIndex)
+    : inferInstructionIndex(step.instruction);
+
+  if (inferredIndex <= 0) {
+    return 0;
+  }
+
+  const combined = normalizeSearchText(
+    [step.instruction, step.target?.description, step.target?.text, step.target?.role].filter(Boolean).join(" ")
+  );
+
+  return /\bpost\b/.test(combined) || normalizeSearchText(step.target?.role) === "article"
+    ? inferredIndex
+    : 0;
+}
+
 function appendTaskLog(taskId: string | undefined, message: string) {
   if (!taskId || !isTaskLoggingEnabled) {
     return;
@@ -650,6 +669,8 @@ export class OpenClawRuntime {
     const targetTextPatterns = normalizeTextPatterns(target.text, target.alternativeTexts);
     const description = normalizeSearchText(target.description);
     const profileCardStep = isProfileCardStep(step);
+    const ordinalPostContextIndex = getOrdinalPostContextIndex(step);
+    const postContextNeedle = ordinalPostContextIndex > 0 ? `feed post number ${ordinalPostContextIndex}` : "";
     const containerTextPatterns = normalizeTextPatterns(
       step.params.containerText,
       step.params.containerAlternativeTexts
@@ -670,6 +691,8 @@ export class OpenClawRuntime {
           lines.slice(Math.max(0, lineIndex - 40), Math.min(lines.length, lineIndex + 6)).join(" ")
         );
         const localContext = buildLineWindow(lines, lineIndex, 8, 18);
+        const hasAnyPostContext = /\bfeed post number \d+\b/.test(nearbyContext);
+        const hasDesiredPostContext = Boolean(postContextNeedle) && nearbyContext.includes(postContextNeedle);
         const hasListItemAncestor = hasNearbyLineMatch(lines, lineIndex, 8, 0, /\blistitem\b/);
         const hasProfileUrl = /\/url:\s+https:\/\/www\.linkedin\.com\/(?:in|creator)\//.test(localContext);
         const hasPersonCardSignals = /\binvite\b.*\bconnect\b|\bremove\b.*\bsuggestion\b/.test(localContext);
@@ -712,6 +735,14 @@ export class OpenClawRuntime {
 
         if (containerTextPatterns.length > 0) {
           score += 20;
+        }
+
+        if (postContextNeedle) {
+          if (hasDesiredPostContext) {
+            score += 180;
+          } else if (hasAnyPostContext) {
+            score -= 180;
+          }
         }
 
         if (profileCardStep) {
