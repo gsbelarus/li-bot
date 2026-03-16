@@ -18,6 +18,10 @@ const taskLogsDirectory = resolve(projectRoot, "logs");
 dotenv.config({ path: resolve(projectRoot, ".env") });
 dotenv.config({ path: resolve(projectRoot, ".env.local"), override: true });
 
+console.log(
+  `[rc] OPENAI_API_KEY=${process.env.OPENAI_API_KEY ? "set" : "not set"}; OPENAI_PROJECT_KEY=${process.env.OPENAI_PROJECT_KEY ? "set" : "not set"}`
+);
+
 const port = Number(process.env.PORT || 3100);
 const remoteControllerSecretKey = process.env.REMOTE_CONTROLLER_SECRET_KEY || "";
 const controllerVersion = process.env.npm_package_version || "0.1.0";

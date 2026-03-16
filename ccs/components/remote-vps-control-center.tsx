@@ -2409,7 +2409,7 @@ export function RemoteVpsControlCenter() {
                 </Typography>
                 <Typography sx={{ mt: 0.5 }}>
                   {selectedScript.engineMode === "ai_driven"
-                    ? "AI-driven requested. rc will tag the run as AI-driven and currently fall back to deterministic execution until the AI resolver is implemented."
+                    ? "AI-driven execution. rc uses AI to choose among bounded snapshot candidates, keeps browser actions deterministic, and falls back to deterministic matching only if AI selection is unavailable or unusable."
                     : "Deterministic execution."}
                 </Typography>
               </Box>

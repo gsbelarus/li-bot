@@ -188,9 +188,11 @@ function inferOrdinalIndex(text: string) {
   return 0;
 }
 
+const secondUnitPattern = String.raw`(?:seconds?|secs?|s)`;
+
 function extractSecondRange(text: string) {
   const normalized = normalizeText(text);
-  const rangeMatch = normalized.match(/(\d+)\s*(?:to|-|–)\s*(\d+)\s*seconds?/);
+  const rangeMatch = normalized.match(new RegExp(`(\\d+)\\s*(?:to|-|–)\\s*(\\d+)\\s*${secondUnitPattern}\\b`));
 
   if (rangeMatch) {
     const minSeconds = Number.parseInt(rangeMatch[1], 10);
@@ -204,7 +206,7 @@ function extractSecondRange(text: string) {
     }
   }
 
-  const singleMatch = normalized.match(/(\d+)\s*seconds?/);
+  const singleMatch = normalized.match(new RegExp(`(\\d+)\\s*${secondUnitPattern}\\b`));
 
   if (singleMatch) {
     const seconds = Number.parseInt(singleMatch[1], 10);

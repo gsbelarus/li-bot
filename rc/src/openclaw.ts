@@ -15,9 +15,18 @@ const currentFilePath = fileURLToPath(import.meta.url);
 const currentDirectory = dirname(currentFilePath);
 const projectRoot = resolve(currentDirectory, "..");
 const logsDirectory = resolve(projectRoot, "logs");
-const isTaskLoggingEnabled = !/^(?:0|false|off|no)$/i.test(process.env.OPENCLAW_TASK_LOGGING_ENABLED || "1");
-const openAiApiKey = process.env.OPENAI_API_KEY || "";
-const openAiProjectKey = process.env.OPENAI_PROJECT_KEY || "";
+
+function isTaskLoggingEnabled() {
+  return !/^(?:0|false|off|no)$/i.test(process.env.OPENCLAW_TASK_LOGGING_ENABLED || "1");
+}
+
+function getOpenAiApiKey() {
+  return process.env.OPENAI_API_KEY || "";
+}
+
+function getOpenAiProjectKey() {
+  return process.env.OPENAI_PROJECT_KEY || "";
+}
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -223,6 +232,33 @@ function isHeaderActionLink(name: string) {
   return /^(show all|manage all|see all|view all)\b/.test(normalizeSearchText(name));
 }
 
+function isPostActionMenuStep(step: ScriptStep) {
+  const role = normalizeSearchText(step.target?.role);
+  const combined = normalizeSearchText(
+    [step.instruction, step.target?.description, step.target?.text, ...scalarStringArray(step.target?.alternativeTexts)]
+      .filter(Boolean)
+      .join(" ")
+  );
+
+  return (
+    role === "button" &&
+    /\bpost\b/.test(combined) &&
+    /\bmore\b|more actions|more options|control menu/.test(combined)
+  );
+}
+
+function isExpandableContentControl(name: string, context: string) {
+  const combined = `${normalizeSearchText(name)} ${normalizeSearchText(context)}`;
+
+  return /\bsee more\b|\bshow more\b|\bload more\b|visually reveals content which is already detected by screen readers/.test(combined);
+}
+
+function isLikelyPostActionMenuControl(name: string, context: string) {
+  const combined = `${normalizeSearchText(name)} ${normalizeSearchText(context)}`;
+
+  return /open control menu for post|open control menu for .* post|\bmore actions\b|\bmore options\b/.test(combined);
+}
+
 function hasNearbyLineMatch(lines: string[], lineIndex: number, before: number, after: number, pattern: RegExp) {
   const start = Math.max(0, lineIndex - before);
   const end = Math.min(lines.length, lineIndex + after);
@@ -403,7 +439,7 @@ function shouldAutoScrollSearch(step: ScriptStep) {
 }
 
 function appendTaskLog(taskId: string | undefined, message: string) {
-  if (!taskId || !isTaskLoggingEnabled) {
+  if (!taskId || !isTaskLoggingEnabled()) {
     return;
   }
 
@@ -421,7 +457,7 @@ function appendTaskLog(taskId: string | undefined, message: string) {
 }
 
 function initializeTaskLog(taskId: string | undefined, payload: Record<string, unknown>) {
-  if (!taskId || !isTaskLoggingEnabled) {
+  if (!taskId || !isTaskLoggingEnabled()) {
     return;
   }
 
@@ -483,6 +519,8 @@ export class OpenClawRuntime {
       return this.openAiClient;
     }
 
+    const openAiApiKey = getOpenAiApiKey();
+
     if (!openAiApiKey) {
       this.openAiClient = null;
       return this.openAiClient;
@@ -490,7 +528,7 @@ export class OpenClawRuntime {
 
     this.openAiClient = new OpenAI({
       apiKey: openAiApiKey,
-      project: openAiProjectKey || undefined,
+      project: getOpenAiProjectKey() || undefined,
     });
 
     return this.openAiClient;
@@ -790,6 +828,7 @@ export class OpenClawRuntime {
     const targetTextPatterns = normalizeTextPatterns(target.text, target.alternativeTexts);
     const description = normalizeSearchText(target.description);
     const profileCardStep = isProfileCardStep(step);
+    const postActionMenuStep = isPostActionMenuStep(step);
     const ordinalPostContextIndex = getOrdinalPostContextIndex(step);
     const postContextNeedle = ordinalPostContextIndex > 0 ? `feed post number ${ordinalPostContextIndex}` : "";
     const containerTextPatterns = normalizeTextPatterns(
@@ -817,12 +856,18 @@ export class OpenClawRuntime {
         const hasListItemAncestor = hasNearbyLineMatch(lines, lineIndex, 8, 0, /\blistitem\b/);
         const hasProfileUrl = /\/url:\s+https:\/\/www\.linkedin\.com\/(?:in|creator)\//.test(localContext);
         const hasPersonCardSignals = /\binvite\b.*\bconnect\b|\bremove\b.*\bsuggestion\b/.test(localContext);
+        const expandableContentControl = isExpandableContentControl(name, localContext);
+        const likelyPostActionMenuControl = isLikelyPostActionMenuControl(name, localContext);
 
         if (containerTextPatterns.length > 0 && scoreAnyTextPattern(name, nearbyContext, containerTextPatterns) === null) {
           return null;
         }
 
         if (profileCardStep && isHeaderActionLink(name)) {
+          return null;
+        }
+
+        if (postActionMenuStep && expandableContentControl) {
           return null;
         }
 
@@ -887,6 +932,20 @@ export class OpenClawRuntime {
           }
         }
 
+        if (postActionMenuStep) {
+          if (likelyPostActionMenuControl) {
+            score += 220;
+          }
+
+          if (/open reactions menu/.test(`${name} ${localContext}`)) {
+            score -= 120;
+          }
+
+          if (name && /\bmore\b/.test(name) && !likelyPostActionMenuControl) {
+            score -= 40;
+          }
+        }
+
         return {
           ref,
           role,
@@ -922,6 +981,7 @@ export class OpenClawRuntime {
     const targetTextPatterns = normalizeTextPatterns(target.text, target.alternativeTexts);
     const description = normalizeSearchText(target.description);
     const profileCardStep = isProfileCardStep(step);
+    const postActionMenuStep = isPostActionMenuStep(step);
     const ordinalPostContextIndex = getOrdinalPostContextIndex(step);
     const postContextNeedle = ordinalPostContextIndex > 0 ? `feed post number ${ordinalPostContextIndex}` : "";
     const containerTextPatterns = normalizeTextPatterns(
@@ -949,6 +1009,13 @@ export class OpenClawRuntime {
         const lineIndex = refLines.get(ref) ?? Number.MAX_SAFE_INTEGER;
         const nearbyContext = buildLineWindow(lines, lineIndex, 10, 24);
         const sourceLine = scalarString(lines[lineIndex]).trim();
+        const expandableContentControl = isExpandableContentControl(name, nearbyContext);
+        const likelyPostActionMenuControl = isLikelyPostActionMenuControl(name, nearbyContext);
+
+        if (postActionMenuStep && expandableContentControl) {
+          return null;
+        }
+
         let score = 0;
 
         if (roleNeedle) {
@@ -989,6 +1056,16 @@ export class OpenClawRuntime {
 
         if (!normalizedName && !sourceLine) {
           score -= 25;
+        }
+
+        if (postActionMenuStep) {
+          if (likelyPostActionMenuControl) {
+            score += 160;
+          }
+
+          if (/open reactions menu/.test(`${normalizedName} ${nearbyContext}`)) {
+            score -= 120;
+          }
         }
 
         return {
@@ -1435,11 +1512,14 @@ export class OpenClawRuntime {
 
   private async performWaitStep(targetId: string, step: ScriptStep, context: ExecutionContext = {}) {
     const explicitDurationMs = scalarNumber(step.params.durationMs, Number.NaN);
+    const fallbackWaitMs = Number.isFinite(explicitDurationMs)
+      ? explicitDurationMs
+      : step.timeoutMs;
     const minDelayMs = scalarNumber(
       step.params.minDelayMs,
-      Number.isFinite(explicitDurationMs) ? explicitDurationMs : step.delayAfterMs
+      fallbackWaitMs
     );
-    const maxDelayMs = scalarNumber(step.params.maxDelayMs, minDelayMs);
+    const maxDelayMs = scalarNumber(step.params.maxDelayMs, fallbackWaitMs);
     const waitMs = Math.max(0, randomInteger(minDelayMs, maxDelayMs));
     const moveMouse = scalarBoolean(step.params.moveMouse, false);
     const moveCount = moveMouse
@@ -1630,6 +1710,56 @@ export class OpenClawRuntime {
     };
   }
 
+  private async verifyElementPressedStateAfterClick(
+    targetId: string,
+    ref: string,
+    activeStateTexts: string[] = [],
+    context: ExecutionContext = {}
+  ) {
+    const attempts = 3;
+
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (attempt > 0) {
+        await sleep(250);
+      }
+
+      try {
+        const state = await this.getElementPressedState(targetId, ref, activeStateTexts, context);
+
+        if (state.pressed) {
+          return {
+            verified: true,
+            state,
+            attempts: attempt + 1,
+          };
+        }
+
+        if (attempt === attempts - 1) {
+          return {
+            verified: false,
+            state,
+            attempts: attempt + 1,
+          };
+        }
+      } catch (error) {
+        if (attempt === attempts - 1) {
+          return {
+            verified: false,
+            state: null,
+            attempts: attempt + 1,
+            error: serializeUnknownError(error),
+          };
+        }
+      }
+    }
+
+    return {
+      verified: false,
+      state: null,
+      attempts,
+    };
+  }
+
   private buildCustomFunctionSource(step: ScriptStep, usesRef: boolean) {
     const expression = scalarString(step.params.expression, "return null;").trim();
 
@@ -1705,6 +1835,7 @@ export class OpenClawRuntime {
       const resolved = await this.resolveSnapshotRef(targetId, step, context);
       const skipIfPressed = scalarBoolean(step.params.skipIfPressed, false);
       const activeStateTexts = scalarStringArray(step.params.activeStateTexts);
+      const shouldVerifyPressedAfterClick = skipIfPressed || activeStateTexts.length > 0;
 
       if (skipIfPressed) {
         const pressedState = await this.getElementPressedState(
@@ -1738,6 +1869,23 @@ export class OpenClawRuntime {
       }
 
       await this.oc(args, context);
+
+      if (shouldVerifyPressedAfterClick) {
+        const verification = await this.verifyElementPressedStateAfterClick(
+          targetId,
+          resolved.ref,
+          activeStateTexts,
+          context
+        );
+
+        return {
+          ok: true,
+          action: step.kind,
+          matched: resolved,
+          verification,
+        };
+      }
+
       return { ok: true, action: step.kind, matched: resolved };
     }
 

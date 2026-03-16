@@ -8,6 +8,8 @@ import AddRoundedIcon from "@mui/icons-material/AddRounded";
 import ArrowBackRoundedIcon from "@mui/icons-material/ArrowBackRounded";
 import AutoAwesomeRoundedIcon from "@mui/icons-material/AutoAwesomeRounded";
 import DeleteOutlineRoundedIcon from "@mui/icons-material/DeleteOutlineRounded";
+import ExpandLessRoundedIcon from "@mui/icons-material/ExpandLessRounded";
+import ExpandMoreRoundedIcon from "@mui/icons-material/ExpandMoreRounded";
 import SaveRoundedIcon from "@mui/icons-material/SaveRounded";
 import SearchRoundedIcon from "@mui/icons-material/SearchRounded";
 import VisibilityRoundedIcon from "@mui/icons-material/VisibilityRounded";
@@ -77,7 +79,7 @@ const scriptEngineModeLabels: Record<ScriptEngineMode, string> = {
 
 const scriptEngineModeDescriptions: Record<ScriptEngineMode, string> = {
   deterministic: "Uses the current deterministic resolver and execution engine.",
-  ai_driven: "Requests the AI-driven engine path. rc currently records this mode and falls back to deterministic execution while the AI resolver scaffold is incomplete.",
+  ai_driven: "Uses AI-guided snapshot target selection in rc while keeping action execution deterministic. rc falls back to deterministic matching only when AI selection is unavailable or does not produce a usable target.",
 };
 
 interface ValidationResult {
@@ -178,6 +180,7 @@ function ScriptDetailScreen({
   );
   const [errors, setErrors] = useState<ScriptFormErrors>({});
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [isDetailsExpanded, setIsDetailsExpanded] = useState(true);
   const [markdownTab, setMarkdownTab] = useState<"source" | "preview">("source");
   const [isSaving, startSaving] = useTransition();
   const [isConverting, startConverting] = useTransition();
@@ -340,7 +343,27 @@ function ScriptDetailScreen({
                 Edit markdown, convert it to JSON, and manage status.
               </Typography>
             </Box>
-            <Stack direction="row" spacing={0.75} sx={{ flexShrink: 0, alignItems: "center" }}>
+            <Stack direction={{ xs: "column", md: "row" }} spacing={0.75} sx={{ flexShrink: 0, alignItems: { xs: "stretch", md: "center" } }}>
+              <FormControlLabel
+                sx={{ mr: 0.5 }}
+                control={
+                  <Switch
+                    checked={!values.isDisabled}
+                    onChange={(event) => updateField("isDisabled", !event.target.checked)}
+                  />
+                }
+                label={values.isDisabled ? "Script disabled" : "Script enabled"}
+              />
+              {hasExistingRecord ? (
+                <Button
+                  variant="text"
+                  color="error"
+                  startIcon={<DeleteOutlineRoundedIcon />}
+                  onClick={() => setDeleteOpen(true)}
+                >
+                  Delete script
+                </Button>
+              ) : null}
               <Button variant="outlined" startIcon={<ArrowBackRoundedIcon />} onClick={onBack}>
                 Back
               </Button>
@@ -381,57 +404,60 @@ function ScriptDetailScreen({
           <Card sx={{ flexShrink: 0 }}>
             <CardContent sx={{ p: 2 }}>
               <Stack spacing={1.25}>
-                <TextField
-                  label="Script name"
-                  value={values.name}
-                  onChange={(event) => updateField("name", event.target.value)}
-                  error={Boolean(errors.name)}
-                  helperText={errors.name}
-                  required
-                />
-                <TextField
-                  label="Description"
-                  value={values.description}
-                  onChange={(event) => updateField("description", event.target.value)}
-                  multiline
-                  minRows={2}
-                />
-                <FormControl fullWidth error={Boolean(errors.engineMode)}>
-                  <InputLabel id="script-engine-mode-label">Engine mode</InputLabel>
-                  <Select
-                    labelId="script-engine-mode-label"
-                    label="Engine mode"
-                    value={values.engineMode}
-                    onChange={(event) => updateField("engineMode", event.target.value as ScriptEngineMode)}
-                  >
-                    {scriptEngineModes.map((mode) => (
-                      <MenuItem key={mode} value={mode}>
-                        {scriptEngineModeLabels[mode]}
-                      </MenuItem>
-                    ))}
-                  </Select>
-                  <Typography variant="caption" color={errors.engineMode ? "error" : "text.secondary"} sx={{ mt: 0.75, px: 1.75 }}>
-                    {errors.engineMode || scriptEngineModeDescriptions[values.engineMode]}
+                <Stack direction="row" spacing={0.75} alignItems="center" justifyContent="space-between">
+                  <Typography variant="h6" sx={{ minWidth: 0 }}>
+                    {values.name.trim() || "Script details"}
                   </Typography>
-                </FormControl>
-                <FormControlLabel
-                  control={
-                    <Switch
-                      checked={!values.isDisabled}
-                      onChange={(event) => updateField("isDisabled", !event.target.checked)}
-                    />
-                  }
-                  label={values.isDisabled ? "Script disabled" : "Script enabled"}
-                />
-                {hasExistingRecord ? (
-                  <Button
-                    variant="text"
-                    color="error"
-                    startIcon={<DeleteOutlineRoundedIcon />}
-                    onClick={() => setDeleteOpen(true)}
+                  <IconButton
+                    aria-label={isDetailsExpanded ? "Collapse script details" : "Expand script details"}
+                    onClick={() => setIsDetailsExpanded((current) => !current)}
                   >
-                    Delete script
-                  </Button>
+                    {isDetailsExpanded ? <ExpandLessRoundedIcon /> : <ExpandMoreRoundedIcon />}
+                  </IconButton>
+                </Stack>
+
+                {!isDetailsExpanded ? (
+                  <Typography color="text.secondary">
+                    Edit script&apos;s name, description and engine mode...
+                  </Typography>
+                ) : null}
+
+                {isDetailsExpanded ? (
+                  <>
+                    <TextField
+                      label="Script name"
+                      value={values.name}
+                      onChange={(event) => updateField("name", event.target.value)}
+                      error={Boolean(errors.name)}
+                      helperText={errors.name}
+                      required
+                    />
+                    <TextField
+                      label="Description"
+                      value={values.description}
+                      onChange={(event) => updateField("description", event.target.value)}
+                      multiline
+                      minRows={2}
+                    />
+                    <FormControl fullWidth error={Boolean(errors.engineMode)}>
+                      <InputLabel id="script-engine-mode-label">Engine mode</InputLabel>
+                      <Select
+                        labelId="script-engine-mode-label"
+                        label="Engine mode"
+                        value={values.engineMode}
+                        onChange={(event) => updateField("engineMode", event.target.value as ScriptEngineMode)}
+                      >
+                        {scriptEngineModes.map((mode) => (
+                          <MenuItem key={mode} value={mode}>
+                            {scriptEngineModeLabels[mode]}
+                          </MenuItem>
+                        ))}
+                      </Select>
+                      <Typography variant="caption" color={errors.engineMode ? "error" : "text.secondary"} sx={{ mt: 0.75, px: 1.75 }}>
+                        {errors.engineMode || scriptEngineModeDescriptions[values.engineMode]}
+                      </Typography>
+                    </FormControl>
+                  </>
                 ) : null}
               </Stack>
             </CardContent>
