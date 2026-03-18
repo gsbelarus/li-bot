@@ -53,6 +53,7 @@ export async function POST(
         ? "ai_driven"
         : "deterministic",
     script: (body as { script?: unknown }).script,
+    taskResultWebhookUrlTemplate: `${request.nextUrl.origin}/api/vps/${id}/commands/{taskId}/results`,
     initiatedByUserId: getActorFromRequest(request),
   });
 

@@ -8,7 +8,7 @@ import dotenv from "dotenv";
 import { log, serializeError } from "./logger.js";
 import { OpenClawRuntime } from "./openclaw.js";
 import { validateExecuteScriptCommandPayload } from "./script-contract.js";
-import { TaskQueue } from "./task-queue.js";
+import { TaskQueue, type TaskRecord } from "./task-queue.js";
 
 const currentFilePath = fileURLToPath(import.meta.url);
 const currentDirectory = dirname(currentFilePath);
@@ -36,6 +36,74 @@ if (!remoteControllerSecretKey) {
 }
 
 const runtime = new OpenClawRuntime();
+
+function buildCompletedTaskResultPayload(task: TaskRecord) {
+  if (task.status === "failed") {
+    return {
+      taskId: task.id,
+      status: task.status,
+      error: task.failure ?? task.error,
+      result: task.result,
+      taskLog: buildTaskLogPayload(task.id),
+    };
+  }
+
+  return {
+    taskId: task.id,
+    status: task.status,
+    result: task.result,
+    taskLog: buildTaskLogPayload(task.id),
+  };
+}
+
+function resolveTaskResultWebhookUrl(task: TaskRecord) {
+  const template = task.input.callback?.taskResultWebhookUrlTemplate?.trim() || "";
+
+  if (!template) {
+    return "";
+  }
+
+  return template.replace("{taskId}", encodeURIComponent(task.id));
+}
+
+async function publishTaskResultToWebhook(task: TaskRecord) {
+  const webhookUrl = resolveTaskResultWebhookUrl(task);
+
+  if (!webhookUrl || (task.status !== "completed" && task.status !== "failed")) {
+    return;
+  }
+
+  const payload = buildCompletedTaskResultPayload(task);
+
+  try {
+    const response = await fetch(webhookUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-remote-controller-secret-key": remoteControllerSecretKey,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Webhook responded with HTTP ${response.status}.`);
+    }
+
+    log("info", "task.result_webhook.delivered", {
+      taskId: task.id,
+      status: task.status,
+      webhookUrl,
+    });
+  } catch (error) {
+    log("warn", "task.result_webhook.failed", {
+      taskId: task.id,
+      status: task.status,
+      webhookUrl,
+      error: serializeError(error),
+    });
+  }
+}
+
 const queue = new TaskQueue(async (task) => {
   return runtime.executeScript(task.input.script, {
     engineMode: task.input.engineMode,
@@ -46,6 +114,7 @@ const queue = new TaskQueue(async (task) => {
   maxRetainedTasks,
   finishedTaskTtlMs,
   cleanupIntervalMs: taskCleanupIntervalMs,
+  onTaskFinished: publishTaskResultToWebhook,
 });
 
 class RequestValidationError extends Error {
@@ -238,22 +307,11 @@ app.get("/api/commands/:taskId/results", (request, response) => {
   }
 
   if (task.status === "failed") {
-    response.status(200).json({
-      taskId: task.id,
-      status: task.status,
-      error: task.failure ?? task.error,
-      result: task.result,
-      taskLog: buildTaskLogPayload(task.id),
-    });
+    response.status(200).json(buildCompletedTaskResultPayload(task));
     return;
   }
 
-  response.json({
-    taskId: task.id,
-    status: task.status,
-    result: task.result,
-    taskLog: buildTaskLogPayload(task.id),
-  });
+  response.json(buildCompletedTaskResultPayload(task));
 });
 
 app.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => {

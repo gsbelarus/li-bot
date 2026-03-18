@@ -11,11 +11,13 @@ import {
   RemoteVpsInteractionLogTimestampWarning,
   RemoteVpsRecord,
   RemoteVpsTimestampWarning,
+  ScriptExecutionResult,
   VpsEnvironment,
   VpsProtocol,
   VpsStatus,
   logInteractionTypeOptions,
   logResultOptions,
+  scriptExecutionResultOptions,
   vpsEnvironmentOptions,
   vpsProtocolOptions,
 } from "@/lib/remote-vps-shared";
@@ -29,6 +31,11 @@ const sensitiveKeyPattern = /(password|secret|token|authorization|cookie|apiKey|
 
 const safeString = (value: unknown, fallback = "") =>
   typeof value === "string" ? value.trim() : fallback;
+
+function normalizeScriptExecutionResult(value: unknown): ScriptExecutionResult | null {
+  const normalized = safeString(value) as ScriptExecutionResult;
+  return scriptExecutionResultOptions.includes(normalized) ? normalized : null;
+}
 
 function maskSecret(secret: string) {
   if (!secret) {
@@ -269,6 +276,7 @@ export function serializeInteractionLog(
         : null,
     responsePayload: document.responsePayload ?? null,
     result: document.result as LogResult,
+    scriptExecutionResult: normalizeScriptExecutionResult(document.scriptExecutionResult),
     errorCode: safeString(document.errorCode),
     errorMessage: safeString(document.errorMessage),
     durationMs:
@@ -277,6 +285,7 @@ export function serializeInteractionLog(
     initiatedBy:
       document.initiatedBy as RemoteVpsInteractionLogRecord["initiatedBy"],
     initiatedByUserId: safeString(document.initiatedByUserId),
+    taskLogText: safeString(document.taskLogText),
     createdAt: createdAt.value,
     timestampWarnings: createdAt.warning
       ? [createdAt.warning as RemoteVpsInteractionLogTimestampWarning]
@@ -363,6 +372,273 @@ function getControllerTaskResultMessage(payload: unknown) {
   }
 
   return "Script result payload was not recognized.";
+}
+
+function getTaskLogText(payload: unknown) {
+  if (!isPlainObject(payload) || !isPlainObject(payload.taskLog) || !isPlainObject(payload.taskLog.chunks)) {
+    return "";
+  }
+
+  return Object.entries(payload.taskLog.chunks)
+    .sort((left, right) => Number(left[0]) - Number(right[0]))
+    .map(([, chunk]) => (typeof chunk === "string" ? chunk : ""))
+    .join("");
+}
+
+function getStructuredScriptStepCount(script: unknown) {
+  if (!isPlainObject(script)) {
+    return null;
+  }
+
+  return normalizeStructuredInstructions(script).steps.length;
+}
+
+function getExecutedStepCount(payload: unknown) {
+  if (!isPlainObject(payload) || !isPlainObject(payload.result) || !Array.isArray(payload.result.steps)) {
+    return null;
+  }
+
+  return payload.result.steps.length;
+}
+
+function evaluateScriptExecutionResult(options: {
+  initialScript: unknown;
+  resultPayload: unknown;
+  taskLogText: string;
+}): ScriptExecutionResult | null {
+  const { status, error } = getControllerTaskResultState(options.resultPayload);
+
+  if (status === "failed") {
+    return "ERROR";
+  }
+
+  if (status !== "completed") {
+    return null;
+  }
+
+  const taskLogText = options.taskLogText;
+  const hasLoggedTaskError = /\bTASK_ERROR\b/.test(taskLogText);
+
+  if (hasLoggedTaskError || Boolean(error)) {
+    return "ERROR";
+  }
+
+  const endedEarly = Boolean(
+    isPlainObject(options.resultPayload) &&
+    isPlainObject(options.resultPayload.result) &&
+    options.resultPayload.result.endedEarly === true
+  );
+
+  if (endedEarly || /\bTASK_BRANCH_END\b/.test(taskLogText)) {
+    return "NOT_COMPLETED";
+  }
+
+  const expectedStepCount = getStructuredScriptStepCount(options.initialScript);
+  const executedStepCount = getExecutedStepCount(options.resultPayload);
+
+  if (
+    typeof expectedStepCount === "number" &&
+    typeof executedStepCount === "number" &&
+    executedStepCount < expectedStepCount
+  ) {
+    return "NOT_COMPLETED";
+  }
+
+  return "COMPLETED";
+}
+
+interface ControllerTaskDispatchContext {
+  scriptId: string;
+  scriptName: string;
+  engineMode: ScriptEngineMode;
+  script: unknown;
+}
+
+async function findCommandDispatchContext(vpsId: string, taskId: string) {
+  const dispatchResponseLog = await RemoteVpsInteractionLogModel.findOne({
+    vpsId,
+    interactionType: "command_dispatch",
+    direction: "inbound_response",
+    "responsePayload.taskId": taskId,
+  })
+    .sort({ createdAt: -1 })
+    .lean();
+
+  if (!dispatchResponseLog?.correlationId) {
+    return null;
+  }
+
+  const dispatchRequestLog = await RemoteVpsInteractionLogModel.findOne({
+    vpsId,
+    interactionType: "command_dispatch",
+    direction: "outbound_request",
+    correlationId: dispatchResponseLog.correlationId,
+  })
+    .sort({ createdAt: -1 })
+    .lean();
+
+  if (!dispatchRequestLog || !isPlainObject(dispatchRequestLog.requestPayload)) {
+    return null;
+  }
+
+  const requestPayload = dispatchRequestLog.requestPayload;
+
+  return {
+    scriptId: safeString(requestPayload.scriptId),
+    scriptName: safeString(requestPayload.scriptName),
+    engineMode:
+      requestPayload.engineMode === "ai_driven" ? "ai_driven" : "deterministic",
+    script: requestPayload.script ?? null,
+  } satisfies ControllerTaskDispatchContext;
+}
+
+function buildScriptResultRequestPayload(
+  taskId: string,
+  dispatchContext: ControllerTaskDispatchContext | null
+) {
+  return {
+    taskId,
+    scriptId: dispatchContext?.scriptId ?? "",
+    scriptName: dispatchContext?.scriptName ?? "",
+    engineMode: dispatchContext?.engineMode ?? "deterministic",
+    script: dispatchContext?.script ?? null,
+  };
+}
+
+function buildScriptResultLogDocument(options: {
+  taskId: string;
+  dispatchContext: ControllerTaskDispatchContext | null;
+  responseStatusCode: number | null;
+  responsePayload: unknown;
+  durationMs: number | null;
+  initiatedByUserId: string;
+  taskLogText: string;
+}) {
+  return {
+    direction: "internal_event" as const,
+    interactionType: "script_result" as const,
+    requestMethod: "GET",
+    requestPath: `/api/commands/${encodeURIComponent(options.taskId)}/results`,
+    requestPayload: sanitizePayload(
+      buildScriptResultRequestPayload(options.taskId, options.dispatchContext)
+    ),
+    responseStatusCode: options.responseStatusCode,
+    responsePayload: sanitizePayload(options.responsePayload),
+    result: getControllerTaskResultLogResult(options.responsePayload),
+    scriptExecutionResult: evaluateScriptExecutionResult({
+      initialScript: options.dispatchContext?.script ?? null,
+      resultPayload: options.responsePayload,
+      taskLogText: options.taskLogText,
+    }),
+    durationMs: options.durationMs,
+    initiatedBy: "operator" as const,
+    initiatedByUserId: options.initiatedByUserId,
+    taskLogText: options.taskLogText,
+    errorCode:
+      getControllerTaskResultState(options.responsePayload).status === "failed"
+        ? "TASK_FAILED"
+        : "",
+    errorMessage: getControllerTaskResultMessage(options.responsePayload),
+  };
+}
+
+export async function persistControllerTaskResultLog(options: {
+  vpsId: string;
+  taskId: string;
+  responseStatusCode?: number | null;
+  responsePayload: unknown;
+  durationMs?: number | null;
+  initiatedByUserId: string;
+  taskLogText?: string;
+  logId?: string;
+  createdAt?: Date;
+}) {
+  const dispatchContext = await findCommandDispatchContext(options.vpsId, options.taskId);
+  const taskLogText = options.taskLogText ?? getTaskLogText(options.responsePayload);
+  const document = buildScriptResultLogDocument({
+    taskId: options.taskId,
+    dispatchContext,
+    responseStatusCode: options.responseStatusCode ?? null,
+    responsePayload: options.responsePayload,
+    durationMs: options.durationMs ?? null,
+    initiatedByUserId: options.initiatedByUserId,
+    taskLogText,
+  });
+
+  if (options.logId) {
+    await RemoteVpsInteractionLogModel.findOneAndUpdate(
+      { _id: options.logId, vpsId: options.vpsId },
+      { $set: document },
+      { returnDocument: "after" }
+    );
+    return;
+  }
+
+  await RemoteVpsInteractionLogModel.findOneAndUpdate(
+    {
+      vpsId: options.vpsId,
+      correlationId: options.taskId,
+      direction: "internal_event",
+      interactionType: "script_result",
+    },
+    {
+      $set: document,
+      $setOnInsert: {
+        vpsId: options.vpsId,
+        correlationId: options.taskId,
+        createdAt: options.createdAt ?? new Date(),
+      },
+    },
+    {
+      upsert: true,
+      returnDocument: "after",
+      setDefaultsOnInsert: true,
+    }
+  );
+}
+
+export async function backfillScriptResultLogsForVps(options: {
+  vpsId: string;
+  initiatedByUserId: string;
+}) {
+  const items = await RemoteVpsInteractionLogModel.find({
+    vpsId: options.vpsId,
+    interactionType: "script_result",
+  })
+    .sort({ createdAt: -1 })
+    .lean();
+
+  let updatedCount = 0;
+  let skippedCount = 0;
+
+  for (const item of items) {
+    const taskId = safeString(item.correlationId);
+
+    if (!taskId) {
+      skippedCount += 1;
+      continue;
+    }
+
+    await persistControllerTaskResultLog({
+      vpsId: options.vpsId,
+      taskId,
+      responseStatusCode:
+        typeof item.responseStatusCode === "number" ? item.responseStatusCode : null,
+      responsePayload: item.responsePayload ?? null,
+      durationMs: typeof item.durationMs === "number" ? item.durationMs : null,
+      initiatedByUserId: options.initiatedByUserId,
+      taskLogText: safeString(item.taskLogText) || getTaskLogText(item.responsePayload),
+      logId: String(item._id),
+    });
+
+    updatedCount += 1;
+  }
+
+  return {
+    scannedCount: items.length,
+    updatedCount,
+    skippedCount,
+  };
 }
 
 export interface VpsPayload {
@@ -496,6 +772,22 @@ export function getActorFromRequest(request: Request) {
   );
 }
 
+export function getProvidedControllerSecret(request: Request) {
+  const headerSecret = request.headers.get("x-remote-controller-secret-key")?.trim();
+
+  if (headerSecret) {
+    return headerSecret;
+  }
+
+  const authorization = request.headers.get("authorization")?.trim() || "";
+
+  if (authorization.toLowerCase().startsWith("bearer ")) {
+    return authorization.slice(7).trim();
+  }
+
+  return "";
+}
+
 export function getListQuery(searchParams: URLSearchParams) {
   const page = parsePositiveIntegerParam(searchParams.get("page"), 1);
   const pageSize = parsePositiveIntegerParam(searchParams.get("pageSize"), 10, {
@@ -550,6 +842,7 @@ export function getLogListQuery(searchParams: URLSearchParams) {
   });
   const result = safeString(searchParams.get("result"));
   const interactionType = safeString(searchParams.get("interactionType"));
+  const scriptExecutionResult = safeString(searchParams.get("scriptExecutionResult"));
   const startAt = safeString(searchParams.get("startAt"));
   const endAt = safeString(searchParams.get("endAt"));
 
@@ -561,6 +854,10 @@ export function getLogListQuery(searchParams: URLSearchParams) {
 
   if (logInteractionTypeOptions.includes(interactionType as LogInteractionType)) {
     filter.interactionType = interactionType;
+  }
+
+  if (scriptExecutionResultOptions.includes(scriptExecutionResult as ScriptExecutionResult)) {
+    filter.scriptExecutionResult = scriptExecutionResult;
   }
 
   const createdAtFilter: { $gte?: Date; $lte?: Date } = {};
@@ -602,12 +899,14 @@ export async function createInteractionLog(entry: {
   responseStatusCode?: number | null;
   responsePayload?: unknown;
   result: LogResult;
+  scriptExecutionResult?: ScriptExecutionResult | null;
   errorCode?: string;
   errorMessage?: string;
   durationMs?: number | null;
   attempt?: number;
   initiatedBy?: "system" | "operator" | "scheduler";
   initiatedByUserId?: string;
+  taskLogText?: string;
   createdAt?: Date;
 }) {
   await RemoteVpsInteractionLogModel.create({
@@ -617,12 +916,14 @@ export async function createInteractionLog(entry: {
     requestPayload: sanitizePayload(entry.requestPayload ?? null),
     responseStatusCode: entry.responseStatusCode ?? null,
     responsePayload: sanitizePayload(entry.responsePayload ?? null),
+    scriptExecutionResult: entry.scriptExecutionResult ?? null,
     errorCode: entry.errorCode ?? "",
     errorMessage: entry.errorMessage ?? "",
     durationMs: entry.durationMs ?? null,
     attempt: entry.attempt ?? 1,
     initiatedBy: entry.initiatedBy ?? "operator",
     initiatedByUserId: entry.initiatedByUserId ?? actorFallback,
+    taskLogText: entry.taskLogText ?? "",
     createdAt: entry.createdAt ?? new Date(),
   });
 }
@@ -941,6 +1242,7 @@ export async function dispatchExecuteScriptCommand(options: {
   scriptId?: string;
   scriptName?: string;
   engineMode?: ScriptEngineMode;
+  taskResultWebhookUrlTemplate?: string;
   initiatedByUserId: string;
 }) {
   const structuredInstructions = normalizeStructuredInstructions(options.script);
@@ -956,6 +1258,11 @@ export async function dispatchExecuteScriptCommand(options: {
       scriptName: safeString(options.scriptName),
       engineMode: options.engineMode ?? "deterministic",
       script: structuredInstructions,
+      callback: options.taskResultWebhookUrlTemplate
+        ? {
+          taskResultWebhookUrlTemplate: options.taskResultWebhookUrlTemplate,
+        }
+        : undefined,
     },
     initiatedByUserId: options.initiatedByUserId,
   });
@@ -988,24 +1295,13 @@ export async function fetchControllerTaskResults(options: {
     initiatedByUserId: options.initiatedByUserId,
   });
 
-  await createInteractionLog({
+  await persistControllerTaskResultLog({
     vpsId: options.vps.id,
-    correlationId: options.taskId,
-    direction: "internal_event",
-    interactionType: "script_result",
-    requestMethod: "GET",
-    requestPath: `/api/commands/${encodeURIComponent(options.taskId)}/results`,
+    taskId: options.taskId,
     responseStatusCode: response.responseStatusCode,
     responsePayload: response.responsePayload,
-    result: getControllerTaskResultLogResult(response.responsePayload),
     durationMs: response.durationMs,
-    initiatedBy: "operator",
     initiatedByUserId: options.initiatedByUserId,
-    errorCode:
-      getControllerTaskResultState(response.responsePayload).status === "failed"
-        ? "TASK_FAILED"
-        : "",
-    errorMessage: getControllerTaskResultMessage(response.responsePayload),
     createdAt: new Date(),
   });
 

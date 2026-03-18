@@ -40,6 +40,12 @@ export const logResultOptions = [
   "pending",
 ] as const;
 
+export const scriptExecutionResultOptions = [
+  "ERROR",
+  "NOT_COMPLETED",
+  "COMPLETED",
+] as const;
+
 export const initiatedByOptions = ["system", "operator", "scheduler"] as const;
 
 export type VpsStatus = (typeof vpsStatusOptions)[number];
@@ -48,6 +54,7 @@ export type VpsProtocol = (typeof vpsProtocolOptions)[number];
 export type LogDirection = (typeof logDirectionOptions)[number];
 export type LogInteractionType = (typeof logInteractionTypeOptions)[number];
 export type LogResult = (typeof logResultOptions)[number];
+export type ScriptExecutionResult = (typeof scriptExecutionResultOptions)[number];
 export type InitiatedBy = (typeof initiatedByOptions)[number];
 
 export type RemoteVpsTimestampWarning =
@@ -97,12 +104,14 @@ export interface RemoteVpsInteractionLogRecord {
   responseStatusCode: number | null;
   responsePayload: unknown;
   result: LogResult;
+  scriptExecutionResult: ScriptExecutionResult | null;
   errorCode: string;
   errorMessage: string;
   durationMs: number | null;
   attempt: number;
   initiatedBy: InitiatedBy;
   initiatedByUserId: string;
+  taskLogText: string;
   createdAt: string;
   timestampWarnings: RemoteVpsInteractionLogTimestampWarning[];
 }

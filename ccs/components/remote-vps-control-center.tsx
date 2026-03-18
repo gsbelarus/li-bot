@@ -59,6 +59,7 @@ import {
   VpsMutationResponse,
   logInteractionTypeOptions,
   logResultOptions,
+  scriptExecutionResultOptions,
   vpsEnvironmentOptions,
   vpsProtocolOptions,
   vpsStatusOptions,
@@ -483,6 +484,34 @@ function resultColor(result: RemoteVpsInteractionLogRecord["result"]) {
     default:
       return "default";
   }
+}
+
+function scriptExecutionResultColor(
+  result: RemoteVpsInteractionLogRecord["scriptExecutionResult"]
+) {
+  switch (result) {
+    case "COMPLETED":
+      return "success" as const;
+    case "NOT_COMPLETED":
+      return "warning" as const;
+    case "ERROR":
+      return "error" as const;
+    default:
+      return "default" as const;
+  }
+}
+
+function getRecentScriptRunSummary(logs: RemoteVpsInteractionLogRecord[]) {
+  const scriptResultLogs = logs.filter(
+    (log) => log.interactionType === "script_result" && Boolean(log.scriptExecutionResult)
+  );
+
+  return {
+    total: scriptResultLogs.length,
+    completed: scriptResultLogs.filter((log) => log.scriptExecutionResult === "COMPLETED").length,
+    notCompleted: scriptResultLogs.filter((log) => log.scriptExecutionResult === "NOT_COMPLETED").length,
+    error: scriptResultLogs.filter((log) => log.scriptExecutionResult === "ERROR").length,
+  };
 }
 
 async function requestJson<T>(input: string, init?: RequestInit): Promise<T> {
@@ -912,6 +941,7 @@ export function RemoteVpsControlCenter() {
     pageSize: 20,
   });
   const [logResultFilter, setLogResultFilter] = useState("");
+  const [logExecutionResultFilter, setLogExecutionResultFilter] = useState("");
   const [logTypeFilter, setLogTypeFilter] = useState("");
   const [logStartAt, setLogStartAt] = useState("");
   const [logEndAt, setLogEndAt] = useState("");
@@ -1006,6 +1036,20 @@ export function RemoteVpsControlCenter() {
         return nextModel;
       });
     }, 0);
+  }
+
+  function openLogsScreen(
+    vpsId: string,
+    options?: {
+      interactionType?: string;
+      scriptExecutionResult?: string;
+    }
+  ) {
+    setLogResultFilter("");
+    setLogTypeFilter(options?.interactionType ?? "");
+    setLogExecutionResultFilter(options?.scriptExecutionResult ?? "");
+    setLogsPaginationModel((current) => ({ ...current, page: 0 }));
+    startNavigation(() => setScreen({ kind: "logs", vpsId }));
   }
 
   function updateListSortModel(nextModel: GridSortModel) {
@@ -1218,7 +1262,7 @@ export function RemoteVpsControlCenter() {
     async function loadDetailLogs() {
       try {
         const response = await requestJson<VpsLogListResponse>(
-          `/api/vps/${vpsId}/logs?page=1&pageSize=6`
+          `/api/vps/${vpsId}/logs?page=1&pageSize=25`
         );
 
         if (!ignore) {
@@ -1255,6 +1299,7 @@ export function RemoteVpsControlCenter() {
           page: String(logsPaginationModel.page + 1),
           pageSize: String(logsPaginationModel.pageSize),
           result: logResultFilter,
+          scriptExecutionResult: logExecutionResultFilter,
           interactionType: logTypeFilter,
           startAt: logStartAt,
           endAt: logEndAt,
@@ -1284,6 +1329,7 @@ export function RemoteVpsControlCenter() {
     };
   }, [
     logEndAt,
+    logExecutionResultFilter,
     logResultFilter,
     logStartAt,
     logTypeFilter,
@@ -1387,7 +1433,7 @@ export function RemoteVpsControlCenter() {
             <Tooltip title="Logs">
               <IconButton
                 size="small"
-                onClick={() => startNavigation(() => setScreen({ kind: "logs", vpsId: row.id }))}
+                onClick={() => openLogsScreen(row.id)}
               >
                 <HistoryRoundedIcon fontSize="small" />
               </IconButton>
@@ -1440,6 +1486,22 @@ export function RemoteVpsControlCenter() {
         renderCell: ({ row }) => (
           <Chip label={row.result} color={resultColor(row.result)} size="small" />
         ),
+      },
+      {
+        field: "scriptExecutionResult",
+        headerName: "Execution",
+        minWidth: 150,
+        renderCell: ({ row }) =>
+          row.scriptExecutionResult ? (
+            <Chip
+              label={row.scriptExecutionResult}
+              color={scriptExecutionResultColor(row.scriptExecutionResult)}
+              size="small"
+              variant="outlined"
+            />
+          ) : (
+            <Typography color="text.secondary">-</Typography>
+          ),
       },
       {
         field: "engineMode",
@@ -1668,6 +1730,27 @@ export function RemoteVpsControlCenter() {
       setSelectedLog(response.item);
     } catch {
       setSelectedLog(log);
+    }
+  }
+
+  async function backfillScriptResultLogs(vps: RemoteVpsRecord) {
+    setActionVpsId(vps.id);
+
+    try {
+      const response = await requestJson<{ message: string; updatedCount: number }>(
+        `/api/vps/${vps.id}/logs/backfill-script-results`,
+        {
+          method: "POST",
+          body: JSON.stringify({}),
+        }
+      );
+
+      setSnackbar(response.message || `Backfilled script result logs for ${vps.name}.`);
+      setRefreshToken((value) => value + 1);
+    } catch {
+      setSnackbar(`Unable to backfill script result logs for ${vps.name}.`);
+    } finally {
+      setActionVpsId(null);
     }
   }
 
@@ -2078,7 +2161,7 @@ export function RemoteVpsControlCenter() {
                           <Button
                             variant="outlined"
                             startIcon={<HistoryRoundedIcon />}
-                            onClick={() => setScreen({ kind: "logs", vpsId: selectedVps.id })}
+                            onClick={() => openLogsScreen(selectedVps.id)}
                           >
                             Open logs
                           </Button>
@@ -2108,12 +2191,78 @@ export function RemoteVpsControlCenter() {
                         />
                       ) : (
                         <Stack spacing={0.75}>
-                          {detailLogs.map((log) => (
+                          {(() => {
+                            const summary = getRecentScriptRunSummary(detailLogs);
+
+                            return summary.total > 0 ? (
+                              <Paper variant="outlined" sx={{ p: 1.25, borderRadius: "7px" }}>
+                                <Stack spacing={1}>
+                                  <Box>
+                                    <Typography variant="subtitle2">Recent script runs</Typography>
+                                    <Typography color="text.secondary" variant="body2">
+                                      Latest {summary.total} script result{summary.total === 1 ? "" : "s"} in the recent interaction window.
+                                    </Typography>
+                                  </Box>
+                                  <Stack direction="row" spacing={0.75} flexWrap="wrap">
+                                    <Chip
+                                      label={`COMPLETED ${summary.completed}`}
+                                      color="success"
+                                      size="small"
+                                      variant="outlined"
+                                      clickable={summary.completed > 0}
+                                      onClick={
+                                        summary.completed > 0
+                                          ? () =>
+                                            openLogsScreen(selectedVps.id, {
+                                              interactionType: "script_result",
+                                              scriptExecutionResult: "COMPLETED",
+                                            })
+                                          : undefined
+                                      }
+                                    />
+                                    <Chip
+                                      label={`NOT_COMPLETED ${summary.notCompleted}`}
+                                      color="warning"
+                                      size="small"
+                                      variant="outlined"
+                                      clickable={summary.notCompleted > 0}
+                                      onClick={
+                                        summary.notCompleted > 0
+                                          ? () =>
+                                            openLogsScreen(selectedVps.id, {
+                                              interactionType: "script_result",
+                                              scriptExecutionResult: "NOT_COMPLETED",
+                                            })
+                                          : undefined
+                                      }
+                                    />
+                                    <Chip
+                                      label={`ERROR ${summary.error}`}
+                                      color="error"
+                                      size="small"
+                                      variant="outlined"
+                                      clickable={summary.error > 0}
+                                      onClick={
+                                        summary.error > 0
+                                          ? () =>
+                                            openLogsScreen(selectedVps.id, {
+                                              interactionType: "script_result",
+                                              scriptExecutionResult: "ERROR",
+                                            })
+                                          : undefined
+                                      }
+                                    />
+                                  </Stack>
+                                </Stack>
+                              </Paper>
+                            ) : null;
+                          })()}
+                          {detailLogs.slice(0, 6).map((log) => (
                             <Paper
                               key={log.id}
                               variant="outlined"
                               sx={{ p: 1.25, borderRadius: "7px", cursor: "pointer" }}
-                              onClick={() => setScreen({ kind: "logs", vpsId: selectedVps.id })}
+                              onClick={() => openLogsScreen(selectedVps.id)}
                             >
                               <Stack direction="row" justifyContent="space-between" spacing={2}>
                                 <Box>
@@ -2123,6 +2272,14 @@ export function RemoteVpsControlCenter() {
                                       color={resultColor(log.result)}
                                       size="small"
                                     />
+                                    {log.scriptExecutionResult ? (
+                                      <Chip
+                                        label={log.scriptExecutionResult}
+                                        color={scriptExecutionResultColor(log.scriptExecutionResult)}
+                                        size="small"
+                                        variant="outlined"
+                                      />
+                                    ) : null}
                                     <Typography variant="subtitle2">{log.interactionType}</Typography>
                                     <Typography color="text.secondary">{log.requestPath}</Typography>
                                   </Stack>
@@ -2176,6 +2333,25 @@ export function RemoteVpsControlCenter() {
                         </Select>
                       </FormControl>
                       <FormControl sx={{ minWidth: 220 }}>
+                        <InputLabel id="log-execution-filter-label">Execution result</InputLabel>
+                        <Select
+                          labelId="log-execution-filter-label"
+                          value={logExecutionResultFilter}
+                          label="Execution result"
+                          onChange={(event) => {
+                            setLogExecutionResultFilter(String(event.target.value));
+                            setLogsPaginationModel((current) => ({ ...current, page: 0 }));
+                          }}
+                        >
+                          <MenuItem value="">All execution results</MenuItem>
+                          {scriptExecutionResultOptions.map((option) => (
+                            <MenuItem key={option} value={option}>
+                              {option}
+                            </MenuItem>
+                          ))}
+                        </Select>
+                      </FormControl>
+                      <FormControl sx={{ minWidth: 220 }}>
                         <InputLabel id="log-type-filter-label">Interaction type</InputLabel>
                         <Select
                           labelId="log-type-filter-label"
@@ -2221,6 +2397,14 @@ export function RemoteVpsControlCenter() {
                 <Card sx={{ flex: 1, minHeight: 0 }}>
                   <CardContent sx={{ height: "100%", p: 1.25, display: "flex", flexDirection: "column", minHeight: 0 }}>
                     <Stack direction="row" justifyContent="flex-end" sx={{ mb: 1 }}>
+                      <Button
+                        variant="outlined"
+                        disabled={!selectedVps || actionVpsId === selectedVps?.id}
+                        onClick={() => selectedVps && void backfillScriptResultLogs(selectedVps)}
+                        sx={{ mr: 1 }}
+                      >
+                        Backfill Script Results
+                      </Button>
                       <Button
                         color="error"
                         variant="outlined"
@@ -2304,6 +2488,13 @@ export function RemoteVpsControlCenter() {
                 return (
                   <Stack direction="row" spacing={1} flexWrap="wrap">
                     <Chip label={selectedLog.result} color={resultColor(selectedLog.result)} />
+                    {selectedLog.scriptExecutionResult ? (
+                      <Chip
+                        label={selectedLog.scriptExecutionResult}
+                        color={scriptExecutionResultColor(selectedLog.scriptExecutionResult)}
+                        variant="outlined"
+                      />
+                    ) : null}
                     <Chip label={selectedLog.direction} variant="outlined" />
                     <Chip label={selectedLog.interactionType} variant="outlined" />
                     {engine.requestedMode ? (
@@ -2326,6 +2517,10 @@ export function RemoteVpsControlCenter() {
               <DetailField label="Duration" value={formatDuration(selectedLog.durationMs)} />
               <DetailField label="Error" value={selectedLog.errorMessage || "-"} />
               <DetailField
+                label="Execution result"
+                value={selectedLog.scriptExecutionResult || "-"}
+              />
+              <DetailField
                 label="Engine mode"
                 value={getTaskEngineLabel(getInteractionEngineInfo(selectedLog).requestedMode)}
               />
@@ -2346,8 +2541,11 @@ export function RemoteVpsControlCenter() {
                   items={formatTaskStepResolutionIndicators(selectedLog.responsePayload)}
                 />
               ) : null}
-              {getTaskLogText(selectedLog.responsePayload) ? (
-                <PayloadBlock title="Task log" value={getTaskLogText(selectedLog.responsePayload)} />
+              {selectedLog.taskLogText || getTaskLogText(selectedLog.responsePayload) ? (
+                <PayloadBlock
+                  title="Task log"
+                  value={selectedLog.taskLogText || getTaskLogText(selectedLog.responsePayload)}
+                />
               ) : null}
             </Stack>
           ) : null}

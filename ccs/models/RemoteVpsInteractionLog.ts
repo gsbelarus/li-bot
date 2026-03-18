@@ -5,6 +5,7 @@ import {
   logDirectionOptions,
   logInteractionTypeOptions,
   logResultOptions,
+  scriptExecutionResultOptions,
 } from "@/lib/remote-vps-shared";
 
 const remoteVpsInteractionLogSchema = new Schema(
@@ -57,6 +58,11 @@ const remoteVpsInteractionLogSchema = new Schema(
       enum: logResultOptions,
       required: true,
     },
+    scriptExecutionResult: {
+      type: String,
+      enum: scriptExecutionResultOptions,
+      default: null,
+    },
     errorCode: {
       type: String,
       default: "",
@@ -86,6 +92,10 @@ const remoteVpsInteractionLogSchema = new Schema(
       type: String,
       default: "",
       trim: true,
+    },
+    taskLogText: {
+      type: String,
+      default: "",
     },
     createdAt: {
       type: Date,

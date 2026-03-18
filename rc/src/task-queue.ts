@@ -30,6 +30,7 @@ interface TaskQueueOptions {
   maxRetainedTasks?: number;
   finishedTaskTtlMs?: number;
   cleanupIntervalMs?: number;
+  onTaskFinished?: (task: TaskRecord) => void | Promise<void>;
 }
 
 function parseIsoTime(value: string | null) {
@@ -87,6 +88,7 @@ export class TaskQueue {
   private readonly maxRetainedTasks: number;
   private readonly finishedTaskTtlMs: number;
   private readonly cleanupTimer: NodeJS.Timeout;
+  private readonly onTaskFinished?: (task: TaskRecord) => void | Promise<void>;
 
   constructor(
     private readonly worker: (task: TaskRecord) => Promise<unknown>,
@@ -94,6 +96,7 @@ export class TaskQueue {
   ) {
     this.maxRetainedTasks = Math.max(1, options.maxRetainedTasks ?? 200);
     this.finishedTaskTtlMs = Math.max(60_000, options.finishedTaskTtlMs ?? 6 * 60 * 60 * 1000);
+    this.onTaskFinished = options.onTaskFinished;
     const cleanupIntervalMs = Math.max(30_000, options.cleanupIntervalMs ?? 5 * 60 * 1000);
 
     this.cleanupTimer = setInterval(() => {
@@ -160,6 +163,10 @@ export class TaskQueue {
     } finally {
       task.finishedAt = new Date().toISOString();
       this.prune();
+
+      if (this.onTaskFinished) {
+        void Promise.resolve(this.onTaskFinished(task)).catch(() => undefined);
+      }
     }
   }
 

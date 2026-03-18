@@ -47,11 +47,16 @@ export const executionEngineModes = ["deterministic", "ai_driven"] as const;
 
 export type ExecutionEngineMode = (typeof executionEngineModes)[number];
 
+export interface ExecuteScriptCallbackConfig {
+  taskResultWebhookUrlTemplate: string;
+}
+
 export interface ExecuteScriptCommandPayload {
   command: "executeScript";
   script: ScriptInstructions;
   engineMode: ExecutionEngineMode;
   targetId?: string;
+  callback?: ExecuteScriptCallbackConfig;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -65,6 +70,22 @@ function safeString(value: unknown, fallback = "") {
 function normalizeExecutionEngineMode(value: unknown): ExecutionEngineMode {
   const mode = safeString(value, "deterministic") as ExecutionEngineMode;
   return executionEngineModes.includes(mode) ? mode : "deterministic";
+}
+
+function normalizeCallbackConfig(value: unknown): ExecuteScriptCallbackConfig | undefined {
+  if (!isPlainObject(value)) {
+    return undefined;
+  }
+
+  const taskResultWebhookUrlTemplate = safeString(value.taskResultWebhookUrlTemplate);
+
+  if (!taskResultWebhookUrlTemplate) {
+    return undefined;
+  }
+
+  return {
+    taskResultWebhookUrlTemplate,
+  };
 }
 
 function normalizeTarget(value: unknown): ScriptTarget | null {
@@ -157,5 +178,6 @@ export function validateExecuteScriptCommandPayload(
     script: normalizeStructuredInstructions(value.script),
     engineMode: normalizeExecutionEngineMode(value.engineMode),
     targetId: safeString(value.targetId) || undefined,
+    callback: normalizeCallbackConfig(value.callback),
   };
 }
