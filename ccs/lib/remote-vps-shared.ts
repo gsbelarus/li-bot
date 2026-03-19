@@ -134,3 +134,34 @@ export interface VpsMutationResponse {
   item: RemoteVpsRecord;
   message: string;
 }
+
+export interface SystemLogFilterOption {
+  value: string;
+  label: string;
+}
+
+export interface SystemLogRecord extends RemoteVpsInteractionLogRecord {
+  vpsName: string;
+  vpsAddress: string;
+  vpsLabel: string;
+  scriptName: string;
+  logMessage: string;
+}
+
+export interface SystemLogListResponse {
+  items: SystemLogRecord[];
+  totalCount: number;
+  page: number;
+  pageSize: number;
+  vpsOptions: SystemLogFilterOption[];
+  scriptOptions: string[];
+}
+
+export interface SystemLogQueryOptions {
+  vpsId: string;
+  scriptName: string;
+  startAt: string;
+  endAt: string;
+  scriptResultsOnly: boolean;
+  search: string;
+}

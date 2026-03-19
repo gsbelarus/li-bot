@@ -1829,6 +1829,7 @@ export function RemoteVpsControlCenter() {
         sections={[
           { href: "/", label: "Remote VPS", description: "Registry and diagnostics" },
           { href: "/scripts", label: "Scripts", description: "Authoring and conversion" },
+          { href: "/logs", label: "Logs", description: "System-wide retained logs" },
         ]}
         activeHref="/"
         footerTitle="Registry posture"
