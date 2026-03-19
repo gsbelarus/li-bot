@@ -2,6 +2,7 @@ export const vpsStatusOptions = [
   "online",
   "degraded",
   "offline",
+  "alert",
   "disabled",
   "unknown",
 ] as const;
@@ -41,9 +42,10 @@ export const logResultOptions = [
 ] as const;
 
 export const scriptExecutionResultOptions = [
-  "ERROR",
-  "NOT_COMPLETED",
   "COMPLETED",
+  "NOT_COMPLETED",
+  "ERROR",
+  "ALERT",
 ] as const;
 
 export const initiatedByOptions = ["system", "operator", "scheduler"] as const;

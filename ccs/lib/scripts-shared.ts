@@ -2,6 +2,7 @@ export const scriptActionKinds = [
   "navigate",
   "click",
   "branch_if_missing",
+  "branch_if_visible",
   "hover",
   "wait",
   "wait_for_page",

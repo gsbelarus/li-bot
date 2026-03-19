@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 
 import { connectToDatabase } from "@/lib/mongodb";
 import {
+  AlertLockedVpsError,
   dispatchExecuteScriptCommand,
   findVpsById,
   getActorFromRequest,
@@ -38,25 +39,33 @@ export async function POST(
     );
   }
 
-  const response = await dispatchExecuteScriptCommand({
-    vps: getControllerConnectionDetails(item),
-    scriptId:
-      typeof (body as { scriptId?: unknown }).scriptId === "string"
-        ? (body as { scriptId: string }).scriptId
-        : "",
-    scriptName:
-      typeof (body as { scriptName?: unknown }).scriptName === "string"
-        ? (body as { scriptName: string }).scriptName
-        : "",
-    engineMode:
-      (body as { engineMode?: unknown }).engineMode === "ai_driven"
-        ? "ai_driven"
-        : "deterministic",
-    script: (body as { script?: unknown }).script,
-    taskResultWebhookUrlTemplate: `${request.nextUrl.origin}/api/vps/${id}/commands/{taskId}/results`,
-    initiatedByUserId: getActorFromRequest(request),
-  });
+  try {
+    const response = await dispatchExecuteScriptCommand({
+      vps: getControllerConnectionDetails(item),
+      scriptId:
+        typeof (body as { scriptId?: unknown }).scriptId === "string"
+          ? (body as { scriptId: string }).scriptId
+          : "",
+      scriptName:
+        typeof (body as { scriptName?: unknown }).scriptName === "string"
+          ? (body as { scriptName: string }).scriptName
+          : "",
+      engineMode:
+        (body as { engineMode?: unknown }).engineMode === "ai_driven"
+          ? "ai_driven"
+          : "deterministic",
+      script: (body as { script?: unknown }).script,
+      taskResultWebhookUrlTemplate: `${request.nextUrl.origin}/api/vps/${id}/commands/{taskId}/results`,
+      initiatedByUserId: getActorFromRequest(request),
+    });
 
-  const status = response.responseStatusCode ?? (response.result === "timeout" ? 504 : 502);
-  return NextResponse.json(response.responsePayload ?? response, { status });
+    const status = response.responseStatusCode ?? (response.result === "timeout" ? 504 : 502);
+    return NextResponse.json(response.responsePayload ?? response, { status });
+  } catch (error) {
+    if (error instanceof AlertLockedVpsError) {
+      return NextResponse.json({ error: error.message }, { status: 409 });
+    }
+
+    throw error;
+  }
 }

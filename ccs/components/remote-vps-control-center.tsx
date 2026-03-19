@@ -354,9 +354,18 @@ function getTaskResultSummary(payload: unknown) {
   const skippedOutputs = getSkippedTaskOutputs(payload);
   const alreadyActiveSkips = skippedOutputs.filter((output) => output.reason === "already_pressed").length;
   const endedEarly = payload.result.endedEarly === true;
+  const alertReason =
+    isPlainObject(payload.result.alert) && typeof payload.result.alert.reason === "string"
+      ? payload.result.alert.reason.trim()
+      : "";
+  const alerted = payload.result.alerted === true;
   const engine = getTaskEngineInfo(payload);
   const stepResolutionSummary = getTaskStepResolutionSummary(payload);
   const parts: string[] = [];
+
+  if (alerted) {
+    parts.push(alertReason ? `Alert condition detected: ${alertReason}.` : "Alert condition detected.");
+  }
 
   if (engine.requestedMode) {
     let engineSummary = `Engine: ${getTaskEngineLabel(engine.requestedMode)}`;
@@ -400,6 +409,13 @@ function getTaskCompletionSnackbarMessage(
   vpsName: string
 ) {
   const summary = getTaskResultSummary(payload);
+  const alerted = isPlainObject(payload.result) && payload.result.alerted === true;
+
+  if (alerted) {
+    return summary
+      ? `Script "${scriptName}" stopped with ALERT on ${vpsName}. ${summary}`
+      : `Script "${scriptName}" stopped with ALERT on ${vpsName}.`;
+  }
 
   return summary
     ? `Script "${scriptName}" completed on ${vpsName}. ${summary}`
@@ -460,6 +476,7 @@ function statusColor(status: RemoteVpsRecord["status"]) {
       return "success";
     case "degraded":
       return "warning";
+    case "alert":
     case "offline":
       return "error";
     case "disabled":
@@ -494,6 +511,7 @@ function scriptExecutionResultColor(
       return "success" as const;
     case "NOT_COMPLETED":
       return "warning" as const;
+    case "ALERT":
     case "ERROR":
       return "error" as const;
     default:
@@ -511,6 +529,7 @@ function getRecentScriptRunSummary(logs: RemoteVpsInteractionLogRecord[]) {
     completed: scriptResultLogs.filter((log) => log.scriptExecutionResult === "COMPLETED").length,
     notCompleted: scriptResultLogs.filter((log) => log.scriptExecutionResult === "NOT_COMPLETED").length,
     error: scriptResultLogs.filter((log) => log.scriptExecutionResult === "ERROR").length,
+    alert: scriptResultLogs.filter((log) => log.scriptExecutionResult === "ALERT").length,
   };
 }
 
@@ -1423,7 +1442,7 @@ export function RemoteVpsControlCenter() {
               <span>
                 <IconButton
                   size="small"
-                  disabled={actionVpsId === row.id || !row.isEnabled}
+                  disabled={actionVpsId === row.id || !row.isEnabled || row.status === "alert"}
                   onClick={() => openExecuteScriptDialog(row)}
                 >
                   <PlayArrowRoundedIcon fontSize="small" />
@@ -1694,10 +1713,31 @@ export function RemoteVpsControlCenter() {
         scriptName: selectedScript.name,
         vpsName: executeDialogVps.name,
       });
-    } catch {
-      setExecuteDialogError("Unable to execute the selected script.");
+    } catch (error) {
+      setExecuteDialogError(getControllerTaskErrorMessage(error));
     } finally {
       setIsExecutingScript(false);
+    }
+  }
+
+  async function clearAlertStatus(vpsId: string) {
+    setActionVpsId(vpsId);
+
+    try {
+      const response = await requestJson<{ item: RemoteVpsRecord; message?: string }>(
+        `/api/vps/${vpsId}/clear-alert`,
+        {
+          method: "POST",
+          body: JSON.stringify({}),
+        }
+      );
+
+      setSnackbar(response.message || "Alert status cleared.");
+      setRefreshToken((value) => value + 1);
+    } catch (error) {
+      setSnackbar(`Unable to clear alert status: ${getControllerTaskErrorMessage(error)}`);
+    } finally {
+      setActionVpsId((current) => (current === vpsId ? null : current));
     }
   }
 
@@ -2138,11 +2178,26 @@ export function RemoteVpsControlCenter() {
                           <Button
                             variant="outlined"
                             startIcon={<PlayArrowRoundedIcon />}
-                            disabled={actionVpsId === selectedVps.id || !selectedVps.isEnabled}
+                            disabled={
+                              actionVpsId === selectedVps.id ||
+                              !selectedVps.isEnabled ||
+                              selectedVps.status === "alert"
+                            }
                             onClick={() => openExecuteScriptDialog(selectedVps)}
                           >
                             Execute script
                           </Button>
+                          {selectedVps.status === "alert" ? (
+                            <Button
+                              variant="contained"
+                              color="error"
+                              startIcon={<SyncRoundedIcon />}
+                              disabled={actionVpsId === selectedVps.id}
+                              onClick={() => void clearAlertStatus(selectedVps.id)}
+                            >
+                              Clear alert
+                            </Button>
+                          ) : null}
                           <Button
                             variant="outlined"
                             startIcon={<LanRoundedIcon />}
@@ -2249,6 +2304,22 @@ export function RemoteVpsControlCenter() {
                                             openLogsScreen(selectedVps.id, {
                                               interactionType: "script_result",
                                               scriptExecutionResult: "ERROR",
+                                            })
+                                          : undefined
+                                      }
+                                    />
+                                    <Chip
+                                      label={`ALERT ${summary.alert}`}
+                                      color="error"
+                                      size="small"
+                                      variant="outlined"
+                                      clickable={summary.alert > 0}
+                                      onClick={
+                                        summary.alert > 0
+                                          ? () =>
+                                            openLogsScreen(selectedVps.id, {
+                                              interactionType: "script_result",
+                                              scriptExecutionResult: "ALERT",
                                             })
                                           : undefined
                                       }

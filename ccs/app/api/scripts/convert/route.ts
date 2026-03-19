@@ -320,6 +320,44 @@ function isMissingEndScriptIntent(text: string) {
   );
 }
 
+function isAlertOnVisibleIntent(text: string) {
+  const normalized = normalizeText(text);
+
+  return (
+    /(captcha|капч|verification|верификац|security check|challenge|verify you're human|verify you are human)/.test(
+      normalized
+    ) &&
+    /(if|when|whenever|upon|при появлении|если|когда)/.test(normalized) &&
+    /(alert|stop|halt|end|finish|exit|немедленно останов|остановить|прекратить)/.test(normalized)
+  );
+}
+
+function buildAlertVisibleTarget(existingTarget: ScriptStep["target"] | null | undefined) {
+  const existingTexts = dedupeTexts([
+    safeString(existingTarget?.text),
+    ...normalizeAlternativeTexts(existingTarget?.alternativeTexts),
+  ]);
+  const alertTexts = dedupeTexts([
+    ...existingTexts,
+    "CAPTCHA",
+    "Verification",
+    "Verification screen",
+    "Verify you're human",
+    "Verify you are human",
+    "Security check",
+    "Prove you're human",
+    "Just a moment...",
+  ]);
+
+  return {
+    description: "CAPTCHA or verification screen",
+    selectors: [],
+    text: alertTexts[0] || "CAPTCHA",
+    role: "",
+    alternativeTexts: alertTexts.slice(1),
+  } satisfies NonNullable<ScriptStep["target"]>;
+}
+
 function isOrdinalPostIntent(text: string) {
   const normalized = normalizeText(text);
   return (
@@ -627,7 +665,13 @@ function reorderGuardBranches(steps: ScriptStep[]) {
   for (let index = 0; index < reordered.length; index += 1) {
     const step = reordered[index];
 
-    if (step.kind !== "branch_if_missing" || safeString(step.params.onMissing) !== "end_script") {
+    const isMissingBranch =
+      step.kind === "branch_if_missing" && safeString(step.params.onMissing) === "end_script";
+    const isVisibleBranch =
+      step.kind === "branch_if_visible" &&
+      ["alert", "end_script"].includes(safeString(step.params.onVisible));
+
+    if (!isMissingBranch && !isVisibleBranch) {
       continue;
     }
 
@@ -802,6 +846,13 @@ function repairStructuredInstructions(instructions: ScriptInstructions) {
       step.kind = "branch_if_missing";
       step.delayAfterMs = 0;
       step.params.onMissing = safeString(step.params.onMissing) || "end_script";
+    }
+
+    if (isAlertOnVisibleIntent(instructionText)) {
+      step.kind = "branch_if_visible";
+      step.delayAfterMs = 0;
+      step.params.onVisible = safeString(step.params.onVisible) || "alert";
+      step.target = buildAlertVisibleTarget(step.target);
     }
 
     if (safeString(step.params.containerText)) {
@@ -1010,7 +1061,10 @@ function repairStructuredInstructions(instructions: ScriptInstructions) {
     }
 
     if (
-      (step.kind === "assert_visible" || step.kind === "click" || step.kind === "branch_if_missing") &&
+      (step.kind === "assert_visible" ||
+        step.kind === "click" ||
+        step.kind === "branch_if_missing" ||
+        step.kind === "branch_if_visible") &&
       isLinkedInProfileActivityIntent(instructionText)
     ) {
       const activityContext = [previousContextWindow, previousStepContext, instructionText].filter(Boolean).join(" ");
@@ -1019,6 +1073,7 @@ function repairStructuredInstructions(instructions: ScriptInstructions) {
 
     if (
       (step.kind === "assert_visible" ||
+        step.kind === "branch_if_visible" ||
         step.kind === "branch_if_missing" ||
         step.kind === "scroll" ||
         step.kind === "click") &&
@@ -1074,7 +1129,7 @@ function repairStructuredInstructions(instructions: ScriptInstructions) {
   });
 
   const branchedSteps = repairedSteps.map((step, index, steps) => {
-    if (step.kind !== "branch_if_missing") {
+    if (step.kind !== "branch_if_missing" && step.kind !== "branch_if_visible") {
       return step;
     }
 
@@ -1135,6 +1190,7 @@ const conversionTool = {
                   "navigate",
                   "click",
                   "branch_if_missing",
+                  "branch_if_visible",
                   "hover",
                   "wait",
                   "wait_for_page",
@@ -1220,7 +1276,7 @@ export async function POST(request: NextRequest) {
           content: [
             "You convert human browser instructions into structured JSON for an OpenClaw-based bot.",
             "OpenClaw should execute human-like browser actions from visible labels, roles, page URLs, and page state whenever possible.",
-            "Use only these action kinds: navigate, click, branch_if_missing, hover, wait, wait_for_page, move_mouse, scroll, type, press_key, extract_text, assert_visible, custom.",
+            "Use only these action kinds: navigate, click, branch_if_missing, branch_if_visible, hover, wait, wait_for_page, move_mouse, scroll, type, press_key, extract_text, assert_visible, custom.",
             "Prefer native-browser-friendly instructions that can be executed from an OpenClaw snapshot and element ref.",
             "Prefer intent-level actions over DOM-mechanical actions.",
             "If the human instruction says to go to a known destination page such as LinkedIn My Network, Feed, Jobs, Notifications, or Messaging, use navigate rather than click, and always set params.url.",
@@ -1228,6 +1284,7 @@ export async function POST(request: NextRequest) {
             "Use wait_for_page for page readiness checks and URL assertions. Put urlIncludes, urlEquals, readyState, and text into params when needed. If the instruction mentions a destination page, do not leave wait_for_page params empty.",
             "When a navigation step is followed by 'wait for the page to load' or similar wording, represent that as a wait_for_page step with readyState and URL conditions.",
             "When the operator says that if a visible control, post, or other target is missing the script should end, emit a separate branch_if_missing step with the same target you would otherwise click or assert, and set params.onMissing='end_script'.",
+            "When the operator says that if CAPTCHA, a verification screen, or another human-verification challenge appears the script must stop immediately, emit a separate branch_if_visible step and set params.onVisible='alert'.",
             "Use wait for dwell time on a page. For random dwell time, set params.minDelayMs and params.maxDelayMs. If the human prompt says to move the mouse around during the wait, set params.moveMouse=true.",
             "If the operator provides a numbered or line-by-line procedure, preserve one output step per operator instruction and do not merge neighboring steps.",
             "Preserve explicit conditional stop instructions such as 'If there is no third post, end the script' as their own branch step instead of merging them into the next action.",

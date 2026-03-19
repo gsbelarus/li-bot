@@ -130,7 +130,13 @@ function normalizeStep(value: unknown, index: number): ScriptStep {
   const source = isPlainObject(value) ? value : {};
   const kind = safeString(source.kind, "custom") as ScriptActionKind;
   const fallbackDelayAfterMs =
-    kind === "navigate" || kind === "wait" || kind === "wait_for_page" ? 0 : 1000;
+    kind === "navigate" ||
+      kind === "wait" ||
+      kind === "wait_for_page" ||
+      kind === "branch_if_missing" ||
+      kind === "branch_if_visible"
+      ? 0
+      : 1000;
   const params = isPlainObject(source.params)
     ? Object.entries(source.params).reduce<ScriptStep["params"]>((accumulator, [key, entry]) => {
       if (

@@ -90,6 +90,10 @@ function buildLogMessage(log: RemoteVpsInteractionLogRecord) {
     return "Script finished without achieving the goal.";
   }
 
+  if (log.scriptExecutionResult === "ALERT") {
+    return "The script stopped because an alert condition was detected and the VPS requires manual review.";
+  }
+
   if (log.scriptExecutionResult === "ERROR") {
     return "There was an error during script execution.";
   }

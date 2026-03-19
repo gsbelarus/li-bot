@@ -179,10 +179,18 @@ interface AiResolutionCandidate {
 
 interface BranchStepResult {
   ok: true;
-  action: "branch_if_missing";
-  branchAction: "end_script" | null;
+  action: "branch_if_missing" | "branch_if_visible";
+  branchAction: "end_script" | "alert" | null;
   conditionMet: boolean;
   matched?: ResolvedSnapshotRef;
+}
+
+interface AlertStopResult {
+  detected: true;
+  reason: string;
+  stepOrder: number;
+  stepKind: ScriptStep["kind"];
+  instruction: string;
 }
 
 class StepExecutionError extends Error {
@@ -2073,6 +2081,36 @@ export class OpenClawRuntime {
       }
     }
 
+    if (step.kind === "branch_if_visible") {
+      const onVisible = scalarString(step.params.onVisible, "alert");
+
+      try {
+        const resolved = await this.resolveSnapshotRef(targetId, step, context);
+
+        return {
+          ok: true,
+          action: step.kind,
+          branchAction:
+            onVisible === "alert" || onVisible === "end_script"
+              ? onVisible
+              : null,
+          conditionMet: true,
+          matched: resolved,
+        } satisfies BranchStepResult;
+      } catch (error) {
+        if (!(error instanceof SnapshotRefNotFoundError)) {
+          throw error;
+        }
+
+        return {
+          ok: true,
+          action: step.kind,
+          branchAction: null,
+          conditionMet: false,
+        } satisfies BranchStepResult;
+      }
+    }
+
     if (step.kind === "assert_visible") {
       const resolved = await this.resolveSnapshotRef(targetId, step, context);
       return { ok: true, action: step.kind, matched: resolved };
@@ -2167,6 +2205,7 @@ export class OpenClawRuntime {
     const startedAt = new Date().toISOString();
     const stepResults: StepExecutionRecord[] = [];
     let endedEarly = false;
+    let alert: AlertStopResult | null = null;
 
     for (const step of [...script.steps].sort((left, right) => left.order - right.order)) {
       try {
@@ -2183,6 +2222,30 @@ export class OpenClawRuntime {
             "branchAction" in stepResult.output
             ? scalarString((stepResult.output as { branchAction?: unknown }).branchAction)
             : "";
+
+        if (branchAction === "alert") {
+          alert = {
+            detected: true,
+            reason:
+              scalarString(step.target?.description).trim() ||
+              scalarString(step.target?.text).trim() ||
+              "Alert condition detected.",
+            stepOrder: step.order,
+            stepKind: step.kind,
+            instruction: step.instruction,
+          };
+          appendTaskLog(taskId, `TASK_ALERT ${JSON.stringify({
+            taskId: taskId ?? null,
+            alertedAt: new Date().toISOString(),
+            step: {
+              order: step.order,
+              kind: step.kind,
+              instruction: step.instruction,
+            },
+            reason: alert.reason,
+          })}`);
+          break;
+        }
 
         if (branchAction === "end_script") {
           endedEarly = true;
@@ -2239,6 +2302,8 @@ export class OpenClawRuntime {
       startedAt,
       finishedAt: new Date().toISOString(),
       endedEarly,
+      alerted: Boolean(alert),
+      alert,
       currentPage: await this.getPageState(activeTargetId, { taskId, engineMode, engineStats }),
       steps: stepResults,
     };

@@ -126,6 +126,10 @@ function resultBadgeColor(log: SystemLogRecord) {
     return "warning" as const;
   }
 
+  if (log.scriptExecutionResult === "ALERT") {
+    return "error" as const;
+  }
+
   if (log.scriptExecutionResult === "ERROR") {
     return "error" as const;
   }

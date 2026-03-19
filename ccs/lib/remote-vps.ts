@@ -318,12 +318,22 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 function getControllerTaskResultState(payload: unknown) {
   if (!isPlainObject(payload)) {
-    return { status: "unknown", endedEarly: false, error: null as unknown };
+    return {
+      status: "unknown",
+      endedEarly: false,
+      alerted: false,
+      alert: null as Record<string, unknown> | null,
+      error: null as unknown,
+    };
   }
+
+  const resultPayload = isPlainObject(payload.result) ? payload.result : null;
 
   return {
     status: safeString(payload.status),
-    endedEarly: Boolean(isPlainObject(payload.result) && payload.result.endedEarly === true),
+    endedEarly: Boolean(resultPayload?.endedEarly === true),
+    alerted: Boolean(resultPayload?.alerted === true),
+    alert: isPlainObject(resultPayload?.alert) ? resultPayload.alert : null,
     error: payload.error ?? null,
   };
 }
@@ -347,7 +357,15 @@ function getControllerTaskResultLogResult(payload: unknown): LogResult {
 }
 
 function getControllerTaskResultMessage(payload: unknown) {
-  const { status, endedEarly, error } = getControllerTaskResultState(payload);
+  const { status, endedEarly, alerted, alert, error } = getControllerTaskResultState(payload);
+
+  if (status === "completed" && alerted) {
+    if (typeof alert?.reason === "string" && alert.reason) {
+      return `Alert condition detected: ${alert.reason}`;
+    }
+
+    return "Alert condition detected during script execution.";
+  }
 
   if (status === "completed") {
     return endedEarly
@@ -406,7 +424,7 @@ function evaluateScriptExecutionResult(options: {
   resultPayload: unknown;
   taskLogText: string;
 }): ScriptExecutionResult | null {
-  const { status, error } = getControllerTaskResultState(options.resultPayload);
+  const { status, error, alerted } = getControllerTaskResultState(options.resultPayload);
 
   if (status === "failed") {
     return "ERROR";
@@ -417,7 +435,12 @@ function evaluateScriptExecutionResult(options: {
   }
 
   const taskLogText = options.taskLogText;
+  const hasAlertLog = /\bTASK_ALERT\b/.test(taskLogText);
   const hasLoggedTaskError = /\bTASK_ERROR\b/.test(taskLogText);
+
+  if (alerted || hasAlertLog) {
+    return "ALERT";
+  }
 
   if (hasLoggedTaskError || Boolean(error)) {
     return "ERROR";
@@ -535,11 +558,32 @@ function buildScriptResultLogDocument(options: {
     initiatedByUserId: options.initiatedByUserId,
     taskLogText: options.taskLogText,
     errorCode:
-      getControllerTaskResultState(options.responsePayload).status === "failed"
-        ? "TASK_FAILED"
-        : "",
+      getControllerTaskResultState(options.responsePayload).alerted
+        ? "TASK_ALERT"
+        : getControllerTaskResultState(options.responsePayload).status === "failed"
+          ? "TASK_FAILED"
+          : "",
     errorMessage: getControllerTaskResultMessage(options.responsePayload),
   };
+}
+
+async function applyAlertStatusFromScriptResult(options: {
+  vpsId: string;
+  scriptExecutionResult: ScriptExecutionResult | null;
+  alertMessage: string;
+  updatedBy: string;
+}) {
+  if (options.scriptExecutionResult !== "ALERT") {
+    return;
+  }
+
+  await RemoteVpsModel.findByIdAndUpdate(options.vpsId, {
+    status: "alert",
+    statusReason:
+      options.alertMessage ||
+      "Script execution detected a CAPTCHA or verification screen. Manual review is required.",
+    updatedBy: options.updatedBy,
+  });
 }
 
 export async function persistControllerTaskResultLog(options: {
@@ -563,6 +607,13 @@ export async function persistControllerTaskResultLog(options: {
     durationMs: options.durationMs ?? null,
     initiatedByUserId: options.initiatedByUserId,
     taskLogText,
+  });
+
+  await applyAlertStatusFromScriptResult({
+    vpsId: options.vpsId,
+    scriptExecutionResult: document.scriptExecutionResult,
+    alertMessage: document.errorMessage,
+    updatedBy: options.initiatedByUserId,
   });
 
   if (options.logId) {
@@ -595,6 +646,28 @@ export async function persistControllerTaskResultLog(options: {
       setDefaultsOnInsert: true,
     }
   );
+}
+
+function buildStatusUpdate(options: {
+  currentStatus: VpsStatus;
+  currentReason: string;
+  preserveAlertStatus: boolean;
+  nextStatus: VpsStatus;
+  nextReason: string;
+}) {
+  if (options.preserveAlertStatus && options.currentStatus === "alert") {
+    return {
+      status: "alert" as const,
+      statusReason:
+        options.currentReason ||
+        "Script execution detected a CAPTCHA or verification screen. Manual review is required.",
+    };
+  }
+
+  return {
+    status: options.nextStatus,
+    statusReason: options.nextReason,
+  };
 }
 
 export async function backfillScriptResultLogsForVps(options: {
@@ -989,6 +1062,8 @@ export async function performControllerProbe(options: {
   interactionType: Extract<LogInteractionType, "health_check" | "manual_test">;
   requestPath: string;
   initiatedByUserId: string;
+  preserveAlertStatus?: boolean;
+  clearAlertMode?: boolean;
 }) {
   const correlationId = randomUUID();
   const startedAt = Date.now();
@@ -1022,6 +1097,26 @@ export async function performControllerProbe(options: {
     const controllerVersion = extractControllerVersion(responsePayload);
     const result: LogResult = response.ok ? "success" : "failed";
     const now = new Date();
+    const current = await RemoteVpsModel.findById(options.vps.id, { status: 1, statusReason: 1 }).lean();
+    const statusUpdate = buildStatusUpdate({
+      currentStatus: (current?.status as VpsStatus | undefined) ?? options.vps.status,
+      currentReason: safeString(current?.statusReason, options.vps.statusReason),
+      preserveAlertStatus: options.preserveAlertStatus !== false,
+      nextStatus: options.vps.isEnabled
+        ? response.ok
+          ? "online"
+          : options.clearAlertMode
+            ? "offline"
+            : "degraded"
+        : "disabled",
+      nextReason: options.vps.isEnabled
+        ? response.ok
+          ? `Last ${options.interactionType.replace("_", " ")} completed successfully.`
+          : options.clearAlertMode
+            ? "Manual alert clear failed because the remote controller is not healthy."
+            : `Remote controller returned HTTP ${response.status}.`
+        : "Record disabled by operator.",
+    });
 
     await createInteractionLog({
       vpsId: options.vps.id,
@@ -1043,16 +1138,7 @@ export async function performControllerProbe(options: {
     });
 
     await RemoteVpsModel.findByIdAndUpdate(options.vps.id, {
-      status: options.vps.isEnabled
-        ? response.ok
-          ? "online"
-          : "degraded"
-        : "disabled",
-      statusReason: options.vps.isEnabled
-        ? response.ok
-          ? `Last ${options.interactionType.replace("_", " ")} completed successfully.`
-          : `Remote controller returned HTTP ${response.status}.`
-        : "Record disabled by operator.",
+      ...statusUpdate,
       lastSeenAt: response.ok ? now : options.vps.lastSeenAt,
       lastHealthCheckAt: now,
       lastHealthCheckResult: response.ok ? "success" : "failed",
@@ -1072,6 +1158,20 @@ export async function performControllerProbe(options: {
     const now = new Date();
     const timeout = isTimeoutError(error);
     const errorMessage = error instanceof Error ? error.message : "Unknown probe failure";
+    const current = await RemoteVpsModel.findById(options.vps.id, { status: 1, statusReason: 1 }).lean();
+    const statusUpdate = buildStatusUpdate({
+      currentStatus: (current?.status as VpsStatus | undefined) ?? options.vps.status,
+      currentReason: safeString(current?.statusReason, options.vps.statusReason),
+      preserveAlertStatus: options.preserveAlertStatus !== false,
+      nextStatus: options.vps.isEnabled ? "offline" : "disabled",
+      nextReason: timeout
+        ? options.clearAlertMode
+          ? "Manual alert clear failed because the remote controller timed out."
+          : "Remote controller timed out during the latest probe."
+        : options.clearAlertMode
+          ? "Manual alert clear failed because the remote controller could not be reached."
+          : "Remote controller could not be reached.",
+    });
 
     await createInteractionLog({
       vpsId: options.vps.id,
@@ -1090,10 +1190,7 @@ export async function performControllerProbe(options: {
     });
 
     await RemoteVpsModel.findByIdAndUpdate(options.vps.id, {
-      status: options.vps.isEnabled ? "offline" : "disabled",
-      statusReason: timeout
-        ? "Remote controller timed out during the latest probe."
-        : "Remote controller could not be reached.",
+      ...statusUpdate,
       lastHealthCheckAt: now,
       lastHealthCheckResult: timeout ? "timeout" : "failed",
       updatedBy: options.initiatedByUserId,
@@ -1117,6 +1214,7 @@ async function performControllerRequest(options: {
   requestPath: string;
   requestPayload?: unknown;
   initiatedByUserId: string;
+  preserveAlertStatus?: boolean;
 }) {
   const correlationId = randomUUID();
   const startedAt = Date.now();
@@ -1157,6 +1255,18 @@ async function performControllerRequest(options: {
     const controllerVersion = extractControllerVersion(responsePayload);
     const result: LogResult = response.ok ? "success" : "failed";
     const now = new Date();
+    const current = await RemoteVpsModel.findById(options.vps.id, { status: 1, statusReason: 1 }).lean();
+    const statusUpdate = buildStatusUpdate({
+      currentStatus: (current?.status as VpsStatus | undefined) ?? options.vps.status,
+      currentReason: safeString(current?.statusReason, options.vps.statusReason),
+      preserveAlertStatus: options.preserveAlertStatus !== false,
+      nextStatus: options.vps.isEnabled ? (response.ok ? "online" : "degraded") : "disabled",
+      nextReason: options.vps.isEnabled
+        ? response.ok
+          ? `Last ${options.interactionType.replace("_", " ")} completed successfully.`
+          : `Remote controller returned HTTP ${response.status}.`
+        : "Record disabled by operator.",
+    });
 
     await createInteractionLog({
       vpsId: options.vps.id,
@@ -1176,12 +1286,7 @@ async function performControllerRequest(options: {
     });
 
     await RemoteVpsModel.findByIdAndUpdate(options.vps.id, {
-      status: options.vps.isEnabled ? (response.ok ? "online" : "degraded") : "disabled",
-      statusReason: options.vps.isEnabled
-        ? response.ok
-          ? `Last ${options.interactionType.replace("_", " ")} completed successfully.`
-          : `Remote controller returned HTTP ${response.status}.`
-        : "Record disabled by operator.",
+      ...statusUpdate,
       lastSeenAt: response.ok ? now : options.vps.lastSeenAt,
       controllerVersion: controllerVersion || options.vps.controllerVersion,
       updatedBy: options.initiatedByUserId,
@@ -1199,6 +1304,16 @@ async function performControllerRequest(options: {
     const now = new Date();
     const timeout = isTimeoutError(error);
     const errorMessage = error instanceof Error ? error.message : "Unknown controller request failure";
+    const current = await RemoteVpsModel.findById(options.vps.id, { status: 1, statusReason: 1 }).lean();
+    const statusUpdate = buildStatusUpdate({
+      currentStatus: (current?.status as VpsStatus | undefined) ?? options.vps.status,
+      currentReason: safeString(current?.statusReason, options.vps.statusReason),
+      preserveAlertStatus: options.preserveAlertStatus !== false,
+      nextStatus: options.vps.isEnabled ? "offline" : "disabled",
+      nextReason: timeout
+        ? "Remote controller timed out during the latest request."
+        : "Remote controller could not be reached.",
+    });
 
     await createInteractionLog({
       vpsId: options.vps.id,
@@ -1218,10 +1333,7 @@ async function performControllerRequest(options: {
     });
 
     await RemoteVpsModel.findByIdAndUpdate(options.vps.id, {
-      status: options.vps.isEnabled ? "offline" : "disabled",
-      statusReason: timeout
-        ? "Remote controller timed out during the latest request."
-        : "Remote controller could not be reached.",
+      ...statusUpdate,
       updatedBy: options.initiatedByUserId,
     });
 
@@ -1236,6 +1348,12 @@ async function performControllerRequest(options: {
   }
 }
 
+export class AlertLockedVpsError extends Error {
+  constructor(public readonly reason: string) {
+    super(reason);
+  }
+}
+
 export async function dispatchExecuteScriptCommand(options: {
   vps: ControllerConnectionDetails;
   script: unknown;
@@ -1245,6 +1363,13 @@ export async function dispatchExecuteScriptCommand(options: {
   taskResultWebhookUrlTemplate?: string;
   initiatedByUserId: string;
 }) {
+  if (options.vps.status === "alert") {
+    throw new AlertLockedVpsError(
+      options.vps.statusReason ||
+      "This VPS is in alert status. Clear the alert and verify controller health before running more scripts."
+    );
+  }
+
   const structuredInstructions = normalizeStructuredInstructions(options.script);
 
   return performControllerRequest({
@@ -1306,4 +1431,29 @@ export async function fetchControllerTaskResults(options: {
   });
 
   return response;
+}
+
+export async function clearVpsAlertStatus(options: {
+  vps: ControllerConnectionDetails;
+  initiatedByUserId: string;
+}) {
+  const response = await performControllerProbe({
+    vps: options.vps,
+    interactionType: "health_check",
+    requestPath: "/health",
+    initiatedByUserId: options.initiatedByUserId,
+    preserveAlertStatus: false,
+    clearAlertMode: true,
+  });
+
+  const refreshed = await findVpsById(options.vps.id);
+
+  return {
+    item: refreshed ? serializeVps(refreshed) : serializeVps(options.vps),
+    interaction: response,
+    message:
+      response.result === "success"
+        ? "Alert cleared. Controller is reachable and the VPS is back online."
+        : "Alert cleared, but the controller is offline.",
+  };
 }
