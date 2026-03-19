@@ -152,38 +152,52 @@ function getProvidedSecret(request: Request) {
 
 function buildTaskLogPayload(taskId: string) {
   const logPath = resolve(taskLogsDirectory, `${taskId}.log`);
-
-  if (!existsSync(logPath)) {
-    return {
-      available: false,
-      path: `logs/${taskId}.log`,
-      chunkSize: resultLogChunkSize,
-      chunkCount: 0,
-      totalChars: 0,
-      truncated: false,
-      chunks: {},
-    };
-  }
-
-  const fullText = readFileSync(logPath, "utf8");
-  const truncated = fullText.length > resultLogMaxChars;
-  const text = truncated ? fullText.slice(0, resultLogMaxChars) : fullText;
-  const chunks: Record<string, string> = {};
-
-  for (let index = 0; index < text.length; index += resultLogChunkSize) {
-    const chunkNumber = Math.floor(index / resultLogChunkSize) + 1;
-    chunks[String(chunkNumber)] = text.slice(index, index + resultLogChunkSize);
-  }
-
-  return {
-    available: true,
+  const unavailablePayload = {
+    available: false,
     path: `logs/${taskId}.log`,
     chunkSize: resultLogChunkSize,
-    chunkCount: Object.keys(chunks).length,
-    totalChars: fullText.length,
-    truncated,
-    chunks,
+    chunkCount: 0,
+    totalChars: 0,
+    truncated: false,
+    chunks: {},
   };
+
+  if (!existsSync(logPath)) {
+    return unavailablePayload;
+  }
+
+  try {
+    const fullText = readFileSync(logPath, "utf8");
+    const truncated = fullText.length > resultLogMaxChars;
+    const text = truncated ? fullText.slice(0, resultLogMaxChars) : fullText;
+    const chunks: Record<string, string> = {};
+
+    for (let index = 0; index < text.length; index += resultLogChunkSize) {
+      const chunkNumber = Math.floor(index / resultLogChunkSize) + 1;
+      chunks[String(chunkNumber)] = text.slice(index, index + resultLogChunkSize);
+    }
+
+    return {
+      available: true,
+      path: `logs/${taskId}.log`,
+      chunkSize: resultLogChunkSize,
+      chunkCount: Object.keys(chunks).length,
+      totalChars: fullText.length,
+      truncated,
+      chunks,
+    };
+  } catch (error) {
+    log("warn", "task.log.read_failed", {
+      taskId,
+      logPath,
+      error: serializeError(error),
+    });
+
+    return {
+      ...unavailablePayload,
+      error: "Task log could not be read.",
+    };
+  }
 }
 
 const app = express();
