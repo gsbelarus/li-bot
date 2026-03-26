@@ -264,6 +264,14 @@ export async function listAllSystemLogs(filter: Record<string, unknown>) {
   return items.map((item) => toSystemLogRecord(item as unknown as Record<string, unknown>, vpsById));
 }
 
+export async function deleteSystemLogs(filter: Record<string, unknown>) {
+  const result = await RemoteVpsInteractionLogModel.deleteMany(filter);
+
+  return {
+    deletedCount: result.deletedCount ?? 0,
+  };
+}
+
 export async function getSystemLogExportSize(filter: Record<string, unknown>) {
   const [result] = await RemoteVpsInteractionLogModel.aggregate<{
     count: number;

@@ -483,7 +483,7 @@ function initializeTaskLog(taskId: string | undefined, payload: Record<string, u
 }
 
 export class OpenClawRuntime {
-  private readonly browserProfile = process.env.OPENCLAW_BROWSER_PROFILE || "chrome";
+  private readonly browserProfile = (process.env.OPENCLAW_BROWSER_PROFILE || "").trim();
   private readonly gatewayUrl = process.env.OPENCLAW_GATEWAY_URL || "";
   private readonly gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN || "";
   private readonly openClawBin = process.env.OPENCLAW_BIN || "openclaw";
@@ -611,7 +611,11 @@ export class OpenClawRuntime {
     options: { json?: boolean } & ExecutionContext = {}
   ) {
     const { json = false, taskId } = options;
-    const fullArgs = ["browser", "--browser-profile", this.browserProfile];
+    const fullArgs = ["browser"];
+
+    if (this.browserProfile) {
+      fullArgs.push("--browser-profile", this.browserProfile);
+    }
 
     if (this.gatewayUrl) {
       fullArgs.push("--url", this.gatewayUrl);
@@ -621,11 +625,11 @@ export class OpenClawRuntime {
       fullArgs.push("--token", this.gatewayToken);
     }
 
-    fullArgs.push(...args);
-
     if (json) {
       fullArgs.push("--json");
     }
+
+    fullArgs.push(...args);
 
     const invocation = this.resolveOpenClawInvocation();
     const command = invocation.command;

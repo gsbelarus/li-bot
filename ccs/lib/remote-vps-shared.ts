@@ -163,6 +163,11 @@ export interface SystemLogListResponse {
   scriptOptions: string[];
 }
 
+export interface SystemLogBulkDeleteResponse {
+  deletedCount: number;
+  message: string;
+}
+
 export interface SystemLogQueryOptions {
   vpsId: string;
   scriptName: string;

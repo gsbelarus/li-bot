@@ -5,9 +5,13 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 
 import CodeMirror from "@uiw/react-codemirror";
 import ArrowBackRoundedIcon from "@mui/icons-material/ArrowBackRounded";
+import CheckRoundedIcon from "@mui/icons-material/CheckRounded";
 import CloseRoundedIcon from "@mui/icons-material/CloseRounded";
+import ContentCopyRoundedIcon from "@mui/icons-material/ContentCopyRounded";
+import DeleteOutlineRoundedIcon from "@mui/icons-material/DeleteOutlineRounded";
 import DownloadRoundedIcon from "@mui/icons-material/DownloadRounded";
 import HistoryRoundedIcon from "@mui/icons-material/HistoryRounded";
+import RefreshRoundedIcon from "@mui/icons-material/RefreshRounded";
 import SearchRoundedIcon from "@mui/icons-material/SearchRounded";
 import {
   Alert,
@@ -17,6 +21,10 @@ import {
   CardContent,
   Chip,
   CircularProgress,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
   FormControl,
   IconButton,
   InputAdornment,
@@ -24,6 +32,7 @@ import {
   MenuItem,
   Paper,
   Select,
+  Snackbar,
   Stack,
   Switch,
   TextField,
@@ -40,6 +49,7 @@ import { json } from "@codemirror/lang-json";
 import { ControlCenterSidebar } from "@/components/control-center-sidebar";
 import { controlCenterSections } from "@/lib/control-center-navigation";
 import {
+  SystemLogBulkDeleteResponse,
   SystemLogListResponse,
   SystemLogRecord,
 } from "@/lib/remote-vps-shared";
@@ -174,6 +184,22 @@ async function requestJson<T>(input: string, init?: RequestInit): Promise<T> {
   return payload as T;
 }
 
+function getApiErrorMessage(error: unknown, fallback: string) {
+  if (typeof error === "object" && error !== null) {
+    const candidate = error as { error?: unknown; details?: unknown };
+
+    if (typeof candidate.error === "string" && candidate.error.trim()) {
+      return candidate.error;
+    }
+
+    if (typeof candidate.details === "string" && candidate.details.trim()) {
+      return candidate.details;
+    }
+  }
+
+  return fallback;
+}
+
 export function SystemLogsControlCenter() {
   const router = useRouter();
   const pathname = usePathname();
@@ -204,6 +230,10 @@ export function SystemLogsControlCenter() {
   const [endAt, setEndAt] = useState(urlState.endAt);
   const [scriptResultsOnly, setScriptResultsOnly] = useState(urlState.scriptResultsOnly);
   const [exportingFormat, setExportingFormat] = useState<"json" | "csv" | null>(null);
+  const [clearLogsOpen, setClearLogsOpen] = useState(false);
+  const [clearingLogs, setClearingLogs] = useState(false);
+  const [snackbar, setSnackbar] = useState<string | null>(null);
+  const [refreshToken, setRefreshToken] = useState(0);
   const [isNavigating, startNavigation] = useTransition();
 
   const activeLogId = urlState.logId;
@@ -503,6 +533,38 @@ export function SystemLogsControlCenter() {
     }
   }
 
+  async function clearFilteredLogs() {
+    setClearingLogs(true);
+
+    try {
+      const params = buildQueryParams({ page: 1, pageSize: defaultPaginationModel.pageSize });
+      const response = await requestJson<SystemLogBulkDeleteResponse>(`/api/logs?${params.toString()}`, {
+        method: "DELETE",
+        body: JSON.stringify({}),
+      });
+
+      setClearLogsOpen(false);
+      setSelectedLog(null);
+      setListData((current) => ({
+        ...current,
+        items: [],
+        totalCount: 0,
+      }));
+      setPaginationModel((current) => ({ ...current, page: 0 }));
+      setRefreshToken((current) => current + 1);
+      navigateWithState({ page: 1, logId: null }, "replace");
+      setSnackbar(response.message);
+    } catch (error) {
+      setSnackbar(getApiErrorMessage(error, "Unable to clear log records."));
+    } finally {
+      setClearingLogs(false);
+    }
+  }
+
+  function refreshScreen() {
+    setRefreshToken((current) => current + 1);
+  }
+
   useEffect(() => {
     if (activeLogId) {
       return;
@@ -537,7 +599,7 @@ export function SystemLogsControlCenter() {
     return () => {
       ignore = true;
     };
-  }, [activeLogId, buildQueryParams]);
+  }, [activeLogId, buildQueryParams, refreshToken]);
 
   useEffect(() => {
     if (!activeLogId) {
@@ -575,7 +637,7 @@ export function SystemLogsControlCenter() {
     return () => {
       ignore = true;
     };
-  }, [activeLogId]);
+  }, [activeLogId, refreshToken]);
 
   const columns = useMemo<GridColDef<SystemLogRecord>[]>(
     () => [
@@ -685,15 +747,25 @@ export function SystemLogsControlCenter() {
             </Typography>
           </Box>
 
-          {screen.kind !== "list" ? (
+          <Stack direction="row" spacing={1} alignItems="center">
             <Button
               variant="outlined"
-              startIcon={<ArrowBackRoundedIcon />}
-              onClick={() => navigateWithState({ logId: null }, "replace")}
+              startIcon={<RefreshRoundedIcon />}
+              disabled={listLoading || detailLoading || isNavigating || clearingLogs}
+              onClick={refreshScreen}
             >
-              Back
+              Refresh
             </Button>
-          ) : null}
+            {screen.kind !== "list" ? (
+              <Button
+                variant="outlined"
+                startIcon={<ArrowBackRoundedIcon />}
+                onClick={() => navigateWithState({ logId: null }, "replace")}
+              >
+                Back
+              </Button>
+            ) : null}
+          </Stack>
         </Box>
 
         <Box sx={{ flex: 1, minHeight: 0, overflow: "auto", px: { xs: 1.25, md: 2.5 }, pb: 2.5 }}>
@@ -827,6 +899,15 @@ export function SystemLogsControlCenter() {
                     <Stack direction="row" spacing={1} alignItems="center" sx={{ minHeight: 56 }}>
                       <Button variant="text" disabled={!hasActiveListState} onClick={clearListFilters}>
                         Clear filters
+                      </Button>
+                      <Button
+                        color="error"
+                        variant="outlined"
+                        startIcon={<DeleteOutlineRoundedIcon />}
+                        disabled={listLoading || clearingLogs || listData.totalCount === 0}
+                        onClick={() => setClearLogsOpen(true)}
+                      >
+                        Clear logs
                       </Button>
                       <Button
                         variant="outlined"
@@ -992,6 +1073,39 @@ export function SystemLogsControlCenter() {
           )}
         </Box>
       </Box>
+
+      <Dialog open={clearLogsOpen} onClose={() => (!clearingLogs ? setClearLogsOpen(false) : undefined)} maxWidth="sm" fullWidth>
+        <DialogTitle>Clear log records</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={1}>
+            <Typography>
+              {listData.totalCount === 1
+                ? "Delete 1 log record that matches the current filter? This cannot be undone."
+                : `Delete ${listData.totalCount} log records that match the current filter? This cannot be undone.`}
+            </Typography>
+            <Typography color="text.secondary">
+              {activeFilterSummary.length
+                ? `Current filter: ${activeFilterSummary.map((item) => item.label).join(" | ")}`
+                : "Current filter: all retained logs."}
+            </Typography>
+          </Stack>
+        </DialogContent>
+        <DialogActions>
+          <Button disabled={clearingLogs} onClick={() => setClearLogsOpen(false)}>
+            Cancel
+          </Button>
+          <Button color="error" variant="contained" disabled={clearingLogs} onClick={() => void clearFilteredLogs()}>
+            {clearingLogs ? "Clearing..." : "Clear logs"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Snackbar
+        open={Boolean(snackbar)}
+        autoHideDuration={4000}
+        onClose={() => setSnackbar(null)}
+        message={snackbar}
+      />
     </Box>
   );
 }
@@ -1034,12 +1148,50 @@ function DetailField({ label, value }: { label: string; value: string }) {
 function StructuredDataBlock({ title, value }: { title: string; value: unknown }) {
   const isStructured = isStructuredValue(value);
   const serializedValue = typeof value === "string" ? value : JSON.stringify(value ?? null, null, 2);
+  const isCopyable = title === "Request payload" || title === "Response payload" || title === "Task log";
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!copied) {
+      return undefined;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setCopied(false);
+    }, 1500);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [copied]);
+
+  const handleCopy = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(serializedValue);
+      setCopied(true);
+    } catch {
+      setCopied(false);
+    }
+  }, [serializedValue]);
 
   return (
     <Box>
-      <Typography variant="subtitle2" color="text.secondary">
-        {title}
-      </Typography>
+      <Stack direction="row" alignItems="center" spacing={0.5}>
+        <Typography variant="subtitle2" color="text.secondary">
+          {title}
+        </Typography>
+        {isCopyable ? (
+          <IconButton
+            size="small"
+            onClick={handleCopy}
+            aria-label={`Copy ${title.toLowerCase()} to clipboard`}
+            title={copied ? "Copied" : `Copy ${title.toLowerCase()}`}
+            sx={{ color: copied ? "success.main" : "text.secondary" }}
+          >
+            {copied ? <CheckRoundedIcon fontSize="inherit" /> : <ContentCopyRoundedIcon fontSize="inherit" />}
+          </IconButton>
+        ) : null}
+      </Stack>
       <Paper
         variant="outlined"
         sx={{
