@@ -26,6 +26,9 @@ import { normalizeStructuredInstructions } from "@/lib/scripts";
 
 const actorFallback = "operator@control-center";
 const fallbackIsoTimestamp = new Date(0).toISOString();
+const DEFAULT_MOUSE_ACTIVITY_MIN_INTERVAL_MS = 9000;
+const DEFAULT_MOUSE_ACTIVITY_MAX_INTERVAL_MS = 22000;
+const DEFAULT_MOUSE_ACTIVITY_MAX_OFFSET_PX = 48;
 
 const sensitiveKeyPattern = /(password|secret|token|authorization|cookie|apiKey|accessKey|privateKey)/i;
 
@@ -103,6 +106,44 @@ function parseBooleanInput(
   }
 
   return { value: fallback, isValid: false };
+}
+
+function parseIntegerInput(
+  value: unknown,
+  fallback: number,
+  { min = 1, max }: { min?: number; max?: number } = {}
+): { value: number; isValid: boolean } {
+  if (value === undefined || value === null || value === "") {
+    return { value: fallback, isValid: true };
+  }
+
+  let parsed: number | null = null;
+
+  if (typeof value === "number" && Number.isFinite(value)) {
+    parsed = Math.floor(value);
+  } else if (typeof value === "string") {
+    const normalized = value.trim();
+
+    if (!normalized) {
+      return { value: fallback, isValid: true };
+    }
+
+    const candidate = Number.parseInt(normalized, 10);
+
+    if (Number.isFinite(candidate)) {
+      parsed = candidate;
+    }
+  }
+
+  if (parsed === null) {
+    return { value: fallback, isValid: false };
+  }
+
+  const normalized = Math.max(min, parsed);
+  return {
+    value: typeof max === "number" ? Math.min(max, normalized) : normalized,
+    isValid: true,
+  };
 }
 
 const toIsoResult = <TWarning extends string>(
@@ -184,14 +225,15 @@ export function sanitizePayload(value: unknown, depth = 0): unknown {
 }
 
 function hasToObject(
-  value: RemoteVpsDocument | Record<string, unknown>
+  value: RemoteVpsDocument | RemoteVpsRecord | Record<string, unknown>
 ): value is RemoteVpsDocument & { toObject(): Record<string, unknown> } {
   return typeof (value as { toObject?: unknown }).toObject === "function";
 }
 
-export function serializeVps(document: RemoteVpsDocument | Record<string, unknown>) {
+export function serializeVps(document: RemoteVpsDocument | RemoteVpsRecord | Record<string, unknown>) {
   const source = hasToObject(document) ? document.toObject() : document;
-  const controllerSecretKey = safeString(source.controllerSecretKey);
+  const sourceRecord = source as Record<string, unknown>;
+  const controllerSecretKey = safeString(sourceRecord.controllerSecretKey);
   const lastSeenAt = toNullableIsoResult("lastSeenAt", source.lastSeenAt as Date | string | null | undefined);
   const lastHealthCheckAt = toNullableIsoResult(
     "lastHealthCheckAt",
@@ -207,7 +249,7 @@ export function serializeVps(document: RemoteVpsDocument | Record<string, unknow
   ].filter((warning): warning is RemoteVpsTimestampWarning => Boolean(warning));
 
   return {
-    id: String(source._id),
+    id: safeString(sourceRecord._id) || safeString(sourceRecord.id),
     name: safeString(source.name),
     host: safeString(source.host),
     port: Number(source.port),
@@ -215,6 +257,28 @@ export function serializeVps(document: RemoteVpsDocument | Record<string, unknow
     environment: source.environment as VpsEnvironment,
     region: safeString(source.region),
     provider: safeString(source.provider),
+    defaultMouseActivityEnabled: Boolean(source.defaultMouseActivityEnabled),
+    defaultMouseActivityMinIntervalMs: parsePositiveIntegerParam(
+      typeof source.defaultMouseActivityMinIntervalMs === "number"
+        ? String(source.defaultMouseActivityMinIntervalMs)
+        : null,
+      DEFAULT_MOUSE_ACTIVITY_MIN_INTERVAL_MS,
+      { min: 250 }
+    ),
+    defaultMouseActivityMaxIntervalMs: parsePositiveIntegerParam(
+      typeof source.defaultMouseActivityMaxIntervalMs === "number"
+        ? String(source.defaultMouseActivityMaxIntervalMs)
+        : null,
+      DEFAULT_MOUSE_ACTIVITY_MAX_INTERVAL_MS,
+      { min: 250 }
+    ),
+    defaultMouseActivityMaxOffsetPx: parsePositiveIntegerParam(
+      typeof source.defaultMouseActivityMaxOffsetPx === "number"
+        ? String(source.defaultMouseActivityMaxOffsetPx)
+        : null,
+      DEFAULT_MOUSE_ACTIVITY_MAX_OFFSET_PX,
+      { min: 1 }
+    ),
     hasControllerSecret: Boolean(controllerSecretKey),
     controllerSecretKeyMasked: maskSecret(controllerSecretKey),
     controllerVersion: safeString(source.controllerVersion),
@@ -245,13 +309,14 @@ export interface ControllerConnectionDetails extends RemoteVpsRecord {
 }
 
 export function getControllerConnectionDetails(
-  document: RemoteVpsDocument | Record<string, unknown>
+  document: RemoteVpsDocument | RemoteVpsRecord | Record<string, unknown>
 ): ControllerConnectionDetails {
   const source = hasToObject(document) ? document.toObject() : document;
+  const sourceRecord = source as Record<string, unknown>;
 
   return {
     ...serializeVps(source),
-    controllerSecretKey: safeString(source.controllerSecretKey),
+    controllerSecretKey: safeString(sourceRecord.controllerSecretKey),
   };
 }
 
@@ -474,6 +539,12 @@ interface ControllerTaskDispatchContext {
   scriptId: string;
   scriptName: string;
   engineMode: ScriptEngineMode;
+  mouseActivityEnabled: boolean;
+  mouseActivityConfig: {
+    minIntervalMs: number | null;
+    maxIntervalMs: number | null;
+    maxOffsetPx: number | null;
+  };
   script: unknown;
 }
 
@@ -511,6 +582,27 @@ async function findCommandDispatchContext(vpsId: string, taskId: string) {
     scriptName: safeString(requestPayload.scriptName),
     engineMode:
       requestPayload.engineMode === "ai_driven" ? "ai_driven" : "deterministic",
+    mouseActivityEnabled: requestPayload.mouseActivityEnabled === true,
+    mouseActivityConfig: isPlainObject(requestPayload.mouseActivityConfig)
+      ? {
+        minIntervalMs:
+          typeof requestPayload.mouseActivityConfig.minIntervalMs === "number"
+            ? requestPayload.mouseActivityConfig.minIntervalMs
+            : null,
+        maxIntervalMs:
+          typeof requestPayload.mouseActivityConfig.maxIntervalMs === "number"
+            ? requestPayload.mouseActivityConfig.maxIntervalMs
+            : null,
+        maxOffsetPx:
+          typeof requestPayload.mouseActivityConfig.maxOffsetPx === "number"
+            ? requestPayload.mouseActivityConfig.maxOffsetPx
+            : null,
+      }
+      : {
+        minIntervalMs: null,
+        maxIntervalMs: null,
+        maxOffsetPx: null,
+      },
     script: requestPayload.script ?? null,
   } satisfies ControllerTaskDispatchContext;
 }
@@ -524,6 +616,12 @@ function buildScriptResultRequestPayload(
     scriptId: dispatchContext?.scriptId ?? "",
     scriptName: dispatchContext?.scriptName ?? "",
     engineMode: dispatchContext?.engineMode ?? "deterministic",
+    mouseActivityEnabled: dispatchContext?.mouseActivityEnabled ?? false,
+    mouseActivityConfig: dispatchContext?.mouseActivityConfig ?? {
+      minIntervalMs: null,
+      maxIntervalMs: null,
+      maxOffsetPx: null,
+    },
     script: dispatchContext?.script ?? null,
   };
 }
@@ -722,6 +820,10 @@ export interface VpsPayload {
   environment: VpsEnvironment;
   region: string;
   provider: string;
+  defaultMouseActivityEnabled: boolean;
+  defaultMouseActivityMinIntervalMs: number;
+  defaultMouseActivityMaxIntervalMs: number;
+  defaultMouseActivityMaxOffsetPx: number;
   controllerSecretKey: string;
   tags: string[];
   notes: string;
@@ -754,6 +856,22 @@ export function validateVpsPayload(input: unknown): VpsPayload {
   const environment = safeString(input.environment) as VpsEnvironment;
   const provider = safeString(input.provider);
   const region = safeString(input.region);
+  const defaultMouseActivityEnabled = parseBooleanInput(input.defaultMouseActivityEnabled, false);
+  const defaultMouseActivityMinIntervalMs = parseIntegerInput(
+    input.defaultMouseActivityMinIntervalMs,
+    DEFAULT_MOUSE_ACTIVITY_MIN_INTERVAL_MS,
+    { min: 250 }
+  );
+  const defaultMouseActivityMaxIntervalMs = parseIntegerInput(
+    input.defaultMouseActivityMaxIntervalMs,
+    DEFAULT_MOUSE_ACTIVITY_MAX_INTERVAL_MS,
+    { min: 250 }
+  );
+  const defaultMouseActivityMaxOffsetPx = parseIntegerInput(
+    input.defaultMouseActivityMaxOffsetPx,
+    DEFAULT_MOUSE_ACTIVITY_MAX_OFFSET_PX,
+    { min: 1 }
+  );
   const controllerSecretKey = safeString(input.controllerSecretKey);
   const notes = safeString(input.notes);
   const portNumber = Number(input.port);
@@ -792,6 +910,26 @@ export function validateVpsPayload(input: unknown): VpsPayload {
     errors.controllerSecretKey = "Controller secret must be a string.";
   }
 
+  if (!defaultMouseActivityEnabled.isValid) {
+    errors.defaultMouseActivityEnabled = "Default mouse activity must be a boolean, 'true'/'false', or 1/0.";
+  }
+
+  if (!defaultMouseActivityMinIntervalMs.isValid) {
+    errors.defaultMouseActivityMinIntervalMs = "Default minimum mouse interval must be an integer of at least 250 ms.";
+  }
+
+  if (!defaultMouseActivityMaxIntervalMs.isValid) {
+    errors.defaultMouseActivityMaxIntervalMs = "Default maximum mouse interval must be an integer of at least 250 ms.";
+  }
+
+  if (!defaultMouseActivityMaxOffsetPx.isValid) {
+    errors.defaultMouseActivityMaxOffsetPx = "Default mouse offset must be an integer of at least 1 px.";
+  }
+
+  if (defaultMouseActivityMaxIntervalMs.value < defaultMouseActivityMinIntervalMs.value) {
+    errors.defaultMouseActivityMaxIntervalMs = "Default maximum mouse interval must be greater than or equal to the default minimum interval.";
+  }
+
   if (!isEnabled.isValid) {
     errors.isEnabled = "Enabled status must be a boolean, 'true'/'false', or 1/0.";
   }
@@ -808,6 +946,10 @@ export function validateVpsPayload(input: unknown): VpsPayload {
     environment,
     region,
     provider,
+    defaultMouseActivityEnabled: defaultMouseActivityEnabled.value,
+    defaultMouseActivityMinIntervalMs: defaultMouseActivityMinIntervalMs.value,
+    defaultMouseActivityMaxIntervalMs: defaultMouseActivityMaxIntervalMs.value,
+    defaultMouseActivityMaxOffsetPx: defaultMouseActivityMaxOffsetPx.value,
     controllerSecretKey,
     tags,
     notes,
@@ -1360,6 +1502,12 @@ export async function dispatchExecuteScriptCommand(options: {
   scriptId?: string;
   scriptName?: string;
   engineMode?: ScriptEngineMode;
+  mouseActivityEnabled?: boolean;
+  mouseActivityConfig?: {
+    minIntervalMs?: number;
+    maxIntervalMs?: number;
+    maxOffsetPx?: number;
+  };
   taskResultWebhookUrlTemplate?: string;
   initiatedByUserId: string;
 }) {
@@ -1382,6 +1530,23 @@ export async function dispatchExecuteScriptCommand(options: {
       scriptId: safeString(options.scriptId),
       scriptName: safeString(options.scriptName),
       engineMode: options.engineMode ?? "deterministic",
+      mouseActivityEnabled: options.mouseActivityEnabled === true,
+      mouseActivityConfig: options.mouseActivityConfig
+        ? {
+          minIntervalMs:
+            typeof options.mouseActivityConfig.minIntervalMs === "number"
+              ? options.mouseActivityConfig.minIntervalMs
+              : undefined,
+          maxIntervalMs:
+            typeof options.mouseActivityConfig.maxIntervalMs === "number"
+              ? options.mouseActivityConfig.maxIntervalMs
+              : undefined,
+          maxOffsetPx:
+            typeof options.mouseActivityConfig.maxOffsetPx === "number"
+              ? options.mouseActivityConfig.maxOffsetPx
+              : undefined,
+        }
+        : undefined,
       script: structuredInstructions,
       callback: options.taskResultWebhookUrlTemplate
         ? {

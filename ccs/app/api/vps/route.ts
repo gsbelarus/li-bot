@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 
-import { connectToDatabase } from "@/lib/mongodb";
+import { DatabaseConnectionError, connectToDatabase } from "@/lib/mongodb";
 import {
   DuplicateVpsError,
   PayloadValidationError,
@@ -16,25 +16,39 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function GET(request: NextRequest) {
-  await connectToDatabase();
+  try {
+    await connectToDatabase();
 
-  const { filter, page, pageSize, sort } = getListQuery(request.nextUrl.searchParams);
+    const { filter, page, pageSize, sort } = getListQuery(request.nextUrl.searchParams);
 
-  const [items, totalCount] = await Promise.all([
-    RemoteVpsModel.find(filter)
-      .sort(sort)
-      .skip((page - 1) * pageSize)
-      .limit(pageSize)
-      .lean(),
-    RemoteVpsModel.countDocuments(filter),
-  ]);
+    const [items, totalCount] = await Promise.all([
+      RemoteVpsModel.find(filter)
+        .sort(sort)
+        .skip((page - 1) * pageSize)
+        .limit(pageSize)
+        .lean(),
+      RemoteVpsModel.countDocuments(filter),
+    ]);
 
-  return NextResponse.json({
-    items: items.map((item) => serializeVps(item)),
-    totalCount,
-    page,
-    pageSize,
-  });
+    return NextResponse.json({
+      items: items.map((item) => serializeVps(item)),
+      totalCount,
+      page,
+      pageSize,
+    });
+  } catch (error) {
+    if (error instanceof DatabaseConnectionError) {
+      return NextResponse.json(
+        {
+          error: "Database unavailable.",
+          details: error.message,
+        },
+        { status: 503 }
+      );
+    }
+
+    return NextResponse.json({ error: "Failed to load VPS records." }, { status: 500 });
+  }
 }
 
 export async function POST(request: NextRequest) {
@@ -64,6 +78,13 @@ export async function POST(request: NextRequest) {
       { status: 201 }
     );
   } catch (error) {
+    if (error instanceof DatabaseConnectionError) {
+      return NextResponse.json(
+        { errors: { form: error.message } },
+        { status: 503 }
+      );
+    }
+
     if (error instanceof PayloadValidationError) {
       return NextResponse.json({ errors: error.errors }, { status: 400 });
     }

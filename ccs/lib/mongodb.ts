@@ -11,23 +11,34 @@ declare global {
 
 const { MONGODB_URI, MONGODB_DB } = process.env;
 
+export class DatabaseConnectionError extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message);
+    this.name = "DatabaseConnectionError";
+
+    if (options && "cause" in options) {
+      (this as Error & { cause?: unknown }).cause = options.cause;
+    }
+  }
+}
+
 if (!global.mongooseCache) {
   global.mongooseCache = { conn: null, promise: null };
 }
 
 export async function connectToDatabase() {
   if (!MONGODB_URI) {
-    throw new Error("Missing MONGODB_URI environment variable.");
+    throw new DatabaseConnectionError("MongoDB is not configured: missing MONGODB_URI.");
   }
 
   if (!MONGODB_DB) {
-    throw new Error("Missing MONGODB_DB environment variable.");
+    throw new DatabaseConnectionError("MongoDB is not configured: missing MONGODB_DB.");
   }
 
   const cached = global.mongooseCache;
 
   if (!cached) {
-    throw new Error("Mongo cache initialization failed.");
+    throw new DatabaseConnectionError("MongoDB cache initialization failed.");
   }
 
   if (cached.conn) {
@@ -35,11 +46,24 @@ export async function connectToDatabase() {
   }
 
   if (!cached.promise) {
-    cached.promise = mongoose.connect(MONGODB_URI, {
-      dbName: MONGODB_DB,
-      bufferCommands: false,
-      maxPoolSize: 10,
-    });
+    cached.promise = mongoose
+      .connect(MONGODB_URI, {
+        dbName: MONGODB_DB,
+        bufferCommands: false,
+        maxPoolSize: 10,
+        serverSelectionTimeoutMS: 5000,
+      })
+      .catch((error: unknown) => {
+        cached.promise = null;
+        cached.conn = null;
+
+        console.error("MongoDB connection failed", error);
+
+        throw new DatabaseConnectionError(
+          "Unable to reach MongoDB. Check network access, DNS resolution, and the configured cluster address.",
+          { cause: error }
+        );
+      });
   }
 
   cached.conn = await cached.promise;

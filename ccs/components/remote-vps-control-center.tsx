@@ -83,6 +83,10 @@ interface VpsFormValues {
   environment: RemoteVpsRecord["environment"];
   region: string;
   provider: string;
+  defaultMouseActivityEnabled: boolean;
+  defaultMouseActivityMinIntervalMs: string;
+  defaultMouseActivityMaxIntervalMs: string;
+  defaultMouseActivityMaxOffsetPx: string;
   controllerSecretKey: string;
   tags: string;
   notes: string;
@@ -118,11 +122,37 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 const SCRIPT_POLL_INTERVAL_MS = 4000;
 const SCRIPT_POLL_TIMEOUT_MS = 10 * 60 * 1000;
 const SCRIPT_POLL_MAX_ATTEMPTS = Math.ceil(SCRIPT_POLL_TIMEOUT_MS / SCRIPT_POLL_INTERVAL_MS);
+const DEFAULT_MOUSE_ACTIVITY_MIN_INTERVAL_MS = 9000;
+const DEFAULT_MOUSE_ACTIVITY_MAX_INTERVAL_MS = 22000;
+const DEFAULT_MOUSE_ACTIVITY_MAX_OFFSET_PX = 48;
+
+function getMouseActivityDefaultInputs(record?: Pick<
+  RemoteVpsRecord,
+  | "defaultMouseActivityMinIntervalMs"
+  | "defaultMouseActivityMaxIntervalMs"
+  | "defaultMouseActivityMaxOffsetPx"
+> | null) {
+  return {
+    minIntervalMs: String(record?.defaultMouseActivityMinIntervalMs ?? DEFAULT_MOUSE_ACTIVITY_MIN_INTERVAL_MS),
+    maxIntervalMs: String(record?.defaultMouseActivityMaxIntervalMs ?? DEFAULT_MOUSE_ACTIVITY_MAX_INTERVAL_MS),
+    maxOffsetPx: String(record?.defaultMouseActivityMaxOffsetPx ?? DEFAULT_MOUSE_ACTIVITY_MAX_OFFSET_PX),
+  };
+}
 
 function sleep(ms: number) {
   return new Promise<void>((resolve) => {
     window.setTimeout(resolve, ms);
   });
+}
+
+function parsePositiveIntegerInput(value: string, minimum: number) {
+  const parsed = Number.parseInt(value, 10);
+
+  if (!Number.isFinite(parsed) || parsed < minimum) {
+    return null;
+  }
+
+  return Math.floor(parsed);
 }
 
 function getControllerTaskErrorMessage(error: unknown) {
@@ -161,6 +191,46 @@ function getControllerTaskErrorMessage(error: unknown) {
   }
 
   return "Remote controller reported a task failure.";
+}
+
+function getApiErrorMessage(error: unknown, fallback: string) {
+  if (!error || typeof error !== "object") {
+    return fallback;
+  }
+
+  if (
+    "errors" in error &&
+    isPlainObject((error as { errors?: unknown }).errors) &&
+    typeof (error as { errors: { form?: unknown } }).errors.form === "string"
+  ) {
+    return (error as { errors: { form: string } }).errors.form;
+  }
+
+  if (typeof (error as { details?: unknown }).details === "string") {
+    const details = (error as { details: string }).details.trim();
+
+    if (details) {
+      return details;
+    }
+  }
+
+  if (typeof (error as { error?: unknown }).error === "string") {
+    const message = (error as { error: string }).error.trim();
+
+    if (message) {
+      return message;
+    }
+  }
+
+  if (typeof (error as { message?: unknown }).message === "string") {
+    const message = (error as { message: string }).message.trim();
+
+    if (message) {
+      return message;
+    }
+  }
+
+  return fallback;
 }
 
 function getSkippedTaskOutputs(payload: unknown) {
@@ -234,6 +304,42 @@ function getInteractionEngineInfo(log: RemoteVpsInteractionLogRecord) {
   }
 
   return taskEngine;
+}
+
+function getInteractionMouseActivityInfo(log: RemoteVpsInteractionLogRecord) {
+  const payload = isPlainObject(log.requestPayload)
+    ? log.requestPayload
+    : isPlainObject(log.responsePayload)
+      ? log.responsePayload
+      : null;
+
+  if (!payload) {
+    return {
+      enabled: null,
+      minIntervalMs: null,
+      maxIntervalMs: null,
+      maxOffsetPx: null,
+    } as {
+      enabled: boolean | null;
+      minIntervalMs: number | null;
+      maxIntervalMs: number | null;
+      maxOffsetPx: number | null;
+    };
+  }
+
+  const config = isPlainObject(payload.mouseActivityConfig) ? payload.mouseActivityConfig : null;
+
+  return {
+    enabled: typeof payload.mouseActivityEnabled === "boolean" ? payload.mouseActivityEnabled : null,
+    minIntervalMs: typeof config?.minIntervalMs === "number" ? config.minIntervalMs : null,
+    maxIntervalMs: typeof config?.maxIntervalMs === "number" ? config.maxIntervalMs : null,
+    maxOffsetPx: typeof config?.maxOffsetPx === "number" ? config.maxOffsetPx : null,
+  } as {
+    enabled: boolean | null;
+    minIntervalMs: number | null;
+    maxIntervalMs: number | null;
+    maxOffsetPx: number | null;
+  };
 }
 
 function getTaskStepResolutionIndicators(payload: unknown) {
@@ -455,6 +561,8 @@ function formatDuration(value: number | null) {
 }
 
 function toFormValues(record?: RemoteVpsRecord | null): VpsFormValues {
+  const mouseDefaults = getMouseActivityDefaultInputs(record);
+
   return {
     name: record?.name ?? "",
     host: record?.host ?? "",
@@ -463,6 +571,10 @@ function toFormValues(record?: RemoteVpsRecord | null): VpsFormValues {
     environment: record?.environment ?? "production",
     region: record?.region ?? "",
     provider: record?.provider ?? "",
+    defaultMouseActivityEnabled: record?.defaultMouseActivityEnabled ?? false,
+    defaultMouseActivityMinIntervalMs: mouseDefaults.minIntervalMs,
+    defaultMouseActivityMaxIntervalMs: mouseDefaults.maxIntervalMs,
+    defaultMouseActivityMaxOffsetPx: mouseDefaults.maxOffsetPx,
     controllerSecretKey: "",
     tags: record?.tags.join(", ") ?? "",
     notes: record?.notes ?? "",
@@ -650,6 +762,30 @@ function RemoteVpsFormScreen({
       nextErrors.provider = "Provider is required.";
     }
 
+    const mouseMinIntervalMs = parsePositiveIntegerInput(values.defaultMouseActivityMinIntervalMs, 250);
+    const mouseMaxIntervalMs = parsePositiveIntegerInput(values.defaultMouseActivityMaxIntervalMs, 250);
+    const mouseMaxOffsetPx = parsePositiveIntegerInput(values.defaultMouseActivityMaxOffsetPx, 1);
+
+    if (mouseMinIntervalMs === null) {
+      nextErrors.defaultMouseActivityMinIntervalMs = "Default minimum interval must be at least 250 ms.";
+    }
+
+    if (mouseMaxIntervalMs === null) {
+      nextErrors.defaultMouseActivityMaxIntervalMs = "Default maximum interval must be at least 250 ms.";
+    }
+
+    if (
+      mouseMinIntervalMs !== null &&
+      mouseMaxIntervalMs !== null &&
+      mouseMaxIntervalMs < mouseMinIntervalMs
+    ) {
+      nextErrors.defaultMouseActivityMaxIntervalMs = "Default maximum interval must be greater than or equal to the minimum interval.";
+    }
+
+    if (mouseMaxOffsetPx === null) {
+      nextErrors.defaultMouseActivityMaxOffsetPx = "Default mouse offset must be at least 1 px.";
+    }
+
     setErrors(nextErrors);
     return Object.keys(nextErrors).length === 0;
   };
@@ -672,6 +808,9 @@ function RemoteVpsFormScreen({
         const payload: Record<string, unknown> = {
           ...values,
           port: Number(values.port),
+          defaultMouseActivityMinIntervalMs: Number(values.defaultMouseActivityMinIntervalMs),
+          defaultMouseActivityMaxIntervalMs: Number(values.defaultMouseActivityMaxIntervalMs),
+          defaultMouseActivityMaxOffsetPx: Number(values.defaultMouseActivityMaxOffsetPx),
           tags: values.tags,
         };
 
@@ -700,7 +839,12 @@ function RemoteVpsFormScreen({
           return;
         }
 
-        setErrors({ form: `Unable to ${mode === "create" ? "create" : "save"} VPS.` });
+        setErrors({
+          form: getApiErrorMessage(
+            error,
+            `Unable to ${mode === "create" ? "create" : "save"} VPS.`
+          ),
+        });
       }
     });
   };
@@ -795,6 +939,53 @@ function RemoteVpsFormScreen({
               error={Boolean(errors.provider)}
               helperText={errors.provider}
               required
+            />
+            <FormControl sx={{ gridColumn: { xs: "auto", md: "1 / span 2" } }}>
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={values.defaultMouseActivityEnabled}
+                    onChange={(event) =>
+                      handleChange("defaultMouseActivityEnabled", event.target.checked)
+                    }
+                  />
+                }
+                label="Enable OS mouse drift by default for script runs"
+              />
+              <FormHelperText>
+                When enabled, new script runs on this VPS default to moving the real cursor on the browser host machine unless the operator overrides it for that run.
+              </FormHelperText>
+            </FormControl>
+            <TextField
+              label="Default min interval (ms)"
+              type="number"
+              value={values.defaultMouseActivityMinIntervalMs}
+              onChange={(event) =>
+                handleChange("defaultMouseActivityMinIntervalMs", event.target.value)
+              }
+              error={Boolean(errors.defaultMouseActivityMinIntervalMs)}
+              helperText={errors.defaultMouseActivityMinIntervalMs ?? "Applied when an operator opens the execute dialog."}
+              inputProps={{ min: 250, step: 250 }}
+            />
+            <TextField
+              label="Default max interval (ms)"
+              type="number"
+              value={values.defaultMouseActivityMaxIntervalMs}
+              onChange={(event) =>
+                handleChange("defaultMouseActivityMaxIntervalMs", event.target.value)
+              }
+              error={Boolean(errors.defaultMouseActivityMaxIntervalMs)}
+              helperText={errors.defaultMouseActivityMaxIntervalMs ?? "Must be greater than or equal to the minimum interval."}
+              inputProps={{ min: 250, step: 250 }}
+            />
+            <TextField
+              label="Default max offset (px)"
+              type="number"
+              value={values.defaultMouseActivityMaxOffsetPx}
+              onChange={(event) => handleChange("defaultMouseActivityMaxOffsetPx", event.target.value)}
+              error={Boolean(errors.defaultMouseActivityMaxOffsetPx)}
+              helperText={errors.defaultMouseActivityMaxOffsetPx ?? "Used as the per-run offset default for this VPS."}
+              inputProps={{ min: 1, step: 1 }}
             />
             <TextField
               label="Controller secret"
@@ -975,6 +1166,16 @@ export function RemoteVpsControlCenter() {
   const [scriptsLoading, setScriptsLoading] = useState(false);
   const [scriptsError, setScriptsError] = useState<string | null>(null);
   const [executeDialogError, setExecuteDialogError] = useState<string | null>(null);
+  const [executeDialogMouseActivityEnabled, setExecuteDialogMouseActivityEnabled] = useState(false);
+  const [executeDialogMouseMinIntervalMs, setExecuteDialogMouseMinIntervalMs] = useState(
+    String(DEFAULT_MOUSE_ACTIVITY_MIN_INTERVAL_MS)
+  );
+  const [executeDialogMouseMaxIntervalMs, setExecuteDialogMouseMaxIntervalMs] = useState(
+    String(DEFAULT_MOUSE_ACTIVITY_MAX_INTERVAL_MS)
+  );
+  const [executeDialogMouseMaxOffsetPx, setExecuteDialogMouseMaxOffsetPx] = useState(
+    String(DEFAULT_MOUSE_ACTIVITY_MAX_OFFSET_PX)
+  );
   const [selectedScriptId, setSelectedScriptId] = useState("");
   const [isExecutingScript, setIsExecutingScript] = useState(false);
   const [isNavigating, startNavigation] = useTransition();
@@ -1162,9 +1363,9 @@ export function RemoteVpsControlCenter() {
         if (!ignore) {
           setListData(response);
         }
-      } catch {
+      } catch (error) {
         if (!ignore) {
-          setListError("Unable to load the VPS registry.");
+          setListError(getApiErrorMessage(error, "Unable to load the VPS registry."));
         }
       } finally {
         if (!ignore) {
@@ -1203,8 +1404,9 @@ export function RemoteVpsControlCenter() {
         if (!ignore) {
           setSelectedVps(response.item);
         }
-      } catch {
+      } catch (error) {
         if (!ignore) {
+          setListError(getApiErrorMessage(error, "Unable to load the selected VPS record."));
           setSelectedVps(null);
         }
       }
@@ -1249,11 +1451,11 @@ export function RemoteVpsControlCenter() {
             return response.items[0]?.id ?? "";
           });
         }
-      } catch {
+      } catch (error) {
         if (!ignore) {
           setAvailableScripts([]);
           setSelectedScriptId("");
-          setScriptsError("Unable to load available scripts.");
+          setScriptsError(getApiErrorMessage(error, "Unable to load available scripts."));
         }
       } finally {
         if (!ignore) {
@@ -1287,8 +1489,9 @@ export function RemoteVpsControlCenter() {
         if (!ignore) {
           setDetailLogs(response.items);
         }
-      } catch {
+      } catch (error) {
         if (!ignore) {
+          setLogsError(getApiErrorMessage(error, "Unable to load recent interaction history."));
           setDetailLogs([]);
         }
       }
@@ -1330,9 +1533,9 @@ export function RemoteVpsControlCenter() {
         if (!ignore) {
           setLogsData(response);
         }
-      } catch {
+      } catch (error) {
         if (!ignore) {
-          setLogsError("Unable to load interaction history.");
+          setLogsError(getApiErrorMessage(error, "Unable to load interaction history."));
         }
       } finally {
         if (!ignore) {
@@ -1386,6 +1589,20 @@ export function RemoteVpsControlCenter() {
         field: "provider",
         headerName: "Provider",
         minWidth: 140,
+      },
+      {
+        field: "defaultMouseActivityEnabled",
+        headerName: "Mouse drift",
+        minWidth: 140,
+        sortable: false,
+        renderCell: ({ row }) => (
+          <Chip
+            label={row.defaultMouseActivityEnabled ? "default on" : "default off"}
+            size="small"
+            color={row.defaultMouseActivityEnabled ? "success" : "default"}
+            variant={row.defaultMouseActivityEnabled ? "filled" : "outlined"}
+          />
+        ),
       },
       {
         field: "status",
@@ -1571,7 +1788,13 @@ export function RemoteVpsControlCenter() {
   );
 
   function openExecuteScriptDialog(vps: RemoteVpsRecord) {
+    const mouseDefaults = getMouseActivityDefaultInputs(vps);
+
     setExecuteDialogVps(vps);
+    setExecuteDialogMouseActivityEnabled(vps.defaultMouseActivityEnabled);
+    setExecuteDialogMouseMinIntervalMs(mouseDefaults.minIntervalMs);
+    setExecuteDialogMouseMaxIntervalMs(mouseDefaults.maxIntervalMs);
+    setExecuteDialogMouseMaxOffsetPx(mouseDefaults.maxOffsetPx);
   }
 
   async function pollScriptExecution(options: {
@@ -1680,6 +1903,32 @@ export function RemoteVpsControlCenter() {
       return;
     }
 
+    const mouseMinIntervalMs = parsePositiveIntegerInput(executeDialogMouseMinIntervalMs, 250);
+    const mouseMaxIntervalMs = parsePositiveIntegerInput(executeDialogMouseMaxIntervalMs, 250);
+    const mouseMaxOffsetPx = parsePositiveIntegerInput(executeDialogMouseMaxOffsetPx, 1);
+
+    if (executeDialogMouseActivityEnabled) {
+      if (mouseMinIntervalMs === null) {
+        setExecuteDialogError("Mouse minimum interval must be at least 250 ms.");
+        return;
+      }
+
+      if (mouseMaxIntervalMs === null) {
+        setExecuteDialogError("Mouse maximum interval must be at least 250 ms.");
+        return;
+      }
+
+      if (mouseMaxIntervalMs < mouseMinIntervalMs) {
+        setExecuteDialogError("Mouse maximum interval must be greater than or equal to the minimum interval.");
+        return;
+      }
+
+      if (mouseMaxOffsetPx === null) {
+        setExecuteDialogError("Mouse max offset must be at least 1 px.");
+        return;
+      }
+    }
+
     setIsExecutingScript(true);
     setExecuteDialogError(null);
 
@@ -1693,6 +1942,14 @@ export function RemoteVpsControlCenter() {
             scriptId: selectedScript.id,
             scriptName: selectedScript.name,
             engineMode: selectedScript.engineMode,
+            mouseActivityEnabled: executeDialogMouseActivityEnabled,
+            mouseActivityConfig: executeDialogMouseActivityEnabled
+              ? {
+                minIntervalMs: mouseMinIntervalMs,
+                maxIntervalMs: mouseMaxIntervalMs,
+                maxOffsetPx: mouseMaxOffsetPx,
+              }
+              : undefined,
             script: selectedScript.structuredInstructions,
           }),
         }
@@ -1717,6 +1974,9 @@ export function RemoteVpsControlCenter() {
       setExecuteDialogError(getControllerTaskErrorMessage(error));
     } finally {
       setIsExecutingScript(false);
+      setExecuteDialogMouseMinIntervalMs(String(DEFAULT_MOUSE_ACTIVITY_MIN_INTERVAL_MS));
+      setExecuteDialogMouseMaxIntervalMs(String(DEFAULT_MOUSE_ACTIVITY_MAX_INTERVAL_MS));
+      setExecuteDialogMouseMaxOffsetPx(String(DEFAULT_MOUSE_ACTIVITY_MAX_OFFSET_PX));
     }
   }
 
@@ -1751,8 +2011,12 @@ export function RemoteVpsControlCenter() {
       });
       setSnackbar(action === "test-connection" ? "Connection test completed." : "Health check completed.");
       setRefreshToken((value) => value + 1);
-    } catch {
-      setSnackbar(action === "test-connection" ? "Connection test failed." : "Health check failed.");
+    } catch (error) {
+      setSnackbar(
+        action === "test-connection"
+          ? `Connection test failed: ${getApiErrorMessage(error, "Unexpected error.")}`
+          : `Health check failed: ${getApiErrorMessage(error, "Unexpected error.")}`
+      );
     } finally {
       setActionVpsId(null);
     }
@@ -1787,8 +2051,10 @@ export function RemoteVpsControlCenter() {
 
       setSnackbar(response.message || `Backfilled script result logs for ${vps.name}.`);
       setRefreshToken((value) => value + 1);
-    } catch {
-      setSnackbar(`Unable to backfill script result logs for ${vps.name}.`);
+    } catch (error) {
+      setSnackbar(
+        `Unable to backfill script result logs for ${vps.name}: ${getApiErrorMessage(error, "Unexpected error.")}`
+      );
     } finally {
       setActionVpsId(null);
     }
@@ -1808,8 +2074,8 @@ export function RemoteVpsControlCenter() {
       setDeleteTarget(null);
       setRefreshToken((value) => value + 1);
       setScreen({ kind: "list" });
-    } catch {
-      setSnackbar("Delete failed.");
+    } catch (error) {
+      setSnackbar(getApiErrorMessage(error, "Delete failed."));
     }
   }
 
@@ -1834,8 +2100,8 @@ export function RemoteVpsControlCenter() {
       setLogsPaginationModel((current) => ({ ...current, page: 0 }));
       setRefreshToken((value) => value + 1);
       setSnackbar(`Cleared interaction logs for ${clearLogsTarget.name}.`);
-    } catch {
-      setSnackbar("Unable to clear interaction logs.");
+    } catch (error) {
+      setSnackbar(getApiErrorMessage(error, "Unable to clear interaction logs."));
     }
   }
 
@@ -2124,6 +2390,22 @@ export function RemoteVpsControlCenter() {
                           <DetailField label="Environment" value={selectedVps.environment} />
                           <DetailField label="Region" value={selectedVps.region || "-"} />
                           <DetailField
+                            label="Mouse drift default"
+                            value={selectedVps.defaultMouseActivityEnabled ? "Enabled" : "Disabled"}
+                          />
+                          <DetailField
+                            label="Default min interval"
+                            value={`${selectedVps.defaultMouseActivityMinIntervalMs} ms`}
+                          />
+                          <DetailField
+                            label="Default max interval"
+                            value={`${selectedVps.defaultMouseActivityMaxIntervalMs} ms`}
+                          />
+                          <DetailField
+                            label="Default max offset"
+                            value={`${selectedVps.defaultMouseActivityMaxOffsetPx} px`}
+                          />
+                          <DetailField
                             label="Controller secret"
                             value={
                               selectedVps.hasControllerSecret
@@ -2247,6 +2529,48 @@ export function RemoteVpsControlCenter() {
                         />
                       ) : (
                         <Stack spacing={0.75}>
+                          {(() => {
+                            const mouseActivity = getInteractionMouseActivityInfo(selectedLog!);
+
+                            return (
+                              <>
+                                <DetailField
+                                  label="Mouse drift"
+                                  value={
+                                    mouseActivity.enabled === null
+                                      ? "-"
+                                      : mouseActivity.enabled
+                                        ? "Enabled"
+                                        : "Disabled"
+                                  }
+                                />
+                                <DetailField
+                                  label="Mouse min interval"
+                                  value={
+                                    mouseActivity.minIntervalMs === null
+                                      ? "-"
+                                      : `${mouseActivity.minIntervalMs} ms`
+                                  }
+                                />
+                                <DetailField
+                                  label="Mouse max interval"
+                                  value={
+                                    mouseActivity.maxIntervalMs === null
+                                      ? "-"
+                                      : `${mouseActivity.maxIntervalMs} ms`
+                                  }
+                                />
+                                <DetailField
+                                  label="Mouse max offset"
+                                  value={
+                                    mouseActivity.maxOffsetPx === null
+                                      ? "-"
+                                      : `${mouseActivity.maxOffsetPx} px`
+                                  }
+                                />
+                              </>
+                            );
+                          })()}
                           {(() => {
                             const summary = getRecentScriptRunSummary(detailLogs);
 
@@ -2632,6 +2956,10 @@ export function RemoteVpsControlCenter() {
         onClose={() => {
           if (!isExecutingScript) {
             setExecuteDialogVps(null);
+            setExecuteDialogMouseActivityEnabled(false);
+            setExecuteDialogMouseMinIntervalMs(String(DEFAULT_MOUSE_ACTIVITY_MIN_INTERVAL_MS));
+            setExecuteDialogMouseMaxIntervalMs(String(DEFAULT_MOUSE_ACTIVITY_MAX_INTERVAL_MS));
+            setExecuteDialogMouseMaxOffsetPx(String(DEFAULT_MOUSE_ACTIVITY_MAX_OFFSET_PX));
           }
         }}
         maxWidth="sm"
@@ -2685,6 +3013,65 @@ export function RemoteVpsControlCenter() {
               </Box>
             ) : null}
 
+            <FormControl disabled={isExecutingScript}>
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={executeDialogMouseActivityEnabled}
+                    onChange={(event) => setExecuteDialogMouseActivityEnabled(event.target.checked)}
+                  />
+                }
+                label="Move the real mouse during execution"
+              />
+              <FormHelperText>
+                {executeDialogVps?.defaultMouseActivityEnabled
+                  ? "This VPS defaults to mouse drift. Turn this off to skip cursor movement for this run only."
+                  : "Turn this on to override the VPS default and enable cursor drift for this run only."}
+              </FormHelperText>
+            </FormControl>
+
+            <Box
+              sx={{
+                display: "grid",
+                gap: 1.25,
+                gridTemplateColumns: { xs: "1fr", sm: "repeat(3, minmax(0, 1fr))" },
+              }}
+            >
+              <TextField
+                label="Min interval (ms)"
+                type="number"
+                value={executeDialogMouseMinIntervalMs}
+                onChange={(event) => setExecuteDialogMouseMinIntervalMs(event.target.value)}
+                disabled={isExecutingScript || !executeDialogMouseActivityEnabled}
+                helperText="At least 250 ms"
+                inputProps={{ min: 250, step: 250 }}
+              />
+              <TextField
+                label="Max interval (ms)"
+                type="number"
+                value={executeDialogMouseMaxIntervalMs}
+                onChange={(event) => setExecuteDialogMouseMaxIntervalMs(event.target.value)}
+                disabled={isExecutingScript || !executeDialogMouseActivityEnabled}
+                helperText="Must be >= min interval"
+                inputProps={{ min: 250, step: 250 }}
+              />
+              <TextField
+                label="Max offset (px)"
+                type="number"
+                value={executeDialogMouseMaxOffsetPx}
+                onChange={(event) => setExecuteDialogMouseMaxOffsetPx(event.target.value)}
+                disabled={isExecutingScript || !executeDialogMouseActivityEnabled}
+                helperText="At least 1 px"
+                inputProps={{ min: 1, step: 1 }}
+              />
+            </Box>
+
+            {executeDialogVps ? (
+              <Typography variant="caption" color="text.secondary">
+                Saved VPS defaults: {executeDialogVps.defaultMouseActivityMinIntervalMs} ms min, {executeDialogVps.defaultMouseActivityMaxIntervalMs} ms max, {executeDialogVps.defaultMouseActivityMaxOffsetPx} px offset.
+              </Typography>
+            ) : null}
+
             {selectedScript ? (
               <Box>
                 <Typography variant="subtitle2" color="text.secondary">
@@ -2698,7 +3085,16 @@ export function RemoteVpsControlCenter() {
           </Stack>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setExecuteDialogVps(null)} disabled={isExecutingScript}>
+          <Button
+            onClick={() => {
+              setExecuteDialogVps(null);
+              setExecuteDialogMouseActivityEnabled(false);
+              setExecuteDialogMouseMinIntervalMs(String(DEFAULT_MOUSE_ACTIVITY_MIN_INTERVAL_MS));
+              setExecuteDialogMouseMaxIntervalMs(String(DEFAULT_MOUSE_ACTIVITY_MAX_INTERVAL_MS));
+              setExecuteDialogMouseMaxOffsetPx(String(DEFAULT_MOUSE_ACTIVITY_MAX_OFFSET_PX));
+            }}
+            disabled={isExecutingScript}
+          >
             Cancel
           </Button>
           <Button

@@ -52,10 +52,18 @@ export interface ExecuteScriptCallbackConfig {
   taskResultWebhookUrlTemplate: string;
 }
 
+export interface MouseActivityConfig {
+  minIntervalMs?: number;
+  maxIntervalMs?: number;
+  maxOffsetPx?: number;
+}
+
 export interface ExecuteScriptCommandPayload {
   command: "executeScript";
   script: ScriptInstructions;
   engineMode: ExecutionEngineMode;
+  mouseActivityEnabled?: boolean;
+  mouseActivityConfig?: MouseActivityConfig;
   targetId?: string;
   callback?: ExecuteScriptCallbackConfig;
 }
@@ -71,6 +79,40 @@ function safeString(value: unknown, fallback = "") {
 function normalizeExecutionEngineMode(value: unknown): ExecutionEngineMode {
   const mode = safeString(value, "deterministic") as ExecutionEngineMode;
   return executionEngineModes.includes(mode) ? mode : "deterministic";
+}
+
+function normalizeOptionalBoolean(value: unknown) {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function normalizeMouseActivityConfig(value: unknown): MouseActivityConfig | undefined {
+  if (!isPlainObject(value)) {
+    return undefined;
+  }
+
+  const config: MouseActivityConfig = {};
+
+  if (typeof value.minIntervalMs === "number" && Number.isFinite(value.minIntervalMs)) {
+    config.minIntervalMs = Math.max(250, Math.floor(value.minIntervalMs));
+  }
+
+  if (typeof value.maxIntervalMs === "number" && Number.isFinite(value.maxIntervalMs)) {
+    config.maxIntervalMs = Math.max(250, Math.floor(value.maxIntervalMs));
+  }
+
+  if (typeof value.maxOffsetPx === "number" && Number.isFinite(value.maxOffsetPx)) {
+    config.maxOffsetPx = Math.max(1, Math.floor(value.maxOffsetPx));
+  }
+
+  if (
+    config.minIntervalMs !== undefined &&
+    config.maxIntervalMs !== undefined &&
+    config.maxIntervalMs < config.minIntervalMs
+  ) {
+    config.maxIntervalMs = config.minIntervalMs;
+  }
+
+  return Object.keys(config).length > 0 ? config : undefined;
 }
 
 function normalizeCallbackConfig(value: unknown): ExecuteScriptCallbackConfig | undefined {
@@ -184,6 +226,8 @@ export function validateExecuteScriptCommandPayload(
     command: "executeScript",
     script: normalizeStructuredInstructions(value.script),
     engineMode: normalizeExecutionEngineMode(value.engineMode),
+    mouseActivityEnabled: normalizeOptionalBoolean(value.mouseActivityEnabled),
+    mouseActivityConfig: normalizeMouseActivityConfig(value.mouseActivityConfig),
     targetId: safeString(value.targetId) || undefined,
     callback: normalizeCallbackConfig(value.callback),
   };

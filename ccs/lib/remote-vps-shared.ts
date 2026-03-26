@@ -76,6 +76,10 @@ export interface RemoteVpsRecord {
   environment: VpsEnvironment;
   region: string;
   provider: string;
+  defaultMouseActivityEnabled: boolean;
+  defaultMouseActivityMinIntervalMs: number;
+  defaultMouseActivityMaxIntervalMs: number;
+  defaultMouseActivityMaxOffsetPx: number;
   hasControllerSecret: boolean;
   controllerSecretKeyMasked: string;
   controllerVersion: string;

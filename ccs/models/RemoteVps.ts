@@ -6,6 +6,10 @@ import {
   vpsStatusOptions,
 } from "@/lib/remote-vps-shared";
 
+const defaultMouseActivityMinIntervalMs = 9000;
+const defaultMouseActivityMaxIntervalMs = 22000;
+const defaultMouseActivityMaxOffsetPx = 48;
+
 const remoteVpsSchema = new Schema(
   {
     name: {
@@ -44,6 +48,29 @@ const remoteVpsSchema = new Schema(
       type: String,
       required: true,
       trim: true,
+    },
+    defaultMouseActivityEnabled: {
+      type: Boolean,
+      default: false,
+      required: true,
+    },
+    defaultMouseActivityMinIntervalMs: {
+      type: Number,
+      default: defaultMouseActivityMinIntervalMs,
+      min: 250,
+      required: true,
+    },
+    defaultMouseActivityMaxIntervalMs: {
+      type: Number,
+      default: defaultMouseActivityMaxIntervalMs,
+      min: 250,
+      required: true,
+    },
+    defaultMouseActivityMaxOffsetPx: {
+      type: Number,
+      default: defaultMouseActivityMaxOffsetPx,
+      min: 1,
+      required: true,
     },
     controllerSecretKey: {
       type: String,

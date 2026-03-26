@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import express, { type NextFunction, type Request, type Response } from "express";
 import dotenv from "dotenv";
 
+import { CursorActivityController } from "./cursor-activity.js";
 import { log, serializeError } from "./logger.js";
 import { OpenClawRuntime } from "./openclaw.js";
 import { validateExecuteScriptCommandPayload } from "./script-contract.js";
@@ -36,6 +37,7 @@ if (!remoteControllerSecretKey) {
 }
 
 const runtime = new OpenClawRuntime();
+const cursorActivity = new CursorActivityController();
 
 function buildCompletedTaskResultPayload(task: TaskRecord) {
   if (task.status === "failed") {
@@ -105,11 +107,22 @@ async function publishTaskResultToWebhook(task: TaskRecord) {
 }
 
 const queue = new TaskQueue(async (task) => {
-  return runtime.executeScript(task.input.script, {
-    engineMode: task.input.engineMode,
-    targetId: task.input.targetId,
-    taskId: task.id,
+  cursorActivity.start(task.id, {
+    enabled: task.input.mouseActivityEnabled,
+    minIntervalMs: task.input.mouseActivityConfig?.minIntervalMs,
+    maxIntervalMs: task.input.mouseActivityConfig?.maxIntervalMs,
+    maxOffsetPx: task.input.mouseActivityConfig?.maxOffsetPx,
   });
+
+  try {
+    return await runtime.executeScript(task.input.script, {
+      engineMode: task.input.engineMode,
+      targetId: task.input.targetId,
+      taskId: task.id,
+    });
+  } finally {
+    cursorActivity.stop(task.id);
+  }
 }, {
   maxRetainedTasks,
   finishedTaskTtlMs,

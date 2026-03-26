@@ -40,8 +40,42 @@ export async function POST(
   }
 
   try {
+    const controller = getControllerConnectionDetails(item);
+    const rawMouseConfig = (body as { mouseActivityConfig?: unknown }).mouseActivityConfig;
+    const requestMouseConfig =
+      rawMouseConfig && typeof rawMouseConfig === "object" && !Array.isArray(rawMouseConfig)
+        ? (rawMouseConfig as {
+          minIntervalMs?: unknown;
+          maxIntervalMs?: unknown;
+          maxOffsetPx?: unknown;
+        })
+        : null;
+    const mouseActivityConfig = {
+      minIntervalMs:
+        typeof requestMouseConfig?.minIntervalMs === "number" && Number.isFinite(requestMouseConfig.minIntervalMs)
+          ? Math.max(250, Math.floor(requestMouseConfig.minIntervalMs))
+          : controller.defaultMouseActivityMinIntervalMs,
+      maxIntervalMs:
+        typeof requestMouseConfig?.maxIntervalMs === "number" && Number.isFinite(requestMouseConfig.maxIntervalMs)
+          ? Math.max(250, Math.floor(requestMouseConfig.maxIntervalMs))
+          : controller.defaultMouseActivityMaxIntervalMs,
+      maxOffsetPx:
+        typeof requestMouseConfig?.maxOffsetPx === "number" && Number.isFinite(requestMouseConfig.maxOffsetPx)
+          ? Math.max(1, Math.floor(requestMouseConfig.maxOffsetPx))
+          : controller.defaultMouseActivityMaxOffsetPx,
+    };
+
+    if (mouseActivityConfig.maxIntervalMs < mouseActivityConfig.minIntervalMs) {
+      return NextResponse.json(
+        {
+          error: "Mouse maximum interval must be greater than or equal to the minimum interval.",
+        },
+        { status: 400 }
+      );
+    }
+
     const response = await dispatchExecuteScriptCommand({
-      vps: getControllerConnectionDetails(item),
+      vps: controller,
       scriptId:
         typeof (body as { scriptId?: unknown }).scriptId === "string"
           ? (body as { scriptId: string }).scriptId
@@ -54,6 +88,11 @@ export async function POST(
         (body as { engineMode?: unknown }).engineMode === "ai_driven"
           ? "ai_driven"
           : "deterministic",
+      mouseActivityEnabled:
+        typeof (body as { mouseActivityEnabled?: unknown }).mouseActivityEnabled === "boolean"
+          ? (body as { mouseActivityEnabled: boolean }).mouseActivityEnabled
+          : controller.defaultMouseActivityEnabled,
+      mouseActivityConfig,
       script: (body as { script?: unknown }).script,
       taskResultWebhookUrlTemplate: `${request.nextUrl.origin}/api/vps/${id}/commands/{taskId}/results`,
       initiatedByUserId: getActorFromRequest(request),
