@@ -233,6 +233,10 @@ function hasToObject(
 export function serializeVps(document: RemoteVpsDocument | RemoteVpsRecord | Record<string, unknown>) {
   const source = hasToObject(document) ? document.toObject() : document;
   const sourceRecord = source as Record<string, unknown>;
+  const serializedId =
+    sourceRecord._id === null || sourceRecord._id === undefined
+      ? safeString(sourceRecord.id)
+      : String(sourceRecord._id);
   const controllerSecretKey = safeString(sourceRecord.controllerSecretKey);
   const lastSeenAt = toNullableIsoResult("lastSeenAt", source.lastSeenAt as Date | string | null | undefined);
   const lastHealthCheckAt = toNullableIsoResult(
@@ -249,7 +253,7 @@ export function serializeVps(document: RemoteVpsDocument | RemoteVpsRecord | Rec
   ].filter((warning): warning is RemoteVpsTimestampWarning => Boolean(warning));
 
   return {
-    id: safeString(sourceRecord._id) || safeString(sourceRecord.id),
+    id: serializedId,
     name: safeString(source.name),
     host: safeString(source.host),
     port: Number(source.port),

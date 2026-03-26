@@ -31,6 +31,10 @@ const finishedTaskTtlMs = Number(process.env.REMOTE_CONTROLLER_FINISHED_TASK_TTL
 const taskCleanupIntervalMs = Number(process.env.REMOTE_CONTROLLER_TASK_CLEANUP_INTERVAL_MS || 5 * 60 * 1000);
 const resultLogChunkSize = Math.max(200, Number(process.env.REMOTE_CONTROLLER_RESULT_LOG_CHUNK_SIZE || 600));
 const resultLogMaxChars = Math.max(resultLogChunkSize, Number(process.env.REMOTE_CONTROLLER_RESULT_LOG_MAX_CHARS || 120_000));
+const resultWebhookTimeoutMs = Math.max(
+  1_000,
+  Number(process.env.REMOTE_CONTROLLER_RESULT_WEBHOOK_TIMEOUT_MS || 15_000)
+);
 
 if (!remoteControllerSecretKey) {
   throw new Error("REMOTE_CONTROLLER_SECRET_KEY must be configured.");
@@ -68,6 +72,12 @@ function resolveTaskResultWebhookUrl(task: TaskRecord) {
   return template.replace("{taskId}", encodeURIComponent(task.id));
 }
 
+function createWebhookTimeoutError(timeoutMs: number) {
+  const error = new Error(`Webhook request timed out after ${timeoutMs}ms.`);
+  error.name = "WebhookTimeoutError";
+  return error;
+}
+
 async function publishTaskResultToWebhook(task: TaskRecord) {
   const webhookUrl = resolveTaskResultWebhookUrl(task);
 
@@ -76,6 +86,13 @@ async function publishTaskResultToWebhook(task: TaskRecord) {
   }
 
   const payload = buildCompletedTaskResultPayload(task);
+  const abortController = new AbortController();
+  const timeoutError = createWebhookTimeoutError(resultWebhookTimeoutMs);
+  const timeoutHandle = setTimeout(() => {
+    abortController.abort(timeoutError);
+  }, resultWebhookTimeoutMs);
+
+  timeoutHandle.unref?.();
 
   try {
     const response = await fetch(webhookUrl, {
@@ -85,6 +102,7 @@ async function publishTaskResultToWebhook(task: TaskRecord) {
         "x-remote-controller-secret-key": remoteControllerSecretKey,
       },
       body: JSON.stringify(payload),
+      signal: abortController.signal,
     });
 
     if (!response.ok) {
@@ -97,12 +115,25 @@ async function publishTaskResultToWebhook(task: TaskRecord) {
       webhookUrl,
     });
   } catch (error) {
+    if (abortController.signal.aborted && abortController.signal.reason === timeoutError) {
+      log("warn", "task.result_webhook.timeout", {
+        taskId: task.id,
+        status: task.status,
+        webhookUrl,
+        timeoutMs: resultWebhookTimeoutMs,
+        error: serializeError(timeoutError),
+      });
+      return;
+    }
+
     log("warn", "task.result_webhook.failed", {
       taskId: task.id,
       status: task.status,
       webhookUrl,
       error: serializeError(error),
     });
+  } finally {
+    clearTimeout(timeoutHandle);
   }
 }
 

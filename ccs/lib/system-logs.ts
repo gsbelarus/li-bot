@@ -11,6 +11,8 @@ import { serializeInteractionLog } from "@/lib/remote-vps";
 import RemoteVpsInteractionLogModel from "@/models/RemoteVpsInteractionLog";
 import RemoteVpsModel from "@/models/RemoteVps";
 
+export const maxSystemLogExportBytes = 40 * 1024 * 1024;
+
 const safeString = (value: unknown, fallback = "") =>
   typeof value === "string" ? value.trim() : fallback;
 
@@ -260,6 +262,27 @@ export async function listAllSystemLogs(filter: Record<string, unknown>) {
   );
 
   return items.map((item) => toSystemLogRecord(item as unknown as Record<string, unknown>, vpsById));
+}
+
+export async function getSystemLogExportSize(filter: Record<string, unknown>) {
+  const [result] = await RemoteVpsInteractionLogModel.aggregate<{
+    count: number;
+    totalDocumentBytes: number;
+  }>([
+    { $match: filter },
+    {
+      $group: {
+        _id: null,
+        count: { $sum: 1 },
+        totalDocumentBytes: { $sum: { $bsonSize: "$$ROOT" } },
+      },
+    },
+  ]);
+
+  return {
+    count: result?.count ?? 0,
+    totalDocumentBytes: result?.totalDocumentBytes ?? 0,
+  };
 }
 
 function stringifyStructuredValue(value: unknown) {

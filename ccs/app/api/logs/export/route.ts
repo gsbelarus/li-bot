@@ -4,8 +4,10 @@ import { connectToDatabase } from "@/lib/mongodb";
 import {
   buildSystemLogsCsv,
   buildSystemLogsJson,
+  getSystemLogExportSize,
   getSystemLogListQuery,
   listAllSystemLogs,
+  maxSystemLogExportBytes,
 } from "@/lib/system-logs";
 
 export const runtime = "nodejs";
@@ -16,6 +18,25 @@ export async function GET(request: NextRequest) {
 
   const format = request.nextUrl.searchParams.get("format") === "csv" ? "csv" : "json";
   const { filter } = getSystemLogListQuery(request.nextUrl.searchParams);
+  const exportInfo = await getSystemLogExportSize(filter);
+
+  if (exportInfo.totalDocumentBytes > maxSystemLogExportBytes) {
+    return NextResponse.json(
+      {
+        error: "Export exceeds the 40 MB limit. Narrow the filters and try again.",
+        maxExportBytes: maxSystemLogExportBytes,
+        estimatedBytes: exportInfo.totalDocumentBytes,
+        matchingLogCount: exportInfo.count,
+      },
+      {
+        status: 413,
+        headers: {
+          "cache-control": "no-store",
+        },
+      }
+    );
+  }
+
   const logs = await listAllSystemLogs(filter);
 
   const body = format === "csv" ? buildSystemLogsCsv(logs) : buildSystemLogsJson(logs);
