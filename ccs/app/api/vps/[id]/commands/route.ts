@@ -98,6 +98,9 @@ export async function POST(
       profileVisitLookupUrlTemplate:
         `${request.nextUrl.origin}/api/vps/${id}/profile-history/check` +
         `?profileUrl={profileUrl}&lookbackDays={lookbackDays}`,
+      postHistoryLookupUrlTemplate:
+        `${request.nextUrl.origin}/api/vps/${id}/post-history/check` +
+        `?postUrl={postUrl}&lookbackDays={lookbackDays}`,
       initiatedByUserId: getActorFromRequest(request),
     });
 

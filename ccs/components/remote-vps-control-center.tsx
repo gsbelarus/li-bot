@@ -1657,38 +1657,38 @@ export function RemoteVpsControlCenter() {
       {
         field: "name",
         headerName: "Name",
-        flex: 1.2,
-        minWidth: 180,
+        flex: 1,
+        minWidth: 160,
       },
       {
         field: "host",
         headerName: "Host",
-        flex: 1.1,
-        minWidth: 180,
+        flex: 1,
+        minWidth: 160,
       },
       {
         field: "port",
         headerName: "Port",
-        width: 90,
+        width: 72,
       },
       {
         field: "environment",
         headerName: "Environment",
-        minWidth: 120,
+        minWidth: 110,
       },
       {
         field: "provider",
         headerName: "Provider",
-        minWidth: 140,
+        minWidth: 120,
       },
       {
         field: "defaultMouseActivityEnabled",
         headerName: "Mouse drift",
-        minWidth: 140,
+        minWidth: 116,
         sortable: false,
         renderCell: ({ row }) => (
           <Chip
-            label={row.defaultMouseActivityEnabled ? "default on" : "default off"}
+            label={row.defaultMouseActivityEnabled ? "on" : "off"}
             size="small"
             color={row.defaultMouseActivityEnabled ? "success" : "default"}
             variant={row.defaultMouseActivityEnabled ? "filled" : "outlined"}
@@ -1698,7 +1698,7 @@ export function RemoteVpsControlCenter() {
       {
         field: "status",
         headerName: "Status",
-        minWidth: 220,
+        minWidth: 180,
         renderCell: ({ row }) => (
           <Stack direction="row" spacing={0.5} alignItems="center" flexWrap="wrap">
             <Chip label={row.status} color={statusColor(row.status)} size="small" />
@@ -1712,8 +1712,8 @@ export function RemoteVpsControlCenter() {
       },
       {
         field: "lastScriptExecutionResult",
-        headerName: "Last execution",
-        minWidth: 170,
+        headerName: "Last exec",
+        minWidth: 136,
         sortable: false,
         renderCell: ({ row }) =>
           row.lastScriptExecutionResult ? (
@@ -1728,13 +1728,13 @@ export function RemoteVpsControlCenter() {
       {
         field: "lastSeenAt",
         headerName: "Last seen",
-        minWidth: 180,
+        minWidth: 156,
         valueFormatter: (value) => formatDateTime(value as string | null),
       },
       {
         field: "controllerVersion",
-        headerName: "Controller version",
-        minWidth: 150,
+        headerName: "Controller",
+        minWidth: 118,
         valueGetter: (_value, row) => row.controllerVersion || "-",
       },
       {
@@ -1742,12 +1742,13 @@ export function RemoteVpsControlCenter() {
         headerName: "Actions",
         sortable: false,
         filterable: false,
-        minWidth: 220,
+        minWidth: 176,
         renderCell: ({ row }) => (
-          <Stack direction="row" spacing={0.5}>
+          <Stack direction="row" spacing={0.25}>
             <Tooltip title="View details">
               <IconButton
                 size="small"
+                sx={{ p: 0.4 }}
                 onClick={() => startNavigation(() => setScreen({ kind: "details", vpsId: row.id }))}
               >
                 <VisibilityRoundedIcon fontSize="small" />
@@ -1756,6 +1757,7 @@ export function RemoteVpsControlCenter() {
             <Tooltip title="Edit">
               <IconButton
                 size="small"
+                sx={{ p: 0.4 }}
                 onClick={() => startNavigation(() => setScreen({ kind: "edit", vpsId: row.id }))}
               >
                 <EditRoundedIcon fontSize="small" />
@@ -1765,6 +1767,7 @@ export function RemoteVpsControlCenter() {
               <span>
                 <IconButton
                   size="small"
+                  sx={{ p: 0.4 }}
                   disabled={actionVpsId === row.id || !row.isEnabled || row.status === "alert"}
                   onClick={() => openExecuteScriptDialog(row)}
                 >
@@ -1775,6 +1778,7 @@ export function RemoteVpsControlCenter() {
             <Tooltip title="Logs">
               <IconButton
                 size="small"
+                sx={{ p: 0.4 }}
                 onClick={() => openLogsScreen(row.id)}
               >
                 <HistoryRoundedIcon fontSize="small" />
@@ -1784,6 +1788,7 @@ export function RemoteVpsControlCenter() {
               <span>
                 <IconButton
                   size="small"
+                  sx={{ p: 0.4 }}
                   disabled={actionVpsId === row.id}
                   onClick={() => void triggerProbe(row.id, "test-connection")}
                 >
@@ -1792,7 +1797,7 @@ export function RemoteVpsControlCenter() {
               </span>
             </Tooltip>
             <Tooltip title="Delete">
-              <IconButton size="small" color="error" onClick={() => setDeleteTarget(row)}>
+              <IconButton size="small" sx={{ p: 0.4 }} color="error" onClick={() => setDeleteTarget(row)}>
                 <DeleteOutlineRoundedIcon fontSize="small" />
               </IconButton>
             </Tooltip>

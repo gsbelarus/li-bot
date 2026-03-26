@@ -361,6 +361,59 @@ function isRecentProfileVisitSkipIntent(text: string) {
   );
 }
 
+function extractPostMaxAgeDays(text: string) {
+  const normalized = normalizeText(text);
+  const monthMatch = normalized.match(/less than\s+(\d+)\s+months?\s+old|under\s+(\d+)\s+months?\s+old/);
+
+  if (monthMatch) {
+    const value = Number.parseInt(monthMatch[1] || monthMatch[2], 10);
+
+    if (Number.isFinite(value) && value > 0) {
+      return value * 30;
+    }
+  }
+
+  const dayMatch = normalized.match(/less than\s+(\d+)\s+days?\s+old|under\s+(\d+)\s+days?\s+old/);
+
+  if (dayMatch) {
+    const value = Number.parseInt(dayMatch[1] || dayMatch[2], 10);
+
+    if (Number.isFinite(value) && value > 0) {
+      return value;
+    }
+  }
+
+  if (/six months/.test(normalized)) {
+    return 180;
+  }
+
+  return 180;
+}
+
+function isPostCandidateSelectionIntent(text: string) {
+  const normalized = normalizeText(text);
+
+  return (
+    /\bfind\b|\bchoose\b|\bselect\b/.test(normalized) &&
+    /\bfirst\s+post\b/.test(normalized) &&
+    (/\bprocessed before\b|\bnot been processed\b|\bnot processed before\b/.test(normalized) || /months? old|days? old/.test(normalized))
+  );
+}
+
+function isGoBackIntent(text: string) {
+  return /\bgo back\b|\bback to\b|\breturn to the profile page\b/.test(normalizeText(text));
+}
+
+function isFocusIntent(text: string) {
+  return /\bmove focus\b|\bfocus\b/.test(normalizeText(text));
+}
+
+function isProcessedPostLogIntent(text: string) {
+  const normalized = normalizeText(text);
+
+  return /\blog entry\b|\badd a log\b|\blog that the post was processed\b/.test(normalized) && /\bpost\b/.test(normalized);
+}
+
 function buildAlertVisibleTarget(existingTarget: ScriptStep["target"] | null | undefined) {
   const existingTexts = dedupeTexts([
     safeString(existingTarget?.text),
@@ -428,6 +481,15 @@ function getPostControlTarget(text: string) {
       role: "button",
       text: "React Like",
       alternativeTexts: ["Like"],
+    };
+  }
+
+  if (/\bcomment\b/.test(normalized)) {
+    return {
+      description: "Comment button on the post",
+      role: "button",
+      text: "Comment",
+      alternativeTexts: ["Leave a comment", "Add a comment"],
     };
   }
 
@@ -891,6 +953,30 @@ function repairStructuredInstructions(instructions: ScriptInstructions) {
       step.params.lookbackDays = extractLookbackDays(instructionText);
     }
 
+    if (isPostCandidateSelectionIntent(instructionText)) {
+      step.kind = "select_linkedin_post_candidate";
+      step.delayAfterMs = 0;
+      step.target = {
+        description: "eligible post candidate",
+        selectors: [],
+        text: "",
+        role: "article",
+        alternativeTexts: [],
+      };
+      step.params.maxAgeDays = step.params.maxAgeDays ?? extractPostMaxAgeDays(instructionText);
+      step.params.lookbackDays = step.params.lookbackDays ?? 3650;
+      step.params.requireUnprocessed = true;
+      step.params.onMissing = safeString(step.params.onMissing) || "end_script";
+      step.params.outputKey = safeString(step.params.outputKey) || "selectedPost";
+    }
+
+    if (isGoBackIntent(instructionText)) {
+      step.kind = "go_back";
+      step.delayAfterMs = 0;
+      step.target = createEmptyTarget();
+      step.params = {};
+    }
+
     if (safeString(step.params.containerText)) {
       const mergedContainerTexts = mergeAlternativeTexts(
         step.params.containerText,
@@ -1119,11 +1205,26 @@ function repairStructuredInstructions(instructions: ScriptInstructions) {
     }
 
     if (refersToPreviousPost(instructionText)) {
+      step.params.useSelectedPost = true;
       copyOrdinalPostContext(step, previousStep);
+    }
+
+    if (isFocusIntent(instructionText) && (isOrdinalPostIntent(instructionText) || refersToPreviousPost(instructionText))) {
+      step.kind = "focus";
+      step.delayAfterMs = 0;
+      step.params.useSelectedPost = step.params.useSelectedPost === true || refersToPreviousPost(instructionText);
     }
 
     if (isOrdinalPostIntent(instructionText) || refersToPreviousPost(instructionText)) {
       applyPostControlTarget(step);
+    }
+
+    if (isProcessedPostLogIntent(instructionText)) {
+      step.kind = "log_processed_post";
+      step.delayAfterMs = 0;
+      step.target = createEmptyTarget();
+      step.params.label = safeString(step.params.label) || "processed_post";
+      step.params.fromKey = safeString(step.params.fromKey) || "selectedPost";
     }
 
     if (step.kind !== "scroll" && shouldScrollPostIntoView(instructionText)) {
@@ -1224,10 +1325,16 @@ const conversionTool = {
                 type: "string",
                 enum: [
                   "navigate",
+                  "go_back",
                   "click",
+                  "focus",
+                  "set_runtime_value",
+                  "increment_runtime_value",
                   "skip_if_profile_recently_visited",
                   "branch_if_missing",
                   "branch_if_visible",
+                  "branch_if_runtime_value",
+                  "jump",
                   "hover",
                   "wait",
                   "wait_for_page",
@@ -1236,7 +1343,14 @@ const conversionTool = {
                   "type",
                   "press_key",
                   "extract_text",
+                  "inspect_linkedin_latest_post",
+                  "select_linkedin_post_candidate",
+                  "generate_comment",
                   "assert_visible",
+                  "return_to_profile_source",
+                  "open_next_profile_candidate",
+                  "log_runtime_value",
+                  "log_processed_post",
                   "custom",
                 ],
               },
@@ -1310,7 +1424,7 @@ export async function POST(request: NextRequest) {
           content: [
             "You convert human browser instructions into structured JSON for an OpenClaw-based bot.",
             "OpenClaw should execute human-like browser actions from visible labels, roles, page URLs, and page state whenever possible.",
-            "Use only these action kinds: navigate, click, skip_if_profile_recently_visited, branch_if_missing, branch_if_visible, hover, wait, wait_for_page, move_mouse, scroll, type, press_key, extract_text, assert_visible, custom.",
+            "Use only these action kinds: navigate, go_back, click, focus, set_runtime_value, increment_runtime_value, skip_if_profile_recently_visited, branch_if_missing, branch_if_visible, branch_if_runtime_value, jump, hover, wait, wait_for_page, move_mouse, scroll, type, press_key, extract_text, inspect_linkedin_latest_post, select_linkedin_post_candidate, generate_comment, assert_visible, return_to_profile_source, open_next_profile_candidate, log_runtime_value, log_processed_post, custom.",
             "Prefer native-browser-friendly instructions that can be executed from an OpenClaw snapshot and element ref.",
             "Prefer intent-level actions over DOM-mechanical actions.",
             "If the human instruction says to go to a known destination page such as LinkedIn My Network, Feed, Jobs, Notifications, or Messaging, use navigate rather than click, and always set params.url.",
@@ -1334,10 +1448,24 @@ export async function POST(request: NextRequest) {
             "For known destination pages, do not rely on selectors or page links when the operator intent is clearly navigation.",
             "If an instruction says to open the first profile card inside a named section, do not target the section heading itself. Target a clickable profile/link inside that section using containerText and index.",
             "If the operator says to check whether scripts have run for the current LinkedIn profile in the last N days and to skip to the next profile when they have, emit skip_if_profile_recently_visited with params.lookbackDays set to N.",
+            "Use select_linkedin_post_candidate when the operator wants the first post that satisfies age or processing-history rules, such as 'less than 6 months old' and 'not processed before'. Set params.maxAgeDays, params.lookbackDays when needed, and params.onMissing='end_script' when the script should stop if no such post exists.",
+            "Use set_runtime_value and increment_runtime_value for counters, flags, and other script state that must survive across later steps.",
+            "Use branch_if_runtime_value when a later action depends on an extracted or previously stored runtime value such as a date classification, boolean flag, or counter.",
+            "Use jump only for intentional loops or re-entry into an earlier step order.",
+            "Use inspect_linkedin_latest_post when the operator wants to inspect the most recent LinkedIn post on the current page, fully read its text, gather its images, parse its publication date, and classify whether the contact should be skipped as inactive, reacted to, or reacted to and commented on.",
+            "For inspect_linkedin_latest_post, prefer params.commentWithinDays=14 and params.inactiveAfterDays=180 unless the operator specifies different windows. Put any desired generated or fixed comment text into params.commentText.",
+            "Use generate_comment when the operator wants a relevant comment based on the currently selected post. Store the result with params.outputKey and later type it with params.fromKey.",
+            "Use focus when the operator explicitly says to move focus to an element.",
+            "Use go_back when the operator explicitly says to go back to the previous page.",
+            "Use return_to_profile_source after processing a LinkedIn profile when the script must return to the saved source list before opening the next candidate.",
+            "Use open_next_profile_candidate after a prior profile-card click when the script must continue with the next contact from the same saved source list.",
+            "Use log_runtime_value when the operator explicitly wants a structured task log entry such as inactive, skipped, reacted, or commented.",
+            "Use log_processed_post after a successful post interaction when the operator wants to persist the post URL and processing timestamp for future history checks.",
             "When the operator refers to the first, second, third, or other ordinal post shown on the page, target role='article' with params.index set to that ordinal instead of using visible text.",
-            "If the operator refers to 'that post', 'the same post', or similar wording immediately after an ordinal post step, inherit the previous post index for the new step.",
+            "If the operator refers to 'that post', 'the same post', or similar wording immediately after an ordinal post step, inherit the previous post index for the new step and set params.useSelectedPost=true when the step should stay bound to the post selected earlier in the script.",
             "When the operator refers to controls on a post, map them to the visible post-scoped control labels. Use button 'More' with alternatives such as 'More actions' or 'More options', and use button 'React Like' with alternative 'Like' for the like action.",
             "If the operator says to find, focus, locate, or bring an ordinal post into view, represent that as a scroll step targeting the indexed article so the runtime scrolls it into view exactly.",
+            "For type steps, you may use params.fromKey when the text should come from a runtime value such as a generated comment.",
             "For LinkedIn profile activity, preserve both direct visible controls such as 'Show all activity', 'See all activity', 'See all posts', or 'Show all posts' and section/title fallbacks such as 'All activity', 'Activity', or 'All Posts' when the operator wants to open the full posts/activity list.",
             "If the operator says to scroll slightly before looking for the full posts/activity view, emit a separate small downward scroll step before the guarded lookup or click step.",
             "For wait and wait_for_page steps, usually set delayAfterMs to 0.",

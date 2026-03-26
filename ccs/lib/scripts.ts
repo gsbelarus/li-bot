@@ -131,10 +131,22 @@ function normalizeStep(value: unknown, index: number): ScriptStep {
   const kind = safeString(source.kind, "custom") as ScriptActionKind;
   const fallbackDelayAfterMs =
     kind === "navigate" ||
+      kind === "go_back" ||
+      kind === "set_runtime_value" ||
+      kind === "increment_runtime_value" ||
       kind === "wait" ||
       kind === "wait_for_page" ||
+      kind === "branch_if_runtime_value" ||
+      kind === "jump" ||
+      kind === "inspect_linkedin_latest_post" ||
+      kind === "select_linkedin_post_candidate" ||
+      kind === "generate_comment" ||
       kind === "branch_if_missing" ||
-      kind === "branch_if_visible"
+      kind === "branch_if_visible" ||
+      kind === "return_to_profile_source" ||
+      kind === "open_next_profile_candidate" ||
+      kind === "log_runtime_value" ||
+      kind === "log_processed_post"
       ? 0
       : 1000;
   const params = isPlainObject(source.params)

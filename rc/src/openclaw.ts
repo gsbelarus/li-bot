@@ -131,6 +131,7 @@ interface ExecutionContext {
   engineMode?: ExecutionEngineMode;
   engineStats?: ExecutionEngineStats;
   profileVisitLookupUrlTemplate?: string;
+  postHistoryLookupUrlTemplate?: string;
   runtimeState?: RuntimeState;
 }
 
@@ -151,9 +152,47 @@ interface ProfileCardSelectionState {
   sourcePageUrl: string;
 }
 
+interface SelectedPostState {
+  postIndex: number;
+  postUrl: string;
+  profileUrl: string;
+  pageUrl: string;
+  ageDays: number | null;
+  publishedAtIso: string | null;
+  publishedAtText: string;
+  text: string;
+  fullText: string;
+  imageCount: number;
+  images: Array<Record<string, unknown>>;
+  shouldComment: boolean;
+}
+
+interface ProcessedPostRecord {
+  postUrl: string;
+  profileUrl: string;
+  processedAt: string;
+  ageDays: number | null;
+  publishedAtIso: string | null;
+  publishedAtText: string;
+  textPreview: string;
+}
+
 interface RuntimeState {
   visitedProfiles: Map<string, VisitedProfileRecord>;
+  processedPosts: Map<string, ProcessedPostRecord>;
   profileCardSelection: ProfileCardSelectionState | null;
+  selectedPost: SelectedPostState | null;
+  values: Map<string, unknown>;
+  runtimeLogs: RuntimeLogRecord[];
+}
+
+interface RuntimeLogRecord {
+  label: string;
+  value: unknown;
+  stepOrder: number;
+  stepKind: ScriptStep["kind"];
+  instruction: string;
+  recordedAt: string;
 }
 
 interface OpenClawInvocation {
@@ -211,13 +250,15 @@ interface AiResolutionCandidate {
   nearbyContext: string;
 }
 
-interface BranchStepResult {
+interface ControlFlowStepResult {
   ok: true;
-  action: "branch_if_missing" | "branch_if_visible";
-  branchAction: "end_script" | "alert" | null;
-  conditionMet: boolean;
+  action: ScriptStep["kind"];
+  branchAction: "end_script" | "alert" | "jump" | null;
+  conditionMet?: boolean;
   reason?: string;
   matched?: ResolvedSnapshotRef;
+  jumpToOrder?: number | null;
+  exhausted?: boolean;
 }
 
 interface AlertStopResult {
@@ -265,6 +306,87 @@ class SnapshotRefNotFoundError extends Error {
 
 function normalizeSearchText(value: unknown) {
   return String(value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function isPlainObjectValue(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function normalizeRuntimeKey(value: unknown) {
+  return scalarString(value).trim();
+}
+
+function getNestedRuntimeValue(value: unknown, pathSegments: string[]) {
+  let current = value;
+
+  for (const segment of pathSegments) {
+    if (!segment) {
+      continue;
+    }
+
+    if (Array.isArray(current)) {
+      const index = Number(segment);
+
+      if (!Number.isInteger(index) || index < 0 || index >= current.length) {
+        return undefined;
+      }
+
+      current = current[index];
+      continue;
+    }
+
+    if (!isPlainObjectValue(current) || !(segment in current)) {
+      return undefined;
+    }
+
+    current = current[segment];
+  }
+
+  return current;
+}
+
+function selectRuntimeOutputValue(output: unknown) {
+  if (isPlainObjectValue(output) && "data" in output) {
+    return output.data;
+  }
+
+  return output;
+}
+
+function normalizeComparableOperand(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return { kind: "number" as const, value };
+  }
+
+  if (typeof value === "boolean") {
+    return { kind: "boolean" as const, value };
+  }
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+
+    if (!trimmed) {
+      return { kind: "string" as const, value: "" };
+    }
+
+    if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) {
+      return { kind: "number" as const, value: Number(trimmed) };
+    }
+
+    const parsedDate = Date.parse(trimmed);
+
+    if (Number.isFinite(parsedDate)) {
+      return { kind: "date" as const, value: parsedDate };
+    }
+
+    return { kind: "string" as const, value: trimmed.toLowerCase() };
+  }
+
+  if (value === null || value === undefined) {
+    return { kind: "nullish" as const, value: null };
+  }
+
+  return { kind: "other" as const, value };
 }
 
 function asBrowserTargetEntry(value: unknown): BrowserTargetEntry | null {
@@ -372,6 +494,45 @@ function normalizeLinkedInProfileKey(value: unknown) {
 function normalizeLinkedInProfileUrl(value: unknown) {
   const profileKey = normalizeLinkedInProfileKey(value);
   return profileKey ? `https://www.linkedin.com${profileKey}` : "";
+}
+
+function normalizeLinkedInPostUrl(value: unknown) {
+  const raw = scalarString(value).trim();
+
+  if (!raw) {
+    return "";
+  }
+
+  try {
+    const parsed = new URL(raw, "https://www.linkedin.com");
+    const hostname = parsed.hostname.toLowerCase();
+
+    if (!hostname.endsWith("linkedin.com")) {
+      return "";
+    }
+
+    const pathname = parsed.pathname.replace(/\/+$/g, "") || "/";
+
+    if (!/(?:\/feed\/update\/|\/posts\/|\/activity\/)/i.test(pathname)) {
+      return "";
+    }
+
+    return `https://www.linkedin.com${pathname}`;
+  } catch {
+    return "";
+  }
+}
+
+function isSelectedPostReferenceStep(step: ScriptStep) {
+  if (step.params.useSelectedPost === true) {
+    return true;
+  }
+
+  const combined = normalizeSearchText(
+    [step.instruction, step.target?.description, step.target?.text].filter(Boolean).join(" ")
+  );
+
+  return /\bsame post\b|\bthat post\b|\bthat same post\b|\bthis post\b/.test(combined);
 }
 
 function isProfileCardStep(step: ScriptStep) {
@@ -959,6 +1120,196 @@ export class OpenClawRuntime {
     return context.runtimeState;
   }
 
+  private getRuntimeValue(context: ExecutionContext, key: unknown) {
+    const runtimeState = this.getRuntimeState(context);
+    const normalizedKey = normalizeRuntimeKey(key);
+
+    if (!normalizedKey) {
+      return undefined;
+    }
+
+    if (runtimeState.values.has(normalizedKey)) {
+      return runtimeState.values.get(normalizedKey);
+    }
+
+    const [rootKey, ...pathSegments] = normalizedKey.split(".").map((segment) => segment.trim());
+
+    if (!rootKey || !runtimeState.values.has(rootKey)) {
+      return undefined;
+    }
+
+    return getNestedRuntimeValue(runtimeState.values.get(rootKey), pathSegments);
+  }
+
+  private setRuntimeValue(context: ExecutionContext, key: unknown, value: unknown) {
+    const runtimeState = this.getRuntimeState(context);
+    const normalizedKey = normalizeRuntimeKey(key);
+
+    if (!normalizedKey) {
+      return;
+    }
+
+    runtimeState.values.set(normalizedKey, value);
+    appendTaskLog(context.taskId, `RUNTIME_VALUE ${JSON.stringify({
+      taskId: context.taskId ?? null,
+      key: normalizedKey,
+      value,
+      recordedAt: new Date().toISOString(),
+    })}`);
+  }
+
+  private appendRuntimeLog(context: ExecutionContext, step: ScriptStep, label: string, value: unknown) {
+    const runtimeState = this.getRuntimeState(context);
+    const entry = {
+      label,
+      value,
+      stepOrder: step.order,
+      stepKind: step.kind,
+      instruction: step.instruction,
+      recordedAt: new Date().toISOString(),
+    } satisfies RuntimeLogRecord;
+
+    runtimeState.runtimeLogs.push(entry);
+    appendTaskLog(context.taskId, `RUNTIME_LOG ${JSON.stringify({
+      taskId: context.taskId ?? null,
+      ...entry,
+    })}`);
+
+    return entry;
+  }
+
+  private getSelectedPost(context: ExecutionContext) {
+    return this.getRuntimeState(context).selectedPost;
+  }
+
+  private setSelectedPost(context: ExecutionContext, selectedPost: SelectedPostState | null) {
+    const runtimeState = this.getRuntimeState(context);
+    runtimeState.selectedPost = selectedPost;
+
+    if (selectedPost) {
+      runtimeState.values.set("selectedPost", selectedPost);
+      appendTaskLog(context.taskId, `SELECTED_POST ${JSON.stringify({
+        taskId: context.taskId ?? null,
+        selectedAt: new Date().toISOString(),
+        selectedPost,
+      })}`);
+      return;
+    }
+
+    runtimeState.values.delete("selectedPost");
+  }
+
+  private getSelectedPostIndex(step: ScriptStep, context: ExecutionContext) {
+    if (!isSelectedPostReferenceStep(step)) {
+      return 0;
+    }
+
+    return this.getSelectedPost(context)?.postIndex ?? 0;
+  }
+
+  private recordProcessedPost(context: ExecutionContext, record: Omit<ProcessedPostRecord, "processedAt"> & {
+    processedAt?: string;
+  }) {
+    const runtimeState = this.getRuntimeState(context);
+    const postUrl = normalizeLinkedInPostUrl(record.postUrl);
+
+    if (!postUrl) {
+      return null;
+    }
+
+    const processedPost = {
+      postUrl,
+      profileUrl: normalizeLinkedInProfileUrl(record.profileUrl),
+      processedAt: scalarString(record.processedAt) || new Date().toISOString(),
+      ageDays: typeof record.ageDays === "number" && Number.isFinite(record.ageDays) ? record.ageDays : null,
+      publishedAtIso: scalarString(record.publishedAtIso) || null,
+      publishedAtText: scalarString(record.publishedAtText),
+      textPreview: scalarString(record.textPreview).slice(0, 280),
+    } satisfies ProcessedPostRecord;
+
+    runtimeState.processedPosts.set(postUrl, processedPost);
+    appendTaskLog(context.taskId, `PROCESSED_POST ${JSON.stringify({
+      taskId: context.taskId ?? null,
+      processedPost,
+    })}`);
+
+    return processedPost;
+  }
+
+  private evaluateRuntimeValueCondition(step: ScriptStep, context: ExecutionContext) {
+    const key = normalizeRuntimeKey(step.params.key);
+    const operator = scalarString(step.params.operator, "truthy").trim().toLowerCase();
+    const currentValue = this.getRuntimeValue(context, key);
+    const expectedValue = "value" in step.params ? step.params.value : step.params.expected;
+    const normalizedCurrent = normalizeComparableOperand(currentValue);
+    const normalizedExpected = normalizeComparableOperand(expectedValue);
+
+    switch (operator) {
+      case "exists":
+        return currentValue !== undefined;
+      case "not_exists":
+        return currentValue === undefined;
+      case "falsy":
+        return !currentValue;
+      case "equals":
+        return normalizedCurrent.kind === normalizedExpected.kind
+          ? normalizedCurrent.value === normalizedExpected.value
+          : String(currentValue ?? "") === String(expectedValue ?? "");
+      case "not_equals":
+        return normalizedCurrent.kind === normalizedExpected.kind
+          ? normalizedCurrent.value !== normalizedExpected.value
+          : String(currentValue ?? "") !== String(expectedValue ?? "");
+      case "gt":
+      case "gte":
+      case "lt":
+      case "lte": {
+        if (
+          (normalizedCurrent.kind !== "number" && normalizedCurrent.kind !== "date") ||
+          normalizedCurrent.kind !== normalizedExpected.kind
+        ) {
+          return false;
+        }
+
+        if (operator === "gt") {
+          return normalizedCurrent.value > normalizedExpected.value;
+        }
+
+        if (operator === "gte") {
+          return normalizedCurrent.value >= normalizedExpected.value;
+        }
+
+        if (operator === "lt") {
+          return normalizedCurrent.value < normalizedExpected.value;
+        }
+
+        return normalizedCurrent.value <= normalizedExpected.value;
+      }
+      case "includes":
+        if (typeof currentValue === "string") {
+          return currentValue.toLowerCase().includes(String(expectedValue ?? "").trim().toLowerCase());
+        }
+
+        if (Array.isArray(currentValue)) {
+          return currentValue.some((entry) => String(entry) === String(expectedValue));
+        }
+
+        return false;
+      case "not_includes":
+        if (typeof currentValue === "string") {
+          return !currentValue.toLowerCase().includes(String(expectedValue ?? "").trim().toLowerCase());
+        }
+
+        if (Array.isArray(currentValue)) {
+          return !currentValue.some((entry) => String(entry) === String(expectedValue));
+        }
+
+        return true;
+      case "truthy":
+      default:
+        return Boolean(currentValue);
+    }
+  }
+
   private recordVisitedProfile(context: ExecutionContext, profileUrl: string) {
     const runtimeState = this.getRuntimeState(context);
     const normalizedProfileUrl = normalizeLinkedInProfileUrl(profileUrl);
@@ -1032,6 +1383,56 @@ export class OpenClawRuntime {
       lookbackDays?: number;
       recentlyVisited?: boolean;
       latestVisitedAt?: string | null;
+    };
+  }
+
+  private buildPostHistoryLookupUrl(template: string, postUrl: string, lookbackDays: number) {
+    if (!template) {
+      return "";
+    }
+
+    return template
+      .replaceAll("{postUrl}", encodeURIComponent(postUrl))
+      .replaceAll("{lookbackDays}", encodeURIComponent(String(lookbackDays)));
+  }
+
+  private async fetchRecentProcessedPost(postUrl: string, lookbackDays: number, context: ExecutionContext) {
+    const template = scalarString(context.postHistoryLookupUrlTemplate).trim();
+    const requestUrl = this.buildPostHistoryLookupUrl(template, postUrl, lookbackDays);
+
+    if (!requestUrl) {
+      throw new Error("Post history lookup URL is not configured for this script execution.");
+    }
+
+    const remoteControllerSecretKey = getRemoteControllerSecretKey();
+
+    if (!remoteControllerSecretKey) {
+      throw new Error("REMOTE_CONTROLLER_SECRET_KEY must be configured for post history lookups.");
+    }
+
+    const response = await fetch(requestUrl, {
+      method: "GET",
+      headers: {
+        accept: "application/json",
+        "x-remote-controller-secret-key": remoteControllerSecretKey,
+      },
+      cache: "no-store",
+      signal: AbortSignal.timeout(15_000),
+    });
+
+    const payload = await response.json().catch(() => null);
+
+    if (!response.ok || typeof payload !== "object" || payload === null) {
+      throw new Error(
+        `Post history lookup failed${response.status ? ` with HTTP ${response.status}` : ""}.`
+      );
+    }
+
+    return payload as {
+      postUrl?: string;
+      lookbackDays?: number;
+      recentlyProcessed?: boolean;
+      latestProcessedAt?: string | null;
     };
   }
 
@@ -1252,18 +1653,24 @@ export class OpenClawRuntime {
     return mergedRefs;
   }
 
-  private getCandidateIndex(step: ScriptStep) {
+  private getCandidateIndex(step: ScriptStep, context: ExecutionContext = {}) {
     const explicitIndex = Number(step.params.index);
 
     if (Number.isFinite(explicitIndex) && explicitIndex > 0) {
       return Math.floor(explicitIndex);
     }
 
+    const selectedPostIndex = this.getSelectedPostIndex(step, context);
+
+    if (selectedPostIndex > 0) {
+      return selectedPostIndex;
+    }
+
     const inferredIndex = inferInstructionIndex(step.instruction);
     return inferredIndex > 0 ? inferredIndex : 1;
   }
 
-  private getSnapshotMatches(snapshot: BrowserSnapshot, step: ScriptStep) {
+  private getSnapshotMatches(snapshot: BrowserSnapshot, step: ScriptStep, context: ExecutionContext = {}) {
     const target = step.target;
 
     if (!target || target.role === "document") {
@@ -1275,7 +1682,7 @@ export class OpenClawRuntime {
     const description = normalizeSearchText(target.description);
     const profileCardStep = isProfileCardStep(step);
     const postActionMenuStep = isPostActionMenuStep(step);
-    const ordinalPostContextIndex = getOrdinalPostContextIndex(step);
+    const ordinalPostContextIndex = this.getSelectedPostIndex(step, context) || getOrdinalPostContextIndex(step);
     const postContextNeedle = ordinalPostContextIndex > 0 ? `feed post number ${ordinalPostContextIndex}` : "";
     const containerTextPatterns = normalizeTextPatterns(
       step.params.containerText,
@@ -1416,7 +1823,7 @@ export class OpenClawRuntime {
     return matches;
   }
 
-  private buildAiResolutionCandidates(snapshot: BrowserSnapshot, step: ScriptStep) {
+  private buildAiResolutionCandidates(snapshot: BrowserSnapshot, step: ScriptStep, context: ExecutionContext = {}) {
     const target = step.target;
 
     if (!target || target.role === "document") {
@@ -1428,7 +1835,7 @@ export class OpenClawRuntime {
     const description = normalizeSearchText(target.description);
     const profileCardStep = isProfileCardStep(step);
     const postActionMenuStep = isPostActionMenuStep(step);
-    const ordinalPostContextIndex = getOrdinalPostContextIndex(step);
+    const ordinalPostContextIndex = this.getSelectedPostIndex(step, context) || getOrdinalPostContextIndex(step);
     const postContextNeedle = ordinalPostContextIndex > 0 ? `feed post number ${ordinalPostContextIndex}` : "";
     const containerTextPatterns = normalizeTextPatterns(
       step.params.containerText,
@@ -1712,13 +2119,13 @@ export class OpenClawRuntime {
     context: ExecutionContext = {}
   ) {
     const deadline = Date.now() + Math.max(250, step.timeoutMs);
-    const desiredIndex = this.getCandidateIndex(step);
-    const hasExplicitIndex = hasExplicitTargetIndex(step);
+    const desiredIndex = this.getCandidateIndex(step, context);
+    const hasResolvedIndex = hasExplicitTargetIndex(step) || this.getSelectedPostIndex(step, context) > 0;
 
     while (Date.now() <= deadline) {
       const snapshot = await this.getSnapshot(targetId, context);
-      const matches = this.getSnapshotMatches(snapshot, step);
-      const resolved = hasExplicitIndex
+      const matches = this.getSnapshotMatches(snapshot, step, context);
+      const resolved = hasResolvedIndex
         ? matches[desiredIndex - 1] || null
         : matches[desiredIndex - 1] || matches[0] || null;
 
@@ -1793,7 +2200,7 @@ export class OpenClawRuntime {
 
     while (Date.now() <= deadline) {
       const snapshot = await this.getSnapshot(targetId, context);
-      const candidates = this.buildAiResolutionCandidates(snapshot, step);
+      const candidates = this.buildAiResolutionCandidates(snapshot, step, context);
       const resolved = await this.selectSnapshotRefWithAi(step, snapshot, candidates, context);
 
       if (resolved) {
@@ -2368,6 +2775,7 @@ export class OpenClawRuntime {
       throw new Error(`Step ${step.order} is missing params.url for navigation.`);
     }
 
+    this.setSelectedPost(context, null);
     await this.oc(["navigate", url, "--target-id", targetId], context);
 
     return {
@@ -2460,6 +2868,864 @@ export class OpenClawRuntime {
       action: step.kind,
       matched: resolved,
       ...(typeof result === "object" && result !== null ? result : { data: result }),
+    };
+  }
+
+  private async inspectLinkedInLatestPost(targetId: string, step: ScriptStep, context: ExecutionContext = {}) {
+    const commentWithinDays = boundedPositiveInteger(
+      step.params.commentWithinDays ?? step.params.commentMaxAgeDays,
+      14
+    );
+    const inactiveAfterDays = boundedPositiveInteger(
+      step.params.inactiveAfterDays ?? step.params.inactiveMaxAgeDays,
+      180
+    );
+    const maxImageCount = boundedPositiveInteger(step.params.maxImageCount, 12);
+    const treatMissingDateAsInactive = scalarBoolean(step.params.treatMissingDateAsInactive, true);
+    const commentText = scalarString(step.params.commentText, scalarString(step.params.commentTemplate));
+
+    const rawResult = await this.evaluate(
+      targetId,
+      `() => {
+        const nowMs = Date.now();
+        const dayMs = 24 * 60 * 60 * 1000;
+        const maxImageCount = ${JSON.stringify(maxImageCount)};
+
+        const normalizeText = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
+        const normalizeComparableText = (value) =>
+          normalizeText(value)
+            .toLowerCase()
+            .replace(/\u00a0/g, " ")
+            .replace(/[.,]/g, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+
+        const monthMap = new Map([
+          ["jan", 0], ["january", 0], ["янв", 0], ["январ", 0],
+          ["feb", 1], ["february", 1], ["фев", 1], ["феврал", 1],
+          ["mar", 2], ["march", 2], ["мар", 2], ["март", 2],
+          ["apr", 3], ["april", 3], ["апр", 3], ["апрел", 3],
+          ["may", 4], ["мая", 4], ["май", 4],
+          ["jun", 5], ["june", 5], ["июн", 5], ["июня", 5], ["июнь", 5],
+          ["jul", 6], ["july", 6], ["июл", 6], ["июля", 6], ["июль", 6],
+          ["aug", 7], ["august", 7], ["авг", 7], ["август", 7],
+          ["sep", 8], ["sept", 8], ["september", 8], ["сен", 8], ["сент", 8], ["сентябр", 8],
+          ["oct", 9], ["october", 9], ["окт", 9], ["октябр", 9],
+          ["nov", 10], ["november", 10], ["ноя", 10], ["ноябр", 10],
+          ["dec", 11], ["december", 11], ["дек", 11], ["декабр", 11],
+        ]);
+
+        const parseAbsoluteDate = (input) => {
+          const normalized = normalizeComparableText(input)
+            .replace(/г\.?$/g, "")
+            .replace(/\u00b7/g, " ");
+
+          if (!normalized) {
+            return null;
+          }
+
+          const directParsed = Date.parse(normalized);
+
+          if (Number.isFinite(directParsed)) {
+            return directParsed;
+          }
+
+          const tokens = normalized.split(/\s+/).filter(Boolean);
+          const monthIndex = tokens.findIndex((token) => {
+            for (const key of monthMap.keys()) {
+              if (token.startsWith(key)) {
+                return true;
+              }
+            }
+
+            return false;
+          });
+
+          if (monthIndex < 0) {
+            return null;
+          }
+
+          const monthToken = tokens[monthIndex];
+          let month = null;
+
+          for (const [key, value] of monthMap.entries()) {
+            if (monthToken.startsWith(key)) {
+              month = value;
+              break;
+            }
+          }
+
+          if (month === null) {
+            return null;
+          }
+
+          const numericTokens = tokens
+            .map((token) => token.replace(/[^0-9]/g, ""))
+            .filter(Boolean)
+            .map((token) => Number(token))
+            .filter((token) => Number.isInteger(token));
+
+          if (numericTokens.length === 0) {
+            return null;
+          }
+
+          const day = numericTokens.find((token) => token >= 1 && token <= 31) ?? null;
+          let year = numericTokens.find((token) => token >= 1900 && token <= 3000) ?? null;
+
+          if (!day) {
+            return null;
+          }
+
+          if (!year) {
+            const currentYear = new Date().getFullYear();
+            year = currentYear;
+            const candidate = new Date(year, month, day).getTime();
+
+            if (candidate > nowMs + dayMs) {
+              year -= 1;
+            }
+          }
+
+          const parsed = new Date(year, month, day).getTime();
+          return Number.isFinite(parsed) ? parsed : null;
+        };
+
+        const parseLinkedInDateText = (input) => {
+          const normalized = normalizeComparableText(input)
+            .replace(/\bago\b/g, "")
+            .replace(/\bназад\b/g, "")
+            .trim();
+
+          if (!normalized) {
+            return null;
+          }
+
+          if (/^(?:now|just now|сейчас|только что)$/i.test(normalized)) {
+            return nowMs;
+          }
+
+          const relativePatterns = [
+            { pattern: /(\d+)\s*(?:m|min|mins|minute|minutes|мин|мин\.)\b/i, multiplierMs: 60 * 1000 },
+            { pattern: /(\d+)\s*(?:h|hr|hrs|hour|hours|ч|час|часа|часов)\b/i, multiplierMs: 60 * 60 * 1000 },
+            { pattern: /(\d+)\s*(?:d|day|days|д|дн|дн\.|дня|дней)\b/i, multiplierMs: dayMs },
+            { pattern: /(\d+)\s*(?:w|wk|wks|week|weeks|нед|нед\.|недели|недель)\b/i, multiplierMs: 7 * dayMs },
+            { pattern: /(\d+)\s*(?:mo|mos|month|months|мес|мес\.|месяц|месяца|месяцев)\b/i, multiplierMs: 30 * dayMs },
+            { pattern: /(\d+)\s*(?:y|yr|yrs|year|years|г|год|года|лет)\b/i, multiplierMs: 365 * dayMs },
+          ];
+
+          for (const entry of relativePatterns) {
+            const match = normalized.match(entry.pattern);
+
+            if (match) {
+              const amount = Number(match[1]);
+
+              if (Number.isFinite(amount)) {
+                return nowMs - (amount * entry.multiplierMs);
+              }
+            }
+          }
+
+          return parseAbsoluteDate(normalized);
+        };
+
+        const isVisible = (element) => {
+          if (!(element instanceof HTMLElement)) {
+            return false;
+          }
+
+          const style = window.getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+        };
+
+        const findLatestPostArticle = () => {
+          const articleCandidates = Array.from(
+            document.querySelectorAll("main article, main [role='article'], article, [role='article']")
+          )
+            .filter((element) => element instanceof HTMLElement)
+            .map((element) => element)
+            .filter((element) => isVisible(element))
+            .slice(0, 20);
+
+          const scored = articleCandidates
+            .map((article, index) => {
+              const text = normalizeText(article.innerText);
+              const signalText = normalizeComparableText([
+                text,
+                article.getAttribute("aria-label") || "",
+                article.getAttribute("data-view-name") || "",
+              ].join(" "));
+              const hasDateLink = Boolean(
+                article.querySelector("a[href*='/feed/update/'], a[href*='/posts/'], a[href*='/activity/'], time")
+              );
+              const imageCount = article.querySelectorAll("img").length;
+
+              let score = 0;
+
+              if (hasDateLink) {
+                score += 250;
+              }
+
+              if (text.length > 40) {
+                score += 120;
+              }
+
+              if (imageCount > 0) {
+                score += Math.min(imageCount, 5) * 20;
+              }
+
+              if (/post|article|activity|feed|commentary|публикац|пост/.test(signalText)) {
+                score += 80;
+              }
+
+              score -= index * 4;
+
+              return { article, score };
+            })
+            .sort((left, right) => right.score - left.score);
+
+          return scored[0]?.article ?? null;
+        };
+
+        const article = findLatestPostArticle();
+
+        if (!(article instanceof HTMLElement)) {
+          return {
+            hasPosts: false,
+            latestPost: null,
+            ageDays: null,
+            publishedAtText: "",
+            publishedAtIso: null,
+          };
+        }
+
+        for (const control of Array.from(article.querySelectorAll("button, a"))) {
+          if (!(control instanceof HTMLElement) || !isVisible(control)) {
+            continue;
+          }
+
+          const label = normalizeComparableText(
+            [control.innerText, control.getAttribute("aria-label") || "", control.getAttribute("title") || ""]
+              .join(" ")
+          );
+
+          if (/^(?:see more|show more|read more|ещ[её]|показать еще|развернуть)/.test(label)) {
+            control.click();
+          }
+        }
+
+        const dateNode = article.querySelector(
+          "a[href*='/feed/update/'], a[href*='/posts/'], a[href*='/activity/'], time, a[aria-label*='ago']"
+        );
+        const publishedAtText = normalizeText(
+          dateNode instanceof HTMLElement
+            ? dateNode.innerText || dateNode.getAttribute("aria-label") || dateNode.getAttribute("title") || ""
+            : ""
+        );
+        const publishedAtMs = parseLinkedInDateText(publishedAtText);
+        const publishedAtIso = Number.isFinite(publishedAtMs) ? new Date(publishedAtMs).toISOString() : null;
+        const ageDays = Number.isFinite(publishedAtMs)
+          ? Math.max(0, Math.floor((nowMs - publishedAtMs) / dayMs))
+          : null;
+
+        const images = Array.from(article.querySelectorAll("img"))
+          .filter((node) => node instanceof HTMLImageElement)
+          .map((node) => node)
+          .filter((image) => {
+            const src = normalizeText(image.currentSrc || image.src);
+            const naturalWidth = Number(image.naturalWidth || image.width || 0);
+            const naturalHeight = Number(image.naturalHeight || image.height || 0);
+
+            if (!src || /^data:/i.test(src)) {
+              return false;
+            }
+
+            if (/profile-displayphoto|ghost-person|company-logo|entity-image/.test(src)) {
+              return false;
+            }
+
+            return naturalWidth >= 80 && naturalHeight >= 80;
+          })
+          .slice(0, maxImageCount)
+          .map((image) => ({
+            src: normalizeText(image.currentSrc || image.src),
+            alt: normalizeText(image.alt),
+            width: Number(image.naturalWidth || image.width || 0),
+            height: Number(image.naturalHeight || image.height || 0),
+          }));
+
+        const articleText = normalizeText(article.innerText);
+        const permalink =
+          dateNode instanceof HTMLAnchorElement && dateNode.href
+            ? normalizeText(dateNode.href)
+            : null;
+
+        return {
+          hasPosts: true,
+          latestPost: {
+            text: articleText,
+            fullText: articleText,
+            imageCount: images.length,
+            images,
+            permalink,
+          },
+          ageDays,
+          publishedAtText,
+          publishedAtIso,
+        };
+      }`,
+      context
+    );
+
+    const raw = isPlainObjectValue(rawResult) ? rawResult : {};
+    const hasPosts = raw.hasPosts === true;
+    const ageDays = typeof raw.ageDays === "number" && Number.isFinite(raw.ageDays)
+      ? raw.ageDays
+      : null;
+
+    let status: "inactive" | "react_only" | "react_and_comment" = "inactive";
+    let reason = "no_posts";
+
+    if (!hasPosts) {
+      status = "inactive";
+      reason = "no_posts";
+    } else if (ageDays === null) {
+      status = treatMissingDateAsInactive ? "inactive" : "react_only";
+      reason = treatMissingDateAsInactive ? "missing_post_date" : "missing_post_date_treated_as_recent";
+    } else if (ageDays > inactiveAfterDays) {
+      status = "inactive";
+      reason = "older_than_inactive_window";
+    } else if (ageDays > commentWithinDays) {
+      status = "react_only";
+      reason = "older_than_comment_window";
+    } else {
+      status = "react_and_comment";
+      reason = "within_comment_window";
+    }
+
+    return {
+      ok: true,
+      action: step.kind,
+      data: {
+        hasPosts,
+        status,
+        reason,
+        ageDays,
+        publishedAtText: scalarString(raw.publishedAtText),
+        publishedAtIso: scalarString(raw.publishedAtIso) || null,
+        commentWithinDays,
+        inactiveAfterDays,
+        shouldSkip: status === "inactive",
+        shouldReact: status !== "inactive",
+        shouldComment: status === "react_and_comment",
+        commentText,
+        latestPost: isPlainObjectValue(raw.latestPost)
+          ? raw.latestPost
+          : {
+            text: "",
+            fullText: "",
+            imageCount: 0,
+            images: [],
+            permalink: null,
+          },
+      },
+    };
+  }
+
+  private async selectLinkedInPostCandidate(
+    targetId: string,
+    step: ScriptStep,
+    context: ExecutionContext = {}
+  ) {
+    const maxAgeDays = boundedPositiveInteger(
+      step.params.maxAgeDays ?? step.params.inactiveAfterDays,
+      180
+    );
+    const commentWithinDays = boundedPositiveInteger(
+      step.params.commentWithinDays ?? step.params.commentMaxAgeDays,
+      14
+    );
+    const lookbackDays = boundedPositiveInteger(step.params.lookbackDays, 3650);
+    const maxScrolls = boundedPositiveInteger(step.params.maxScrolls, 6);
+    const maxCandidatePosts = boundedPositiveInteger(step.params.maxCandidatePosts, 12);
+    const maxImageCount = boundedPositiveInteger(step.params.maxImageCount, 12);
+    const requireUnprocessed = scalarBoolean(step.params.requireUnprocessed, true);
+    const requirePermalink = scalarBoolean(step.params.requirePermalink, true);
+    const treatMissingDateAsIneligible = scalarBoolean(step.params.treatMissingDateAsIneligible, true);
+    const onMissing = scalarString(step.params.onMissing, "end_script");
+    const seenCandidates = new Set<string>();
+
+    for (let scrollAttempt = 0; scrollAttempt <= maxScrolls; scrollAttempt += 1) {
+      const rawResult = await this.evaluate(
+        targetId,
+        `() => {
+          const nowMs = Date.now();
+          const dayMs = 24 * 60 * 60 * 1000;
+          const maxImageCount = ${JSON.stringify(maxImageCount)};
+          const maxCandidatePosts = ${JSON.stringify(maxCandidatePosts)};
+
+          const normalizeText = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
+          const normalizeComparableText = (value) =>
+            normalizeText(value)
+              .toLowerCase()
+              .replace(/\u00a0/g, " ")
+              .replace(/[.,]/g, " ")
+              .replace(/\s+/g, " ")
+              .trim();
+
+          const monthMap = new Map([
+            ["jan", 0], ["january", 0], ["янв", 0], ["январ", 0],
+            ["feb", 1], ["february", 1], ["фев", 1], ["феврал", 1],
+            ["mar", 2], ["march", 2], ["мар", 2], ["март", 2],
+            ["apr", 3], ["april", 3], ["апр", 3], ["апрел", 3],
+            ["may", 4], ["мая", 4], ["май", 4],
+            ["jun", 5], ["june", 5], ["июн", 5], ["июня", 5], ["июнь", 5],
+            ["jul", 6], ["july", 6], ["июл", 6], ["июля", 6], ["июль", 6],
+            ["aug", 7], ["august", 7], ["авг", 7], ["август", 7],
+            ["sep", 8], ["sept", 8], ["september", 8], ["сен", 8], ["сент", 8], ["сентябр", 8],
+            ["oct", 9], ["october", 9], ["окт", 9], ["октябр", 9],
+            ["nov", 10], ["november", 10], ["ноя", 10], ["ноябр", 10],
+            ["dec", 11], ["december", 11], ["дек", 11], ["декабр", 11],
+          ]);
+
+          const parseAbsoluteDate = (input) => {
+            const normalized = normalizeComparableText(input)
+              .replace(/г\.?$/g, "")
+              .replace(/\u00b7/g, " ");
+
+            if (!normalized) {
+              return null;
+            }
+
+            const directParsed = Date.parse(normalized);
+
+            if (Number.isFinite(directParsed)) {
+              return directParsed;
+            }
+
+            const tokens = normalized.split(/\s+/).filter(Boolean);
+            const monthIndex = tokens.findIndex((token) => {
+              for (const key of monthMap.keys()) {
+                if (token.startsWith(key)) {
+                  return true;
+                }
+              }
+
+              return false;
+            });
+
+            if (monthIndex < 0) {
+              return null;
+            }
+
+            const monthToken = tokens[monthIndex];
+            let month = null;
+
+            for (const [key, value] of monthMap.entries()) {
+              if (monthToken.startsWith(key)) {
+                month = value;
+                break;
+              }
+            }
+
+            if (month === null) {
+              return null;
+            }
+
+            const numericTokens = tokens
+              .map((token) => token.replace(/[^0-9]/g, ""))
+              .filter(Boolean)
+              .map((token) => Number(token))
+              .filter((token) => Number.isInteger(token));
+
+            if (numericTokens.length === 0) {
+              return null;
+            }
+
+            const day = numericTokens.find((token) => token >= 1 && token <= 31) ?? null;
+            let year = numericTokens.find((token) => token >= 1900 && token <= 3000) ?? null;
+
+            if (!day) {
+              return null;
+            }
+
+            if (!year) {
+              const currentYear = new Date().getFullYear();
+              year = currentYear;
+              const candidate = new Date(year, month, day).getTime();
+
+              if (candidate > nowMs + dayMs) {
+                year -= 1;
+              }
+            }
+
+            const parsed = new Date(year, month, day).getTime();
+            return Number.isFinite(parsed) ? parsed : null;
+          };
+
+          const parseLinkedInDateText = (input) => {
+            const normalized = normalizeComparableText(input)
+              .replace(/\bago\b/g, "")
+              .replace(/\bназад\b/g, "")
+              .trim();
+
+            if (!normalized) {
+              return null;
+            }
+
+            if (/^(?:now|just now|сейчас|только что)$/i.test(normalized)) {
+              return nowMs;
+            }
+
+            const relativePatterns = [
+              { pattern: /(\d+)\s*(?:m|min|mins|minute|minutes|мин|мин\.)\b/i, multiplierMs: 60 * 1000 },
+              { pattern: /(\d+)\s*(?:h|hr|hrs|hour|hours|ч|час|часа|часов)\b/i, multiplierMs: 60 * 60 * 1000 },
+              { pattern: /(\d+)\s*(?:d|day|days|д|дн|дн\.|дня|дней)\b/i, multiplierMs: dayMs },
+              { pattern: /(\d+)\s*(?:w|wk|wks|week|weeks|нед|нед\.|недели|недель)\b/i, multiplierMs: 7 * dayMs },
+              { pattern: /(\d+)\s*(?:mo|mos|month|months|мес|мес\.|месяц|месяца|месяцев)\b/i, multiplierMs: 30 * dayMs },
+              { pattern: /(\d+)\s*(?:y|yr|yrs|year|years|г|год|года|лет)\b/i, multiplierMs: 365 * dayMs },
+            ];
+
+            for (const entry of relativePatterns) {
+              const match = normalized.match(entry.pattern);
+
+              if (match) {
+                const amount = Number(match[1]);
+
+                if (Number.isFinite(amount)) {
+                  return nowMs - (amount * entry.multiplierMs);
+                }
+              }
+            }
+
+            return parseAbsoluteDate(normalized);
+          };
+
+          const isVisible = (element) => {
+            if (!(element instanceof HTMLElement)) {
+              return false;
+            }
+
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+          };
+
+          const deriveProfileUrl = () => {
+            const segments = window.location.pathname
+              .split("/")
+              .map((segment) => segment.trim())
+              .filter(Boolean);
+
+            if (segments.length >= 2 && (segments[0] === "in" || segments[0] === "creator")) {
+              return window.location.origin + "/" + segments[0] + "/" + segments[1];
+            }
+
+            return "";
+          };
+
+          const articleCandidates = Array.from(
+            document.querySelectorAll("main article, main [role='article'], article, [role='article']")
+          )
+            .filter((element) => element instanceof HTMLElement)
+            .map((element) => element)
+            .filter((element) => isVisible(element))
+            .slice(0, maxCandidatePosts);
+
+          const posts = articleCandidates.map((article, index) => {
+            for (const control of Array.from(article.querySelectorAll("button, a"))) {
+              if (!(control instanceof HTMLElement) || !isVisible(control)) {
+                continue;
+              }
+
+              const label = normalizeComparableText(
+                [control.innerText, control.getAttribute("aria-label") || "", control.getAttribute("title") || ""]
+                  .join(" ")
+              );
+
+              if (/^(?:see more|show more|read more|ещ[её]|показать еще|развернуть)/.test(label)) {
+                control.click();
+              }
+            }
+
+            const dateNode = article.querySelector(
+              "a[href*='/feed/update/'], a[href*='/posts/'], a[href*='/activity/'], time, a[aria-label*='ago']"
+            );
+            const publishedAtText = normalizeText(
+              dateNode instanceof HTMLElement
+                ? dateNode.innerText || dateNode.getAttribute("aria-label") || dateNode.getAttribute("title") || ""
+                : ""
+            );
+            const publishedAtMs = parseLinkedInDateText(publishedAtText);
+            const publishedAtIso = Number.isFinite(publishedAtMs) ? new Date(publishedAtMs).toISOString() : null;
+            const ageDays = Number.isFinite(publishedAtMs)
+              ? Math.max(0, Math.floor((nowMs - publishedAtMs) / dayMs))
+              : null;
+            const images = Array.from(article.querySelectorAll("img"))
+              .filter((node) => node instanceof HTMLImageElement)
+              .map((node) => node)
+              .filter((image) => {
+                const src = normalizeText(image.currentSrc || image.src);
+                const naturalWidth = Number(image.naturalWidth || image.width || 0);
+                const naturalHeight = Number(image.naturalHeight || image.height || 0);
+
+                if (!src || /^data:/i.test(src)) {
+                  return false;
+                }
+
+                if (/profile-displayphoto|ghost-person|company-logo|entity-image/.test(src)) {
+                  return false;
+                }
+
+                return naturalWidth >= 80 && naturalHeight >= 80;
+              })
+              .slice(0, maxImageCount)
+              .map((image) => ({
+                src: normalizeText(image.currentSrc || image.src),
+                alt: normalizeText(image.alt),
+                width: Number(image.naturalWidth || image.width || 0),
+                height: Number(image.naturalHeight || image.height || 0),
+              }));
+            const articleText = normalizeText(article.innerText);
+            const permalink =
+              dateNode instanceof HTMLAnchorElement && dateNode.href
+                ? normalizeText(dateNode.href)
+                : "";
+
+            return {
+              postIndex: index + 1,
+              text: articleText,
+              fullText: articleText,
+              textPreview: articleText.slice(0, 280),
+              imageCount: images.length,
+              images,
+              permalink,
+              publishedAtText,
+              publishedAtIso,
+              ageDays,
+            };
+          });
+
+          return {
+            pageUrl: window.location.href,
+            profileUrl: deriveProfileUrl(),
+            posts,
+          };
+        }`,
+        context
+      );
+
+      const payload = isPlainObjectValue(rawResult) ? rawResult : {};
+      const pageUrl = scalarString(payload.pageUrl);
+      const profileUrl = normalizeLinkedInProfileUrl(payload.profileUrl) || normalizeLinkedInProfileUrl(pageUrl);
+      const posts = Array.isArray(payload.posts)
+        ? payload.posts.filter((entry) => isPlainObjectValue(entry))
+        : [];
+
+      for (const post of posts) {
+        const postUrl = normalizeLinkedInPostUrl(post.permalink);
+        const publishedAtIso = scalarString(post.publishedAtIso) || null;
+        const textPreview = scalarString(post.textPreview);
+        const candidateKey = postUrl || `${publishedAtIso || "no-date"}:${textPreview.slice(0, 120)}`;
+
+        if (seenCandidates.has(candidateKey)) {
+          continue;
+        }
+
+        seenCandidates.add(candidateKey);
+
+        const ageDays = typeof post.ageDays === "number" && Number.isFinite(post.ageDays)
+          ? post.ageDays
+          : null;
+
+        if (ageDays === null && treatMissingDateAsIneligible) {
+          continue;
+        }
+
+        if (ageDays !== null && ageDays > maxAgeDays) {
+          continue;
+        }
+
+        if (requirePermalink && !postUrl) {
+          continue;
+        }
+
+        let recentlyProcessed = false;
+        let latestProcessedAt: string | null = null;
+
+        if (requireUnprocessed && postUrl) {
+          const lookup = await this.fetchRecentProcessedPost(postUrl, lookbackDays, context);
+          recentlyProcessed = lookup.recentlyProcessed === true;
+          latestProcessedAt = scalarString(lookup.latestProcessedAt) || null;
+
+          appendTaskLog(context.taskId, `POST_HISTORY_CHECK ${JSON.stringify({
+            taskId: context.taskId ?? null,
+            checkedAt: new Date().toISOString(),
+            postUrl,
+            lookbackDays,
+            recentlyProcessed,
+            latestProcessedAt,
+          })}`);
+
+          if (recentlyProcessed) {
+            continue;
+          }
+        }
+
+        const selectedPost = {
+          postIndex:
+            typeof post.postIndex === "number" && Number.isFinite(post.postIndex) && post.postIndex > 0
+              ? Math.floor(post.postIndex)
+              : 1,
+          postUrl,
+          profileUrl,
+          pageUrl,
+          ageDays,
+          publishedAtIso,
+          publishedAtText: scalarString(post.publishedAtText),
+          text: scalarString(post.text),
+          fullText: scalarString(post.fullText, scalarString(post.text)),
+          imageCount:
+            typeof post.imageCount === "number" && Number.isFinite(post.imageCount)
+              ? Math.floor(post.imageCount)
+              : 0,
+          images: Array.isArray(post.images)
+            ? post.images.filter((entry) => isPlainObjectValue(entry))
+            : [],
+          shouldComment: ageDays !== null && ageDays <= commentWithinDays,
+        } satisfies SelectedPostState;
+
+        this.setSelectedPost(context, selectedPost);
+
+        return {
+          ok: true,
+          action: step.kind,
+          data: {
+            ...selectedPost,
+            lookbackDays,
+            maxAgeDays,
+            commentWithinDays,
+            recentlyProcessed,
+            latestProcessedAt,
+            shouldReact: true,
+          },
+        };
+      }
+
+      if (scrollAttempt >= maxScrolls) {
+        break;
+      }
+
+      const nextScroll = await this.scrollPageOrPostContainer(
+        targetId,
+        { behavior: "auto", direction: "down" },
+        context
+      );
+
+      if (!nextScroll.moved) {
+        break;
+      }
+
+      await sleep(250);
+    }
+
+    this.setSelectedPost(context, null);
+
+    return {
+      ok: true,
+      action: step.kind,
+      exhausted: true,
+      branchAction: onMissing === "end_script" ? "end_script" : null,
+      reason: `No LinkedIn post matched the age and processing-history filters within ${maxAgeDays} days.`,
+      data: null,
+    } satisfies ControlFlowStepResult & { data: null };
+  }
+
+  private async generateComment(step: ScriptStep, context: ExecutionContext = {}) {
+    const sourceValue = "fromKey" in step.params
+      ? this.getRuntimeValue(context, step.params.fromKey)
+      : null;
+    const selectedPost = isPlainObjectValue(sourceValue)
+      ? sourceValue
+      : this.getSelectedPost(context);
+    const postText = scalarString(
+      isPlainObjectValue(selectedPost) ? selectedPost.fullText ?? selectedPost.text : ""
+    );
+    const postUrl = normalizeLinkedInPostUrl(
+      isPlainObjectValue(selectedPost) ? selectedPost.postUrl ?? selectedPost.permalink : ""
+    );
+    const fallbackText = scalarString(step.params.fallbackText, scalarString(step.params.commentText));
+
+    if (!postText && !fallbackText) {
+      throw new Error("No selected post content is available for comment generation.");
+    }
+
+    const client = this.getOpenAiClient();
+
+    if (!client) {
+      if (fallbackText) {
+        return {
+          ok: true,
+          action: step.kind,
+          data: fallbackText,
+          source: "fallback",
+          postUrl,
+        };
+      }
+
+      throw new Error("OpenAI API access is required to generate a relevant comment.");
+    }
+
+    const maxChars = Math.max(40, Math.min(500, scalarNumber(step.params.maxChars, 220)));
+    const tone = scalarString(step.params.tone, "professional and human");
+    const extraInstructions = scalarString(
+      step.params.instructions,
+      "Write a concise LinkedIn comment that is specific to the post, natural, and does not sound automated. Avoid emojis unless the post clearly invites them."
+    );
+
+    const completion = await client.chat.completions.create({
+      model: this.aiModel,
+      temperature: 0.6,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "You write short LinkedIn comments for outreach automation.",
+            "Keep the comment specific to the post content, concise, and credible.",
+            "Do not mention automation, AI, or templates.",
+            "Do not use hashtags.",
+            `Stay under ${maxChars} characters.`,
+          ].join(" "),
+        },
+        {
+          role: "user",
+          content: JSON.stringify({
+            task: "write_linkedin_comment",
+            tone,
+            instructions: extraInstructions,
+            postUrl: postUrl || null,
+            postText,
+            selectedPost,
+          }),
+        },
+      ],
+    });
+
+    const generatedComment = scalarString(completion.choices[0]?.message?.content)
+      .replace(/\s+/g, " ")
+      .trim();
+    const commentText = (generatedComment || fallbackText).slice(0, maxChars).trim();
+
+    if (!commentText) {
+      throw new Error("Comment generation returned an empty response.");
+    }
+
+    return {
+      ok: true,
+      action: step.kind,
+      data: commentText,
+      source: generatedComment ? "openai" : "fallback",
+      postUrl,
     };
   }
 
@@ -2591,6 +3857,225 @@ export class OpenClawRuntime {
       return await this.assertDocumentVisible(targetId, step, context);
     }
 
+    if (step.kind === "go_back") {
+      this.setSelectedPost(context, null);
+      const beforePage = await this.getPageState(targetId, context);
+      await this.evaluate(targetId, `() => { window.history.back(); return true; }`, context);
+      await sleep(250);
+      return {
+        ok: true,
+        action: step.kind,
+        beforePage,
+        afterPage: await this.getPageState(targetId, context),
+      };
+    }
+
+    if (step.kind === "set_runtime_value") {
+      const key = normalizeRuntimeKey(step.params.key);
+
+      if (!key) {
+        throw new Error(`Step ${step.order} is missing params.key for runtime state assignment.`);
+      }
+
+      const value = "fromKey" in step.params
+        ? this.getRuntimeValue(context, step.params.fromKey)
+        : ("value" in step.params ? step.params.value : null);
+
+      this.setRuntimeValue(context, key, value);
+      return { ok: true, action: step.kind, key, value };
+    }
+
+    if (step.kind === "increment_runtime_value") {
+      const key = normalizeRuntimeKey(step.params.key);
+
+      if (!key) {
+        throw new Error(`Step ${step.order} is missing params.key for runtime increment.`);
+      }
+
+      const currentValue = this.getRuntimeValue(context, key);
+      const startingValue = Number.isFinite(step.params.initialValue)
+        ? Number(step.params.initialValue)
+        : 0;
+      const amount = Number.isFinite(step.params.amount) ? Number(step.params.amount) : 1;
+      const numericCurrentValue = typeof currentValue === "number" && Number.isFinite(currentValue)
+        ? currentValue
+        : startingValue;
+      const nextValue = numericCurrentValue + amount;
+
+      this.setRuntimeValue(context, key, nextValue);
+      return {
+        ok: true,
+        action: step.kind,
+        key,
+        previousValue: numericCurrentValue,
+        amount,
+        value: nextValue,
+      };
+    }
+
+    if (step.kind === "generate_comment") {
+      return await this.generateComment(step, context);
+    }
+
+    if (step.kind === "branch_if_runtime_value") {
+      const key = normalizeRuntimeKey(step.params.key);
+
+      if (!key) {
+        throw new Error(`Step ${step.order} is missing params.key for runtime branching.`);
+      }
+
+      const conditionMet = this.evaluateRuntimeValueCondition(step, context);
+      const configuredAction = scalarString(
+        step.params.onMatch,
+        Number.isFinite(step.params.jumpToOrder) ? "jump" : ""
+      );
+      const jumpToOrder = Number.isFinite(step.params.jumpToOrder)
+        ? Math.floor(Number(step.params.jumpToOrder))
+        : null;
+
+      return {
+        ok: true,
+        action: step.kind,
+        branchAction:
+          conditionMet && configuredAction === "jump" && jumpToOrder
+            ? "jump"
+            : conditionMet && configuredAction === "end_script"
+              ? "end_script"
+              : conditionMet && configuredAction === "alert"
+                ? "alert"
+                : null,
+        conditionMet,
+        jumpToOrder,
+        reason: conditionMet ? scalarString(step.params.reason) || undefined : undefined,
+      } satisfies ControlFlowStepResult;
+    }
+
+    if (step.kind === "jump") {
+      const jumpToOrder = Number.isFinite(step.params.jumpToOrder)
+        ? Math.floor(Number(step.params.jumpToOrder))
+        : 0;
+
+      if (jumpToOrder <= 0) {
+        throw new Error(`Step ${step.order} is missing params.jumpToOrder for jump control flow.`);
+      }
+
+      return {
+        ok: true,
+        action: step.kind,
+        branchAction: "jump",
+        jumpToOrder,
+        reason: scalarString(step.params.reason) || undefined,
+      } satisfies ControlFlowStepResult;
+    }
+
+    if (step.kind === "return_to_profile_source") {
+      const runtimeState = this.getRuntimeState(context);
+      const sourcePageUrl = runtimeState.profileCardSelection?.sourcePageUrl || "";
+
+      if (!sourcePageUrl) {
+        throw new Error("No profile source page is available for return_to_profile_source.");
+      }
+
+      const pageState = await this.getPageState(targetId, context);
+      const currentProfileUrl = normalizeLinkedInProfileUrl(pageState.url) || scalarString(pageState.url);
+      const returnedPage = await this.navigateBackToProfileSourcePage(
+        targetId,
+        currentProfileUrl,
+        sourcePageUrl,
+        step.timeoutMs,
+        context
+      );
+      this.setSelectedPost(context, null);
+
+      return {
+        ok: true,
+        action: step.kind,
+        sourcePageUrl,
+        currentProfileUrl,
+        returnedPage,
+      };
+    }
+
+    if (step.kind === "open_next_profile_candidate") {
+      const nextCandidate = await this.openNextProfileCandidate(targetId, step.timeoutMs, context);
+      const onMissing = scalarString(step.params.onMissing, "end_script");
+      this.setSelectedPost(context, null);
+
+      if (!nextCandidate) {
+        return {
+          ok: true,
+          action: step.kind,
+          exhausted: true,
+          branchAction: onMissing === "end_script" ? "end_script" : null,
+          reason: onMissing === "end_script" ? "No additional profile candidates were available." : undefined,
+        } satisfies ControlFlowStepResult;
+      }
+
+      return {
+        ok: true,
+        action: step.kind,
+        exhausted: false,
+        branchAction: null,
+        matched: nextCandidate.resolved,
+        nextIndex: nextCandidate.nextIndex,
+      };
+    }
+
+    if (step.kind === "log_runtime_value") {
+      const key = normalizeRuntimeKey(step.params.key);
+      const label = scalarString(step.params.label, key || step.instruction || "runtime_log");
+      const value = key
+        ? this.getRuntimeValue(context, key)
+        : ("value" in step.params ? step.params.value : null);
+      const entry = this.appendRuntimeLog(context, step, label, value);
+
+      return {
+        ok: true,
+        action: step.kind,
+        log: entry,
+      };
+    }
+
+    if (step.kind === "log_processed_post") {
+      const sourceValue = "fromKey" in step.params
+        ? this.getRuntimeValue(context, step.params.fromKey)
+        : this.getSelectedPost(context);
+
+      if (!isPlainObjectValue(sourceValue)) {
+        throw new Error(`Step ${step.order} could not determine which post to log as processed.`);
+      }
+
+      const processedPost = this.recordProcessedPost(context, {
+        postUrl: scalarString(sourceValue.postUrl, scalarString(sourceValue.permalink)),
+        profileUrl: scalarString(sourceValue.profileUrl),
+        ageDays:
+          typeof sourceValue.ageDays === "number" && Number.isFinite(sourceValue.ageDays)
+            ? sourceValue.ageDays
+            : null,
+        publishedAtIso: scalarString(sourceValue.publishedAtIso) || null,
+        publishedAtText: scalarString(sourceValue.publishedAtText),
+        textPreview: scalarString(sourceValue.textPreview, scalarString(sourceValue.text, scalarString(sourceValue.fullText))),
+      });
+
+      if (!processedPost) {
+        throw new Error(`Step ${step.order} is missing a LinkedIn post URL to persist.`);
+      }
+
+      const entry = this.appendRuntimeLog(
+        context,
+        step,
+        scalarString(step.params.label, "processed_post"),
+        processedPost
+      );
+
+      return {
+        ok: true,
+        action: step.kind,
+        processedPost,
+        log: entry,
+      };
+    }
+
     if (step.kind === "press_key") {
       const key = scalarString(step.params.key, scalarString(step.target?.text, "Enter"));
       await this.oc(["press", key, "--target-id", targetId], context);
@@ -2613,13 +4098,45 @@ export class OpenClawRuntime {
       return { ok: true, action: step.kind, matched: resolved, movement };
     }
 
+    if (step.kind === "focus") {
+      const resolved = await this.resolveSnapshotRef(targetId, step, context);
+      const focusState = await this.evaluateRef(
+        targetId,
+        resolved.ref,
+        `(el) => {
+          if (!(el instanceof HTMLElement)) {
+            return { focused: false, tagName: null };
+          }
+
+          if (!el.hasAttribute("tabindex")) {
+            el.setAttribute("tabindex", "-1");
+          }
+
+          el.focus({ preventScroll: true });
+
+          return {
+            focused: document.activeElement === el,
+            tagName: el.tagName.toLowerCase(),
+          };
+        }`,
+        context
+      );
+
+      return { ok: true, action: step.kind, matched: resolved, focusState };
+    }
+
     if (step.kind === "scroll") {
       return await this.performScrollStep(targetId, step, context);
     }
 
     if (step.kind === "type") {
       const resolved = await this.resolveSnapshotRef(targetId, step, context);
-      const text = scalarString(step.params.text, scalarString(step.params.value, scalarString(step.target?.text)));
+      const runtimeText = "fromKey" in step.params
+        ? this.getRuntimeValue(context, step.params.fromKey)
+        : undefined;
+      const text = typeof runtimeText === "string"
+        ? runtimeText
+        : scalarString(step.params.text, scalarString(step.params.value, scalarString(step.target?.text)));
 
       if (!text) {
         throw new Error(`Step ${step.order} is missing text to type.`);
@@ -2711,6 +4228,10 @@ export class OpenClawRuntime {
       return await this.skipIfProfileRecentlyVisited(targetId, step, context);
     }
 
+    if (step.kind === "select_linkedin_post_candidate") {
+      return await this.selectLinkedInPostCandidate(targetId, step, context);
+    }
+
     if (step.kind === "branch_if_missing") {
       const onMissing = scalarString(step.params.onMissing);
 
@@ -2723,7 +4244,7 @@ export class OpenClawRuntime {
           branchAction: null,
           conditionMet: false,
           matched: resolved,
-        } satisfies BranchStepResult;
+        } satisfies ControlFlowStepResult;
       } catch (error) {
         if (!(error instanceof SnapshotRefNotFoundError)) {
           throw error;
@@ -2737,7 +4258,7 @@ export class OpenClawRuntime {
           reason: onMissing === "end_script"
             ? `Target was missing for branch step ${step.order}.`
             : undefined,
-        } satisfies BranchStepResult;
+        } satisfies ControlFlowStepResult;
       }
     }
 
@@ -2760,7 +4281,7 @@ export class OpenClawRuntime {
               ? `Target became visible for branch step ${step.order}.`
               : undefined,
           matched: resolved,
-        } satisfies BranchStepResult;
+        } satisfies ControlFlowStepResult;
       } catch (error) {
         if (!(error instanceof SnapshotRefNotFoundError)) {
           throw error;
@@ -2771,7 +4292,7 @@ export class OpenClawRuntime {
           action: step.kind,
           branchAction: null,
           conditionMet: false,
-        } satisfies BranchStepResult;
+        } satisfies ControlFlowStepResult;
       }
     }
 
@@ -2782,6 +4303,10 @@ export class OpenClawRuntime {
 
     if (step.kind === "extract_text") {
       return await this.extractText(targetId, step, context);
+    }
+
+    if (step.kind === "inspect_linkedin_latest_post") {
+      return await this.inspectLinkedInLatestPost(targetId, step, context);
     }
 
     if (step.kind === "custom") {
@@ -2848,7 +4373,13 @@ export class OpenClawRuntime {
   }
 
   private async runScript(script: ScriptInstructions, options: ExecuteScriptOptions = {}) {
-    const { targetId, taskId, engineMode = "deterministic", profileVisitLookupUrlTemplate } = options;
+    const {
+      targetId,
+      taskId,
+      engineMode = "deterministic",
+      profileVisitLookupUrlTemplate,
+      postHistoryLookupUrlTemplate,
+    } = options;
     const engineStats: ExecutionEngineStats = {
       aiSelections: 0,
       deterministicSelections: 0,
@@ -2857,7 +4388,11 @@ export class OpenClawRuntime {
     };
     const runtimeState: RuntimeState = {
       visitedProfiles: new Map<string, VisitedProfileRecord>(),
+      processedPosts: new Map<string, ProcessedPostRecord>(),
       profileCardSelection: null,
+      selectedPost: null,
+      values: new Map<string, unknown>(),
+      runtimeLogs: [],
     };
     initializeTaskLog(taskId, {
       taskId: taskId ?? null,
@@ -2872,20 +4407,50 @@ export class OpenClawRuntime {
     const activeTargetId = targetId || (await this.getFocusedTab({ taskId })).id;
     const startedAt = new Date().toISOString();
     const stepResults: StepExecutionRecord[] = [];
+    const sortedSteps = [...script.steps].sort((left, right) => left.order - right.order);
+    const stepIndexByOrder = new Map(sortedSteps.map((step, index) => [step.order, index]));
+    const maxExecutedSteps = Math.max(250, sortedSteps.length * 50);
     let endedEarly = false;
     let alert: AlertStopResult | null = null;
     let earlyExit: EarlyExitResult | null = null;
+    let currentStepIndex = 0;
+    let executedStepCount = 0;
 
-    for (const step of [...script.steps].sort((left, right) => left.order - right.order)) {
+    while (currentStepIndex < sortedSteps.length) {
+      if (executedStepCount >= maxExecutedSteps) {
+        throw new Error(`Script exceeded the maximum executed step limit of ${maxExecutedSteps}.`);
+      }
+
+      const step = sortedSteps[currentStepIndex];
+      executedStepCount += 1;
+
       try {
         const stepResult = await this.runStep(activeTargetId, step, {
           taskId,
           engineMode,
           engineStats,
           profileVisitLookupUrlTemplate,
+          postHistoryLookupUrlTemplate,
           runtimeState,
         });
         stepResults.push(stepResult);
+
+        const outputKey = normalizeRuntimeKey(step.params.outputKey);
+
+        if (outputKey) {
+          this.setRuntimeValue(
+            {
+              taskId,
+              engineMode,
+              engineStats,
+              profileVisitLookupUrlTemplate,
+              postHistoryLookupUrlTemplate,
+              runtimeState,
+            },
+            outputKey,
+            selectRuntimeOutputValue(stepResult.output)
+          );
+        }
 
         const branchAction =
           typeof stepResult.output === "object" &&
@@ -2893,6 +4458,14 @@ export class OpenClawRuntime {
             "branchAction" in stepResult.output
             ? scalarString((stepResult.output as { branchAction?: unknown }).branchAction)
             : "";
+        const jumpToOrder =
+          typeof stepResult.output === "object" &&
+            stepResult.output !== null &&
+            "jumpToOrder" in stepResult.output &&
+            Number.isFinite((stepResult.output as { jumpToOrder?: unknown }).jumpToOrder)
+            ? Math.floor(Number((stepResult.output as { jumpToOrder?: unknown }).jumpToOrder))
+            : 0;
+        let nextStepIndex = currentStepIndex + 1;
 
         if (branchAction === "alert") {
           alert = {
@@ -2946,11 +4519,33 @@ export class OpenClawRuntime {
           break;
         }
 
+        if (branchAction === "jump") {
+          const resolvedJumpIndex = stepIndexByOrder.get(jumpToOrder);
+
+          if (resolvedJumpIndex === undefined) {
+            throw new Error(`Jump target order ${jumpToOrder} does not exist in this script.`);
+          }
+
+          nextStepIndex = resolvedJumpIndex;
+          appendTaskLog(taskId, `TASK_BRANCH_JUMP ${JSON.stringify({
+            taskId: taskId ?? null,
+            jumpedAt: new Date().toISOString(),
+            step: {
+              order: step.order,
+              kind: step.kind,
+              instruction: step.instruction,
+            },
+            jumpToOrder,
+          })}`);
+        }
+
         const delayMs = Math.max(0, step.delayAfterMs || script.defaultDelayMs || 0);
 
         if (delayMs > 0) {
           await sleep(delayMs);
         }
+
+        currentStepIndex = nextStepIndex;
       } catch (error) {
         appendTaskLog(taskId, `TASK_ERROR ${JSON.stringify({
           taskId: taskId ?? null,
@@ -2990,6 +4585,11 @@ export class OpenClawRuntime {
       alerted: Boolean(alert),
       alert,
       visitedProfiles: [...runtimeState.visitedProfiles.values()],
+      processedPosts: [...runtimeState.processedPosts.values()],
+      runtime: {
+        values: Object.fromEntries(runtimeState.values.entries()),
+        logs: runtimeState.runtimeLogs,
+      },
       currentPage: await this.getPageState(activeTargetId, { taskId, engineMode, engineStats }),
       steps: stepResults,
     };

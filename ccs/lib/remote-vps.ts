@@ -43,6 +43,16 @@ interface NormalizedVisitedProfile {
   visitedAt: Date;
 }
 
+interface NormalizedProcessedPost {
+  postUrl: string;
+  profileUrl: string;
+  processedAt: Date;
+  ageDays: number | null;
+  publishedAtIso: Date | null;
+  publishedAtText: string;
+  textPreview: string;
+}
+
 function normalizeLinkedInProfileKey(value: unknown) {
   const raw = safeString(value);
 
@@ -54,7 +64,7 @@ function normalizeLinkedInProfileKey(value: unknown) {
     const parsed = new URL(raw);
     const hostname = parsed.hostname.toLowerCase();
 
-    if (!hostname.endsWith("linkedin.com")) {
+    if (hostname !== "linkedin.com" && !hostname.endsWith(".linkedin.com")) {
       return "";
     }
 
@@ -82,6 +92,33 @@ function normalizeLinkedInProfileKey(value: unknown) {
 function normalizeLinkedInProfileUrl(value: unknown) {
   const profileKey = normalizeLinkedInProfileKey(value);
   return profileKey ? `https://www.linkedin.com${profileKey}` : "";
+}
+
+function normalizeLinkedInPostUrl(value: unknown) {
+  const raw = safeString(value);
+
+  if (!raw) {
+    return "";
+  }
+
+  try {
+    const parsed = new URL(raw, "https://www.linkedin.com");
+    const hostname = parsed.hostname.toLowerCase();
+
+    if (hostname !== "linkedin.com" && !hostname.endsWith(".linkedin.com")) {
+      return "";
+    }
+
+    const pathname = parsed.pathname.replace(/\/+$/g, "") || "/";
+
+    if (!/(?:\/feed\/update\/|\/posts\/|\/activity\/)/i.test(pathname)) {
+      return "";
+    }
+
+    return `https://www.linkedin.com${pathname}`;
+  } catch {
+    return "";
+  }
 }
 
 function extractVisitedProfilesFromResultPayload(payload: unknown) {
@@ -118,6 +155,53 @@ function extractVisitedProfilesFromResultPayload(payload: unknown) {
   }, []);
 
   return visitedProfiles;
+}
+
+function extractProcessedPostsFromResultPayload(payload: unknown) {
+  if (!isPlainObject(payload) || !isPlainObject(payload.result) || !Array.isArray(payload.result.processedPosts)) {
+    return [] as NormalizedProcessedPost[];
+  }
+
+  const processedPosts = payload.result.processedPosts.reduce<NormalizedProcessedPost[]>((accumulator, entry) => {
+    if (!isPlainObject(entry)) {
+      return accumulator;
+    }
+
+    const postUrl = normalizeLinkedInPostUrl(entry.postUrl);
+
+    if (!postUrl || accumulator.some((item) => item.postUrl === postUrl)) {
+      return accumulator;
+    }
+
+    const profileUrl = normalizeLinkedInProfileUrl(entry.profileUrl);
+    const processedAtValue = entry.processedAt instanceof Date ? entry.processedAt : new Date(entry.processedAt as string);
+    const processedAt = Number.isNaN(processedAtValue.getTime()) ? new Date() : processedAtValue;
+    const publishedAtIsoValue = entry.publishedAtIso instanceof Date
+      ? entry.publishedAtIso
+      : entry.publishedAtIso
+        ? new Date(entry.publishedAtIso as string)
+        : null;
+
+    accumulator.push({
+      postUrl,
+      profileUrl,
+      processedAt,
+      ageDays:
+        typeof entry.ageDays === "number" && Number.isFinite(entry.ageDays)
+          ? entry.ageDays
+          : null,
+      publishedAtIso:
+        publishedAtIsoValue && !Number.isNaN(publishedAtIsoValue.getTime())
+          ? publishedAtIsoValue
+          : null,
+      publishedAtText: safeString(entry.publishedAtText),
+      textPreview: safeString(entry.textPreview),
+    });
+
+    return accumulator;
+  }, []);
+
+  return processedPosts;
 }
 
 function normalizeScriptExecutionResult(value: unknown): ScriptExecutionResult | null {
@@ -882,6 +966,7 @@ function buildScriptResultLogDocument(options: {
   taskLogText: string;
 }) {
   const visitedProfiles = extractVisitedProfilesFromResultPayload(options.responsePayload);
+  const processedPosts = extractProcessedPostsFromResultPayload(options.responsePayload);
   const notCompletedDetails = getControllerTaskNotCompletedDetails({
     payload: options.responsePayload,
     taskLogText: options.taskLogText,
@@ -912,6 +997,8 @@ function buildScriptResultLogDocument(options: {
     taskLogText: options.taskLogText,
     visitedProfiles,
     visitedProfileKeys: visitedProfiles.map((entry) => entry.profileKey),
+    processedPosts,
+    processedPostUrls: processedPosts.map((entry) => entry.postUrl),
     errorCode:
       getControllerTaskResultState(options.responsePayload).alerted
         ? "TASK_ALERT"
@@ -1129,6 +1216,47 @@ export async function findRecentProfileVisit(options: {
     lookbackDays,
     recentlyVisited: Boolean(item),
     latestVisitedAt,
+  };
+}
+
+export async function findRecentProcessedPost(options: {
+  postUrl: string;
+  lookbackDays: number;
+}) {
+  const postUrl = normalizeLinkedInPostUrl(options.postUrl);
+
+  if (!postUrl) {
+    return {
+      postUrl: "",
+      lookbackDays: options.lookbackDays,
+      recentlyProcessed: false,
+      latestProcessedAt: null,
+    };
+  }
+
+  const lookbackDays = Math.max(1, Math.floor(options.lookbackDays || 3650));
+  const cutoff = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000);
+  const item = await RemoteVpsInteractionLogModel.findOne({
+    interactionType: "script_result",
+    processedPostUrls: postUrl,
+    createdAt: { $gte: cutoff },
+  })
+    .sort({ createdAt: -1 })
+    .select({ createdAt: 1, processedPosts: 1 })
+    .lean();
+
+  const matchedProcessedAt = Array.isArray(item?.processedPosts)
+    ? item.processedPosts.find((entry) => isPlainObject(entry) && safeString(entry.postUrl) === postUrl)
+    : null;
+  const latestProcessedAt = matchedProcessedAt && isPlainObject(matchedProcessedAt)
+    ? toNullableIsoResult("createdAt", matchedProcessedAt.processedAt as Date | string | null | undefined).value
+    : toNullableIsoResult("createdAt", item?.createdAt as Date | string | null | undefined).value;
+
+  return {
+    postUrl,
+    lookbackDays,
+    recentlyProcessed: Boolean(item),
+    latestProcessedAt,
   };
 }
 
@@ -1847,6 +1975,7 @@ export async function dispatchExecuteScriptCommand(options: {
   };
   taskResultWebhookUrlTemplate?: string;
   profileVisitLookupUrlTemplate?: string;
+  postHistoryLookupUrlTemplate?: string;
   initiatedByUserId: string;
 }) {
   if (options.vps.status === "alert") {
@@ -1886,12 +2015,16 @@ export async function dispatchExecuteScriptCommand(options: {
         }
         : undefined,
       script: structuredInstructions,
-      callback: options.taskResultWebhookUrlTemplate || options.profileVisitLookupUrlTemplate
-        ? {
-          taskResultWebhookUrlTemplate: options.taskResultWebhookUrlTemplate,
-          profileVisitLookupUrlTemplate: options.profileVisitLookupUrlTemplate,
-        }
-        : undefined,
+      callback:
+        options.taskResultWebhookUrlTemplate ||
+          options.profileVisitLookupUrlTemplate ||
+          options.postHistoryLookupUrlTemplate
+          ? {
+            taskResultWebhookUrlTemplate: options.taskResultWebhookUrlTemplate,
+            profileVisitLookupUrlTemplate: options.profileVisitLookupUrlTemplate,
+            postHistoryLookupUrlTemplate: options.postHistoryLookupUrlTemplate,
+          }
+          : undefined,
     },
     initiatedByUserId: options.initiatedByUserId,
   });

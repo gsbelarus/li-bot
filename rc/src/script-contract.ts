@@ -1,9 +1,15 @@
 export const scriptActionKinds = [
   "navigate",
+  "go_back",
   "click",
+  "focus",
+  "set_runtime_value",
+  "increment_runtime_value",
   "skip_if_profile_recently_visited",
   "branch_if_missing",
   "branch_if_visible",
+  "branch_if_runtime_value",
+  "jump",
   "hover",
   "wait",
   "wait_for_page",
@@ -12,7 +18,14 @@ export const scriptActionKinds = [
   "type",
   "press_key",
   "extract_text",
+  "inspect_linkedin_latest_post",
+  "select_linkedin_post_candidate",
+  "generate_comment",
   "assert_visible",
+  "return_to_profile_source",
+  "open_next_profile_candidate",
+  "log_runtime_value",
+  "log_processed_post",
   "custom",
 ] as const;
 
@@ -52,6 +65,7 @@ export type ExecutionEngineMode = (typeof executionEngineModes)[number];
 export interface ExecuteScriptCallbackConfig {
   taskResultWebhookUrlTemplate: string;
   profileVisitLookupUrlTemplate?: string;
+  postHistoryLookupUrlTemplate?: string;
 }
 
 export interface MouseActivityConfig {
@@ -124,14 +138,16 @@ function normalizeCallbackConfig(value: unknown): ExecuteScriptCallbackConfig | 
 
   const taskResultWebhookUrlTemplate = safeString(value.taskResultWebhookUrlTemplate);
   const profileVisitLookupUrlTemplate = safeString(value.profileVisitLookupUrlTemplate);
+  const postHistoryLookupUrlTemplate = safeString(value.postHistoryLookupUrlTemplate);
 
-  if (!taskResultWebhookUrlTemplate && !profileVisitLookupUrlTemplate) {
+  if (!taskResultWebhookUrlTemplate && !profileVisitLookupUrlTemplate && !postHistoryLookupUrlTemplate) {
     return undefined;
   }
 
   return {
     taskResultWebhookUrlTemplate,
     profileVisitLookupUrlTemplate: profileVisitLookupUrlTemplate || undefined,
+    postHistoryLookupUrlTemplate: postHistoryLookupUrlTemplate || undefined,
   };
 }
 
@@ -158,10 +174,22 @@ function normalizeStep(value: unknown, index: number): ScriptStep {
   const kind = safeString(source.kind, "custom") as ScriptActionKind;
   const fallbackDelayAfterMs =
     kind === "navigate" ||
+      kind === "go_back" ||
+      kind === "set_runtime_value" ||
+      kind === "increment_runtime_value" ||
       kind === "wait" ||
       kind === "wait_for_page" ||
+      kind === "branch_if_runtime_value" ||
+      kind === "jump" ||
+      kind === "inspect_linkedin_latest_post" ||
+      kind === "select_linkedin_post_candidate" ||
+      kind === "generate_comment" ||
       kind === "branch_if_missing" ||
-      kind === "branch_if_visible"
+      kind === "branch_if_visible" ||
+      kind === "return_to_profile_source" ||
+      kind === "open_next_profile_candidate" ||
+      kind === "log_runtime_value" ||
+      kind === "log_processed_post"
       ? 0
       : 1000;
   const params = isPlainObject(source.params)

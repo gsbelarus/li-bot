@@ -75,6 +75,47 @@ const visitedProfileSchema = new Schema(
   }
 );
 
+const processedPostSchema = new Schema(
+  {
+    postUrl: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    profileUrl: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    processedAt: {
+      type: Date,
+      required: true,
+    },
+    ageDays: {
+      type: Number,
+      default: null,
+    },
+    publishedAtIso: {
+      type: Date,
+      default: null,
+    },
+    publishedAtText: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    textPreview: {
+      type: String,
+      default: "",
+    },
+  },
+  {
+    _id: false,
+    id: false,
+    versionKey: false,
+  }
+);
+
 const remoteVpsInteractionLogSchema = new Schema(
   {
     vpsId: {
@@ -176,6 +217,14 @@ const remoteVpsInteractionLogSchema = new Schema(
       type: [String],
       default: [],
     },
+    processedPosts: {
+      type: [processedPostSchema],
+      default: [],
+    },
+    processedPostUrls: {
+      type: [String],
+      default: [],
+    },
     createdAt: {
       type: Date,
       default: () => new Date(),
@@ -193,6 +242,8 @@ remoteVpsInteractionLogSchema.index({ correlationId: 1 });
 remoteVpsInteractionLogSchema.index({ vpsId: 1, result: 1, interactionType: 1, createdAt: -1 });
 remoteVpsInteractionLogSchema.index({ visitedProfileKeys: 1, createdAt: -1 });
 remoteVpsInteractionLogSchema.index({ vpsId: 1, visitedProfileKeys: 1, createdAt: -1 });
+remoteVpsInteractionLogSchema.index({ processedPostUrls: 1, createdAt: -1 });
+remoteVpsInteractionLogSchema.index({ vpsId: 1, processedPostUrls: 1, createdAt: -1 });
 remoteVpsInteractionLogSchema.index({ createdAt: 1 }, { expireAfterSeconds: 60 * 60 * 24 * 180 });
 
 export type RemoteVpsInteractionLogDocument = InferSchemaType<
