@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import { DatabaseConnectionError, connectToDatabase } from "@/lib/mongodb";
+import { scriptExecutionResultOptions } from "@/lib/remote-vps-shared";
 import {
   DuplicateVpsError,
   PayloadValidationError,
@@ -10,6 +11,7 @@ import {
   serializeVps,
   validateVpsPayload,
 } from "@/lib/remote-vps";
+import RemoteVpsInteractionLogModel from "@/models/RemoteVpsInteractionLog";
 import RemoteVpsModel from "@/models/RemoteVps";
 
 export const runtime = "nodejs";
@@ -19,7 +21,42 @@ export async function GET(request: NextRequest) {
   try {
     await connectToDatabase();
 
-    const { filter, page, pageSize, sort } = getListQuery(request.nextUrl.searchParams);
+    const { filter, page, pageSize, sort, lastScriptExecutionResult } = getListQuery(request.nextUrl.searchParams);
+
+    if (lastScriptExecutionResult) {
+      const matchingLatestScriptResults = await RemoteVpsInteractionLogModel.aggregate<{
+        _id: unknown;
+        scriptExecutionResult: string | null;
+      }>([
+        {
+          $match: {
+            interactionType: "script_result",
+            scriptExecutionResult: { $in: [...scriptExecutionResultOptions] },
+          },
+        },
+        {
+          $sort: {
+            vpsId: 1,
+            createdAt: -1,
+          },
+        },
+        {
+          $group: {
+            _id: "$vpsId",
+            scriptExecutionResult: { $first: "$scriptExecutionResult" },
+          },
+        },
+        {
+          $match: {
+            scriptExecutionResult: lastScriptExecutionResult,
+          },
+        },
+      ]);
+
+      filter._id = {
+        $in: matchingLatestScriptResults.map((entry) => entry._id),
+      };
+    }
 
     const [items, totalCount] = await Promise.all([
       RemoteVpsModel.find(filter)
@@ -30,8 +67,44 @@ export async function GET(request: NextRequest) {
       RemoteVpsModel.countDocuments(filter),
     ]);
 
+    const itemIds = items.map((item) => item._id);
+    const latestScriptResults = itemIds.length
+      ? await RemoteVpsInteractionLogModel.aggregate<{
+        _id: unknown;
+        scriptExecutionResult: string | null;
+      }>([
+        {
+          $match: {
+            vpsId: { $in: itemIds },
+            interactionType: "script_result",
+            scriptExecutionResult: { $in: [...scriptExecutionResultOptions] },
+          },
+        },
+        {
+          $sort: {
+            vpsId: 1,
+            createdAt: -1,
+          },
+        },
+        {
+          $group: {
+            _id: "$vpsId",
+            scriptExecutionResult: { $first: "$scriptExecutionResult" },
+          },
+        },
+      ])
+      : [];
+    const latestScriptResultByVpsId = new Map(
+      latestScriptResults.map((entry) => [String(entry._id), entry.scriptExecutionResult])
+    );
+
     return NextResponse.json({
-      items: items.map((item) => serializeVps(item)),
+      items: items.map((item) =>
+        serializeVps({
+          ...item,
+          lastScriptExecutionResult: latestScriptResultByVpsId.get(String(item._id)) ?? null,
+        })
+      ),
       totalCount,
       page,
       pageSize,
@@ -66,6 +139,7 @@ export async function POST(request: NextRequest) {
       statusReason: payload.isEnabled
         ? "Awaiting initial controller communication"
         : "Record disabled by operator.",
+      alertDetails: null,
       createdBy: actor,
       updatedBy: actor,
     });

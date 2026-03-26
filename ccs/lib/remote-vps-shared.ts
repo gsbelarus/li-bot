@@ -67,6 +67,26 @@ export type RemoteVpsTimestampWarning =
 
 export type RemoteVpsInteractionLogTimestampWarning = "createdAt";
 
+export interface VpsAlertDetails {
+  taskId: string;
+  message: string;
+  reason: string;
+  stepOrder: number | null;
+  stepKind: string;
+  instruction: string;
+  detectedAt: string | null;
+}
+
+export interface VpsNotCompletedDetails {
+  taskId: string;
+  message: string;
+  reason: string;
+  stepOrder: number | null;
+  stepKind: string;
+  instruction: string;
+  detectedAt: string | null;
+}
+
 export interface RemoteVpsRecord {
   id: string;
   name: string;
@@ -85,6 +105,8 @@ export interface RemoteVpsRecord {
   controllerVersion: string;
   status: VpsStatus;
   statusReason: string;
+  alertDetails: VpsAlertDetails | null;
+  lastScriptExecutionResult: ScriptExecutionResult | null;
   lastSeenAt: string | null;
   lastHealthCheckAt: string | null;
   lastHealthCheckResult: "success" | "failed" | "timeout" | "unknown";
@@ -111,6 +133,7 @@ export interface RemoteVpsInteractionLogRecord {
   responsePayload: unknown;
   result: LogResult;
   scriptExecutionResult: ScriptExecutionResult | null;
+  notCompletedDetails: VpsNotCompletedDetails | null;
   errorCode: string;
   errorMessage: string;
   durationMs: number | null;

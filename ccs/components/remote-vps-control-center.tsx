@@ -55,6 +55,8 @@ import { controlCenterSections } from "@/lib/control-center-navigation";
 import {
   RemoteVpsInteractionLogRecord,
   RemoteVpsRecord,
+  VpsAlertDetails,
+  VpsNotCompletedDetails,
   VpsLogListResponse,
   VpsListResponse,
   VpsMutationResponse,
@@ -307,7 +309,21 @@ function getInteractionEngineInfo(log: RemoteVpsInteractionLogRecord) {
   return taskEngine;
 }
 
-function getInteractionMouseActivityInfo(log: RemoteVpsInteractionLogRecord) {
+function getInteractionMouseActivityInfo(log: RemoteVpsInteractionLogRecord | null | undefined) {
+  if (!log) {
+    return {
+      enabled: null,
+      minIntervalMs: null,
+      maxIntervalMs: null,
+      maxOffsetPx: null,
+    } as {
+      enabled: boolean | null;
+      minIntervalMs: number | null;
+      maxIntervalMs: number | null;
+      maxOffsetPx: number | null;
+    };
+  }
+
   const payload = isPlainObject(log.requestPayload)
     ? log.requestPayload
     : isPlainObject(log.responsePayload)
@@ -501,6 +517,12 @@ function getTaskResultSummary(payload: unknown) {
 
   if (endedEarly) {
     parts.push("The script completed and ended early through branch logic.");
+
+    const notCompletedDetails = getTaskNotCompletedDetails(payload);
+
+    if (notCompletedDetails?.reason) {
+      parts.push(`Cause: ${notCompletedDetails.reason}.`);
+    }
   }
 
   if (stepResolutionSummary) {
@@ -508,6 +530,65 @@ function getTaskResultSummary(payload: unknown) {
   }
 
   return parts.join(" ");
+}
+
+function getTaskAlertDetails(payload: unknown) {
+  if (!isPlainObject(payload) || !isPlainObject(payload.result) || !isPlainObject(payload.result.alert)) {
+    return null as VpsAlertDetails | null;
+  }
+
+  const alert = payload.result.alert;
+  const reason = typeof alert.reason === "string" ? alert.reason.trim() : "";
+  const message = reason
+    ? `Alert condition detected: ${reason}`
+    : "Alert condition detected during script execution.";
+
+  return {
+    taskId: typeof payload.taskId === "string" ? payload.taskId : "",
+    message,
+    reason,
+    stepOrder:
+      typeof alert.stepOrder === "number" && Number.isFinite(alert.stepOrder)
+        ? Math.floor(alert.stepOrder)
+        : null,
+    stepKind: typeof alert.stepKind === "string" ? alert.stepKind : "",
+    instruction: typeof alert.instruction === "string" ? alert.instruction : "",
+    detectedAt:
+      typeof payload.result.finishedAt === "string"
+        ? payload.result.finishedAt
+        : typeof payload.result.startedAt === "string"
+          ? payload.result.startedAt
+          : null,
+  };
+}
+
+function getTaskNotCompletedDetails(payload: unknown) {
+  if (!isPlainObject(payload) || !isPlainObject(payload.result) || !isPlainObject(payload.result.earlyExit)) {
+    return null as VpsNotCompletedDetails | null;
+  }
+
+  const earlyExit = payload.result.earlyExit;
+  const reason = typeof earlyExit.reason === "string" ? earlyExit.reason.trim() : "";
+
+  return {
+    taskId: typeof payload.taskId === "string" ? payload.taskId : "",
+    message: reason
+      ? `Script completed and ended early through branch logic. Cause: ${reason}`
+      : "Script completed and ended early through branch logic.",
+    reason,
+    stepOrder:
+      typeof earlyExit.stepOrder === "number" && Number.isFinite(earlyExit.stepOrder)
+        ? Math.floor(earlyExit.stepOrder)
+        : null,
+    stepKind: typeof earlyExit.stepKind === "string" ? earlyExit.stepKind : "",
+    instruction: typeof earlyExit.instruction === "string" ? earlyExit.instruction : "",
+    detectedAt:
+      typeof payload.result.finishedAt === "string"
+        ? payload.result.finishedAt
+        : typeof payload.result.startedAt === "string"
+          ? payload.result.startedAt
+          : null,
+  };
 }
 
 function getTaskCompletionSnackbarMessage(
@@ -644,6 +725,12 @@ function getRecentScriptRunSummary(logs: RemoteVpsInteractionLogRecord[]) {
     error: scriptResultLogs.filter((log) => log.scriptExecutionResult === "ERROR").length,
     alert: scriptResultLogs.filter((log) => log.scriptExecutionResult === "ALERT").length,
   };
+}
+
+function getLatestScriptResultLog(logs: RemoteVpsInteractionLogRecord[]) {
+  return logs.find(
+    (log) => log.interactionType === "script_result" && Boolean(log.scriptExecutionResult)
+  ) ?? null;
 }
 
 async function requestJson<T>(input: string, init?: RequestInit): Promise<T> {
@@ -1130,6 +1217,7 @@ export function RemoteVpsControlCenter() {
   const deferredSearch = useDeferredValue(search);
   const [statusFilter, setStatusFilter] = useState("");
   const [environmentFilter, setEnvironmentFilter] = useState("");
+  const [lastScriptExecutionResultFilter, setLastScriptExecutionResultFilter] = useState("");
   const [paginationModel, setPaginationModel] = useState<GridPaginationModel>({
     page: 0,
     pageSize: 10,
@@ -1356,6 +1444,7 @@ export function RemoteVpsControlCenter() {
           search: deferredSearch,
           status: statusFilter,
           environment: environmentFilter,
+          lastScriptExecutionResult: lastScriptExecutionResultFilter,
           sortField: sortEntry?.field ?? "updatedAt",
           sortDirection: sortEntry?.sort ?? "desc",
         });
@@ -1383,6 +1472,7 @@ export function RemoteVpsControlCenter() {
   }, [
     deferredSearch,
     environmentFilter,
+    lastScriptExecutionResultFilter,
     paginationModel.page,
     paginationModel.pageSize,
     refreshToken,
@@ -1619,6 +1709,21 @@ export function RemoteVpsControlCenter() {
             ) : null}
           </Stack>
         ),
+      },
+      {
+        field: "lastScriptExecutionResult",
+        headerName: "Last execution",
+        minWidth: 170,
+        sortable: false,
+        renderCell: ({ row }) =>
+          row.lastScriptExecutionResult ? (
+            <Chip
+              label={row.lastScriptExecutionResult}
+              color={scriptExecutionResultColor(row.lastScriptExecutionResult)}
+              size="small"
+              variant="outlined"
+            />
+          ) : null,
       },
       {
         field: "lastSeenAt",
@@ -2278,6 +2383,25 @@ export function RemoteVpsControlCenter() {
                         ))}
                       </Select>
                     </FormControl>
+                    <FormControl sx={{ minWidth: 220 }}>
+                      <InputLabel id="last-script-execution-filter-label">Last execution</InputLabel>
+                      <Select
+                        labelId="last-script-execution-filter-label"
+                        value={lastScriptExecutionResultFilter}
+                        label="Last execution"
+                        onChange={(event) => {
+                          setLastScriptExecutionResultFilter(String(event.target.value));
+                          setPaginationModel((current) => ({ ...current, page: 0 }));
+                        }}
+                      >
+                        <MenuItem value="">All last executions</MenuItem>
+                        {scriptExecutionResultOptions.map((option) => (
+                          <MenuItem key={option} value={option}>
+                            {option}
+                          </MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
                   </Stack>
                 </CardContent>
               </Card>
@@ -2349,17 +2473,20 @@ export function RemoteVpsControlCenter() {
 
           {screen.kind === "details" ? (
             selectedVps ? (
-              <Stack spacing={1.5}>
+              <Stack spacing={1.5} sx={{ height: "100%", minHeight: 0 }}>
                 <Box
                   sx={{
+                    flex: 1,
+                    minHeight: 0,
+                    overflow: "hidden",
                     display: "grid",
                     gap: 1.25,
                     gridTemplateColumns: { xs: "1fr", xl: "1.1fr 0.9fr" },
                   }}
                 >
-                  <Card>
-                    <CardContent>
-                      <Stack spacing={1.5}>
+                  <Card sx={{ minHeight: 0 }}>
+                    <CardContent sx={{ height: "100%", display: "flex", flexDirection: "column", minHeight: 0 }}>
+                      <Stack spacing={1.5} sx={{ height: "100%", minHeight: 0 }}>
                         <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
                           <Typography variant="h5">{selectedVps.name}</Typography>
                           <Chip
@@ -2374,79 +2501,179 @@ export function RemoteVpsControlCenter() {
                           ) : null}
                         </Stack>
                         <Typography color="text.secondary">{selectedVps.statusReason}</Typography>
+                        {(() => {
+                          const latestScriptResultLog = getLatestScriptResultLog(detailLogs);
+
+                          if (!latestScriptResultLog?.scriptExecutionResult) {
+                            return null;
+                          }
+
+                          const latestSummary =
+                            getTaskResultSummary(latestScriptResultLog.responsePayload) ||
+                            latestScriptResultLog.errorMessage ||
+                            "-";
+
+                          return (
+                            <Paper
+                              variant="outlined"
+                              sx={{
+                                p: 1.25,
+                                borderRadius: "7px",
+                                borderColor: "rgba(15, 118, 110, 0.2)",
+                                backgroundColor: "rgba(15, 118, 110, 0.04)",
+                              }}
+                            >
+                              <Stack spacing={0.75}>
+                                <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
+                                  <Typography variant="subtitle2">Last script status</Typography>
+                                  <Chip
+                                    label={latestScriptResultLog.scriptExecutionResult}
+                                    color={scriptExecutionResultColor(latestScriptResultLog.scriptExecutionResult)}
+                                    size="small"
+                                  />
+                                </Stack>
+                                <Typography color="text.secondary" sx={{ whiteSpace: "pre-wrap" }}>
+                                  {latestSummary}
+                                </Typography>
+                                <Typography variant="body2" color="text.secondary">
+                                  Recorded {formatDateTime(latestScriptResultLog.createdAt)}
+                                </Typography>
+                              </Stack>
+                            </Paper>
+                          );
+                        })()}
                         <Divider />
-                        <Box
-                          sx={{
-                            display: "grid",
-                            gap: 1.5,
-                            gridTemplateColumns: { xs: "1fr", md: "repeat(2, minmax(0, 1fr))" },
-                          }}
-                        >
-                          <DetailField label="Endpoint" value={`${selectedVps.protocol}://${selectedVps.host}:${selectedVps.port}`} />
-                          <DetailField label="Provider" value={selectedVps.provider} />
-                          <DetailField label="Environment" value={selectedVps.environment} />
-                          <DetailField label="Region" value={selectedVps.region || "-"} />
-                          <DetailField
-                            label="Mouse drift default"
-                            value={selectedVps.defaultMouseActivityEnabled ? "Enabled" : "Disabled"}
-                          />
-                          <DetailField
-                            label="Default min interval"
-                            value={`${selectedVps.defaultMouseActivityMinIntervalMs} ms`}
-                          />
-                          <DetailField
-                            label="Default max interval"
-                            value={`${selectedVps.defaultMouseActivityMaxIntervalMs} ms`}
-                          />
-                          <DetailField
-                            label="Default max offset"
-                            value={`${selectedVps.defaultMouseActivityMaxOffsetPx} px`}
-                          />
-                          <DetailField
-                            label="Controller secret"
-                            value={
-                              selectedVps.hasControllerSecret
-                                ? selectedVps.controllerSecretKeyMasked
-                                : "Not configured"
-                            }
-                          />
-                          <DetailField label="Last seen" value={formatDateTime(selectedVps.lastSeenAt)} />
-                          <DetailField
-                            label="Last health check"
-                            value={formatDateTime(selectedVps.lastHealthCheckAt)}
-                          />
-                          <DetailField
-                            label="Health result"
-                            value={selectedVps.lastHealthCheckResult}
-                          />
-                          <DetailField
-                            label="Controller version"
-                            value={selectedVps.controllerVersion || "-"}
-                          />
-                          <DetailField label="Created by" value={selectedVps.createdBy} />
-                          <DetailField label="Updated by" value={selectedVps.updatedBy} />
-                        </Box>
-                        <Box>
-                          <Typography variant="subtitle2" color="text.secondary">
-                            Tags
-                          </Typography>
-                          <Stack direction="row" spacing={0.75} flexWrap="wrap" sx={{ mt: 0.75 }}>
-                            {selectedVps.tags.length > 0 ? (
-                              selectedVps.tags.map((tag) => <Chip key={tag} label={tag} variant="outlined" />)
-                            ) : (
-                              <Typography color="text.secondary">No tags</Typography>
-                            )}
+                        <Box sx={{ flex: 1, minHeight: 0, overflowY: "auto", pr: 0.5 }}>
+                          <Stack spacing={1.5}>
+                            {selectedVps.alertDetails ? (
+                              <Paper
+                                variant="outlined"
+                                sx={{
+                                  p: 1.25,
+                                  borderRadius: "7px",
+                                  borderColor: "error.light",
+                                  backgroundColor: "rgba(183, 28, 28, 0.04)",
+                                }}
+                              >
+                                <Stack spacing={0.75}>
+                                  <Typography variant="subtitle2" color="error.main">
+                                    Active alert trigger
+                                  </Typography>
+                                  <Typography sx={{ whiteSpace: "pre-wrap" }}>
+                                    {selectedVps.alertDetails.message || selectedVps.statusReason}
+                                  </Typography>
+                                  <Stack direction="row" spacing={0.75} flexWrap="wrap">
+                                    {selectedVps.alertDetails.stepOrder !== null ? (
+                                      <Chip
+                                        size="small"
+                                        color="error"
+                                        variant="outlined"
+                                        label={`Step ${selectedVps.alertDetails.stepOrder}`}
+                                      />
+                                    ) : null}
+                                    {selectedVps.alertDetails.stepKind ? (
+                                      <Chip
+                                        size="small"
+                                        color="error"
+                                        variant="outlined"
+                                        label={selectedVps.alertDetails.stepKind}
+                                      />
+                                    ) : null}
+                                    {selectedVps.alertDetails.taskId ? (
+                                      <Chip
+                                        size="small"
+                                        color="error"
+                                        variant="outlined"
+                                        label={`Task ${selectedVps.alertDetails.taskId.slice(0, 8)}`}
+                                      />
+                                    ) : null}
+                                  </Stack>
+                                  {selectedVps.alertDetails.instruction ? (
+                                    <Typography color="text.secondary" sx={{ whiteSpace: "pre-wrap" }}>
+                                      {selectedVps.alertDetails.instruction}
+                                    </Typography>
+                                  ) : null}
+                                  <Typography variant="body2" color="text.secondary">
+                                    Detected {formatDateTime(selectedVps.alertDetails.detectedAt)}
+                                  </Typography>
+                                </Stack>
+                              </Paper>
+                            ) : null}
+                            <Box
+                              sx={{
+                                display: "grid",
+                                gap: 1.5,
+                                gridTemplateColumns: { xs: "1fr", md: "repeat(2, minmax(0, 1fr))" },
+                              }}
+                            >
+                              <DetailField label="Endpoint" value={`${selectedVps.protocol}://${selectedVps.host}:${selectedVps.port}`} />
+                              <DetailField label="Provider" value={selectedVps.provider} />
+                              <DetailField label="Environment" value={selectedVps.environment} />
+                              <DetailField label="Region" value={selectedVps.region || "-"} />
+                              <DetailField
+                                label="Mouse drift default"
+                                value={selectedVps.defaultMouseActivityEnabled ? "Enabled" : "Disabled"}
+                              />
+                              <DetailField
+                                label="Default min interval"
+                                value={`${selectedVps.defaultMouseActivityMinIntervalMs} ms`}
+                              />
+                              <DetailField
+                                label="Default max interval"
+                                value={`${selectedVps.defaultMouseActivityMaxIntervalMs} ms`}
+                              />
+                              <DetailField
+                                label="Default max offset"
+                                value={`${selectedVps.defaultMouseActivityMaxOffsetPx} px`}
+                              />
+                              <DetailField
+                                label="Controller secret"
+                                value={
+                                  selectedVps.hasControllerSecret
+                                    ? selectedVps.controllerSecretKeyMasked
+                                    : "Not configured"
+                                }
+                              />
+                              <DetailField label="Last seen" value={formatDateTime(selectedVps.lastSeenAt)} />
+                              <DetailField
+                                label="Last health check"
+                                value={formatDateTime(selectedVps.lastHealthCheckAt)}
+                              />
+                              <DetailField
+                                label="Health result"
+                                value={selectedVps.lastHealthCheckResult}
+                              />
+                              <DetailField
+                                label="Controller version"
+                                value={selectedVps.controllerVersion || "-"}
+                              />
+                              <DetailField label="Created by" value={selectedVps.createdBy} />
+                              <DetailField label="Updated by" value={selectedVps.updatedBy} />
+                            </Box>
+                            <Box>
+                              <Typography variant="subtitle2" color="text.secondary">
+                                Tags
+                              </Typography>
+                              <Stack direction="row" spacing={0.75} flexWrap="wrap" sx={{ mt: 0.75 }}>
+                                {selectedVps.tags.length > 0 ? (
+                                  selectedVps.tags.map((tag) => <Chip key={tag} label={tag} variant="outlined" />)
+                                ) : (
+                                  <Typography color="text.secondary">No tags</Typography>
+                                )}
+                              </Stack>
+                            </Box>
+                            <Box>
+                              <Typography variant="subtitle2" color="text.secondary">
+                                Notes
+                              </Typography>
+                              <Typography sx={{ mt: 0.75, whiteSpace: "pre-wrap" }}>
+                                {selectedVps.notes || "No operator notes recorded."}
+                              </Typography>
+                            </Box>
                           </Stack>
                         </Box>
-                        <Box>
-                          <Typography variant="subtitle2" color="text.secondary">
-                            Notes
-                          </Typography>
-                          <Typography sx={{ mt: 0.75, whiteSpace: "pre-wrap" }}>
-                            {selectedVps.notes || "No operator notes recorded."}
-                          </Typography>
-                        </Box>
-                        <Stack direction="row" spacing={1} flexWrap="wrap">
+                        <Divider />
+                        <Stack direction="row" spacing={1} flexWrap="wrap" sx={{ mt: "auto" }}>
                           <Button
                             variant="contained"
                             startIcon={<EditRoundedIcon />}
@@ -2513,181 +2740,184 @@ export function RemoteVpsControlCenter() {
                     </CardContent>
                   </Card>
 
-                  <Card>
-                    <CardContent>
+                  <Card sx={{ minHeight: 0 }}>
+                    <CardContent sx={{ height: "100%", display: "flex", flexDirection: "column", minHeight: 0 }}>
                       <Typography variant="h6">Recent interaction history</Typography>
                       <Typography color="text.secondary" sx={{ mt: 0.35, mb: 1 }}>
                         Latest request and failure events.
                       </Typography>
-                      {detailLogs.length === 0 ? (
-                        <EmptyState
-                          title="No interaction logs yet"
-                          body="Run a test or health check to create log entries."
-                        />
-                      ) : (
-                        <Stack spacing={0.75}>
-                          {(() => {
-                            const mouseActivity = getInteractionMouseActivityInfo(selectedLog!);
+                      <Box sx={{ flex: 1, minHeight: 0, overflowY: "auto", pr: 0.5 }}>
+                        {detailLogs.length === 0 ? (
+                          <EmptyState
+                            title="No interaction logs yet"
+                            body="Run a test or health check to create log entries."
+                          />
+                        ) : (
+                          <Stack spacing={0.75}>
+                            {(() => {
+                              const mostRecentInteractionLog = detailLogs[0] ?? null;
+                              const mouseActivity = getInteractionMouseActivityInfo(mostRecentInteractionLog);
 
-                            return (
-                              <>
-                                <DetailField
-                                  label="Mouse drift"
-                                  value={
-                                    mouseActivity.enabled === null
-                                      ? "-"
-                                      : mouseActivity.enabled
-                                        ? "Enabled"
-                                        : "Disabled"
-                                  }
-                                />
-                                <DetailField
-                                  label="Mouse min interval"
-                                  value={
-                                    mouseActivity.minIntervalMs === null
-                                      ? "-"
-                                      : `${mouseActivity.minIntervalMs} ms`
-                                  }
-                                />
-                                <DetailField
-                                  label="Mouse max interval"
-                                  value={
-                                    mouseActivity.maxIntervalMs === null
-                                      ? "-"
-                                      : `${mouseActivity.maxIntervalMs} ms`
-                                  }
-                                />
-                                <DetailField
-                                  label="Mouse max offset"
-                                  value={
-                                    mouseActivity.maxOffsetPx === null
-                                      ? "-"
-                                      : `${mouseActivity.maxOffsetPx} px`
-                                  }
-                                />
-                              </>
-                            );
-                          })()}
-                          {(() => {
-                            const summary = getRecentScriptRunSummary(detailLogs);
+                              return (
+                                <>
+                                  <DetailField
+                                    label="Mouse drift"
+                                    value={
+                                      mouseActivity.enabled === null
+                                        ? "-"
+                                        : mouseActivity.enabled
+                                          ? "Enabled"
+                                          : "Disabled"
+                                    }
+                                  />
+                                  <DetailField
+                                    label="Mouse min interval"
+                                    value={
+                                      mouseActivity.minIntervalMs === null
+                                        ? "-"
+                                        : `${mouseActivity.minIntervalMs} ms`
+                                    }
+                                  />
+                                  <DetailField
+                                    label="Mouse max interval"
+                                    value={
+                                      mouseActivity.maxIntervalMs === null
+                                        ? "-"
+                                        : `${mouseActivity.maxIntervalMs} ms`
+                                    }
+                                  />
+                                  <DetailField
+                                    label="Mouse max offset"
+                                    value={
+                                      mouseActivity.maxOffsetPx === null
+                                        ? "-"
+                                        : `${mouseActivity.maxOffsetPx} px`
+                                    }
+                                  />
+                                </>
+                              );
+                            })()}
+                            {(() => {
+                              const summary = getRecentScriptRunSummary(detailLogs);
 
-                            return summary.total > 0 ? (
-                              <Paper variant="outlined" sx={{ p: 1.25, borderRadius: "7px" }}>
-                                <Stack spacing={1}>
-                                  <Box>
-                                    <Typography variant="subtitle2">Recent script runs</Typography>
-                                    <Typography color="text.secondary" variant="body2">
-                                      Latest {summary.total} script result{summary.total === 1 ? "" : "s"} in the recent interaction window.
-                                    </Typography>
-                                  </Box>
-                                  <Stack direction="row" spacing={0.75} flexWrap="wrap">
-                                    <Chip
-                                      label={`COMPLETED ${summary.completed}`}
-                                      color="success"
-                                      size="small"
-                                      variant="outlined"
-                                      clickable={summary.completed > 0}
-                                      onClick={
-                                        summary.completed > 0
-                                          ? () =>
-                                            openLogsScreen(selectedVps.id, {
-                                              interactionType: "script_result",
-                                              scriptExecutionResult: "COMPLETED",
-                                            })
-                                          : undefined
-                                      }
-                                    />
-                                    <Chip
-                                      label={`NOT_COMPLETED ${summary.notCompleted}`}
-                                      color="warning"
-                                      size="small"
-                                      variant="outlined"
-                                      clickable={summary.notCompleted > 0}
-                                      onClick={
-                                        summary.notCompleted > 0
-                                          ? () =>
-                                            openLogsScreen(selectedVps.id, {
-                                              interactionType: "script_result",
-                                              scriptExecutionResult: "NOT_COMPLETED",
-                                            })
-                                          : undefined
-                                      }
-                                    />
-                                    <Chip
-                                      label={`ERROR ${summary.error}`}
-                                      color="error"
-                                      size="small"
-                                      variant="outlined"
-                                      clickable={summary.error > 0}
-                                      onClick={
-                                        summary.error > 0
-                                          ? () =>
-                                            openLogsScreen(selectedVps.id, {
-                                              interactionType: "script_result",
-                                              scriptExecutionResult: "ERROR",
-                                            })
-                                          : undefined
-                                      }
-                                    />
-                                    <Chip
-                                      label={`ALERT ${summary.alert}`}
-                                      color="error"
-                                      size="small"
-                                      variant="outlined"
-                                      clickable={summary.alert > 0}
-                                      onClick={
-                                        summary.alert > 0
-                                          ? () =>
-                                            openLogsScreen(selectedVps.id, {
-                                              interactionType: "script_result",
-                                              scriptExecutionResult: "ALERT",
-                                            })
-                                          : undefined
-                                      }
-                                    />
-                                  </Stack>
-                                </Stack>
-                              </Paper>
-                            ) : null;
-                          })()}
-                          {detailLogs.slice(0, 6).map((log) => (
-                            <Paper
-                              key={log.id}
-                              variant="outlined"
-                              sx={{ p: 1.25, borderRadius: "7px", cursor: "pointer" }}
-                              onClick={() => openLogsScreen(selectedVps.id)}
-                            >
-                              <Stack direction="row" justifyContent="space-between" spacing={2}>
-                                <Box>
-                                  <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
-                                    <Chip
-                                      label={log.result}
-                                      color={resultColor(log.result)}
-                                      size="small"
-                                    />
-                                    {log.scriptExecutionResult ? (
+                              return summary.total > 0 ? (
+                                <Paper variant="outlined" sx={{ p: 1.25, borderRadius: "7px" }}>
+                                  <Stack spacing={1}>
+                                    <Box>
+                                      <Typography variant="subtitle2">Recent script runs</Typography>
+                                      <Typography color="text.secondary" variant="body2">
+                                        Latest {summary.total} script result{summary.total === 1 ? "" : "s"} in the recent interaction window.
+                                      </Typography>
+                                    </Box>
+                                    <Stack direction="row" spacing={0.75} flexWrap="wrap">
                                       <Chip
-                                        label={log.scriptExecutionResult}
-                                        color={scriptExecutionResultColor(log.scriptExecutionResult)}
+                                        label={`COMPLETED ${summary.completed}`}
+                                        color="success"
                                         size="small"
                                         variant="outlined"
+                                        clickable={summary.completed > 0}
+                                        onClick={
+                                          summary.completed > 0
+                                            ? () =>
+                                              openLogsScreen(selectedVps.id, {
+                                                interactionType: "script_result",
+                                                scriptExecutionResult: "COMPLETED",
+                                              })
+                                            : undefined
+                                        }
                                       />
-                                    ) : null}
-                                    <Typography variant="subtitle2">{log.interactionType}</Typography>
-                                    <Typography color="text.secondary">{log.requestPath}</Typography>
+                                      <Chip
+                                        label={`NOT_COMPLETED ${summary.notCompleted}`}
+                                        color="warning"
+                                        size="small"
+                                        variant="outlined"
+                                        clickable={summary.notCompleted > 0}
+                                        onClick={
+                                          summary.notCompleted > 0
+                                            ? () =>
+                                              openLogsScreen(selectedVps.id, {
+                                                interactionType: "script_result",
+                                                scriptExecutionResult: "NOT_COMPLETED",
+                                              })
+                                            : undefined
+                                        }
+                                      />
+                                      <Chip
+                                        label={`ERROR ${summary.error}`}
+                                        color="error"
+                                        size="small"
+                                        variant="outlined"
+                                        clickable={summary.error > 0}
+                                        onClick={
+                                          summary.error > 0
+                                            ? () =>
+                                              openLogsScreen(selectedVps.id, {
+                                                interactionType: "script_result",
+                                                scriptExecutionResult: "ERROR",
+                                              })
+                                            : undefined
+                                        }
+                                      />
+                                      <Chip
+                                        label={`ALERT ${summary.alert}`}
+                                        color="error"
+                                        size="small"
+                                        variant="outlined"
+                                        clickable={summary.alert > 0}
+                                        onClick={
+                                          summary.alert > 0
+                                            ? () =>
+                                              openLogsScreen(selectedVps.id, {
+                                                interactionType: "script_result",
+                                                scriptExecutionResult: "ALERT",
+                                              })
+                                            : undefined
+                                        }
+                                      />
+                                    </Stack>
                                   </Stack>
-                                  <Typography color="text.secondary" sx={{ mt: 0.5 }}>
-                                    {log.errorMessage || "Completed without reported transport errors."}
+                                </Paper>
+                              ) : null;
+                            })()}
+                            {detailLogs.slice(0, 6).map((log) => (
+                              <Paper
+                                key={log.id}
+                                variant="outlined"
+                                sx={{ p: 1.25, borderRadius: "7px", cursor: "pointer" }}
+                                onClick={() => openLogsScreen(selectedVps.id)}
+                              >
+                                <Stack direction="row" justifyContent="space-between" spacing={2}>
+                                  <Box>
+                                    <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
+                                      <Chip
+                                        label={log.result}
+                                        color={resultColor(log.result)}
+                                        size="small"
+                                      />
+                                      {log.scriptExecutionResult ? (
+                                        <Chip
+                                          label={log.scriptExecutionResult}
+                                          color={scriptExecutionResultColor(log.scriptExecutionResult)}
+                                          size="small"
+                                          variant="outlined"
+                                        />
+                                      ) : null}
+                                      <Typography variant="subtitle2">{log.interactionType}</Typography>
+                                      <Typography color="text.secondary">{log.requestPath}</Typography>
+                                    </Stack>
+                                    <Typography color="text.secondary" sx={{ mt: 0.5 }}>
+                                      {log.errorMessage || "Completed without reported transport errors."}
+                                    </Typography>
+                                  </Box>
+                                  <Typography color="text.secondary">
+                                    {formatDateTime(log.createdAt)}
                                   </Typography>
-                                </Box>
-                                <Typography color="text.secondary">
-                                  {formatDateTime(log.createdAt)}
-                                </Typography>
-                              </Stack>
-                            </Paper>
-                          ))}
-                        </Stack>
-                      )}
+                                </Stack>
+                              </Paper>
+                            ))}
+                          </Stack>
+                        )}
+                      </Box>
                     </CardContent>
                   </Card>
                 </Box>
@@ -2913,6 +3143,56 @@ export function RemoteVpsControlCenter() {
                 label="Execution result"
                 value={selectedLog.scriptExecutionResult || "-"}
               />
+              {getTaskAlertDetails(selectedLog.responsePayload) ? (
+                (() => {
+                  const alertDetails = getTaskAlertDetails(selectedLog.responsePayload);
+
+                  if (!alertDetails) {
+                    return null;
+                  }
+
+                  return (
+                    <>
+                      <DetailField label="Alert cause" value={alertDetails.message} />
+                      <DetailField
+                        label="Alert step"
+                        value={
+                          alertDetails.stepOrder !== null
+                            ? `Step ${alertDetails.stepOrder}${alertDetails.stepKind ? ` • ${alertDetails.stepKind}` : ""}`
+                            : alertDetails.stepKind || "-"
+                        }
+                      />
+                      <DetailField label="Alert instruction" value={alertDetails.instruction || "-"} />
+                    </>
+                  );
+                })()
+              ) : null}
+              {selectedLog.scriptExecutionResult === "NOT_COMPLETED" ? (
+                (() => {
+                  const notCompletedDetails =
+                    selectedLog.notCompletedDetails ?? getTaskNotCompletedDetails(selectedLog.responsePayload);
+
+                  if (!notCompletedDetails) {
+                    return null;
+                  }
+
+                  return (
+                    <>
+                      <DetailField label="Early completion" value="Script completed and ended early through branch logic." />
+                      <DetailField label="Early completion cause" value={notCompletedDetails.reason || "-"} />
+                      <DetailField
+                        label="Early completion step"
+                        value={
+                          notCompletedDetails.stepOrder !== null
+                            ? `Step ${notCompletedDetails.stepOrder}${notCompletedDetails.stepKind ? ` • ${notCompletedDetails.stepKind}` : ""}`
+                            : notCompletedDetails.stepKind || "-"
+                        }
+                      />
+                      <DetailField label="Early completion instruction" value={notCompletedDetails.instruction || "-"} />
+                    </>
+                  );
+                })()
+              ) : null}
               <DetailField
                 label="Engine mode"
                 value={getTaskEngineLabel(getInteractionEngineInfo(selectedLog).requestedMode)}

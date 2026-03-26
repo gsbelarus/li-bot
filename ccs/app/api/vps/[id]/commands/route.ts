@@ -95,6 +95,9 @@ export async function POST(
       mouseActivityConfig,
       script: (body as { script?: unknown }).script,
       taskResultWebhookUrlTemplate: `${request.nextUrl.origin}/api/vps/${id}/commands/{taskId}/results`,
+      profileVisitLookupUrlTemplate:
+        `${request.nextUrl.origin}/api/vps/${id}/profile-history/check` +
+        `?profileUrl={profileUrl}&lookbackDays={lookbackDays}`,
       initiatedByUserId: getActorFromRequest(request),
     });
 

@@ -331,6 +331,36 @@ function isAlertOnVisibleIntent(text: string) {
   );
 }
 
+function extractLookbackDays(text: string) {
+  const normalized = normalizeText(text);
+  const match = normalized.match(/last\s+(\d+)\s+days?/);
+
+  if (match) {
+    const value = Number.parseInt(match[1], 10);
+
+    if (Number.isFinite(value) && value > 0) {
+      return value;
+    }
+  }
+
+  if (/last\s+thirty\s+days?/.test(normalized)) {
+    return 30;
+  }
+
+  return 30;
+}
+
+function isRecentProfileVisitSkipIntent(text: string) {
+  const normalized = normalizeText(text);
+
+  return (
+    /profile/.test(normalized) &&
+    /(check .*logs|see if any scripts have been run|scripts have been run|any scripts have run)/.test(normalized) &&
+    /(last\s+\d+\s+days?|last\s+thirty\s+days?)/.test(normalized) &&
+    /(skip this profile|choose the next one|pick the next one|open the next one|next profile)/.test(normalized)
+  );
+}
+
 function buildAlertVisibleTarget(existingTarget: ScriptStep["target"] | null | undefined) {
   const existingTexts = dedupeTexts([
     safeString(existingTarget?.text),
@@ -854,6 +884,13 @@ function repairStructuredInstructions(instructions: ScriptInstructions) {
       step.target = buildAlertVisibleTarget(step.target);
     }
 
+    if (isRecentProfileVisitSkipIntent(instructionText)) {
+      step.kind = "skip_if_profile_recently_visited";
+      step.delayAfterMs = 0;
+      step.target = createEmptyTarget();
+      step.params.lookbackDays = extractLookbackDays(instructionText);
+    }
+
     if (safeString(step.params.containerText)) {
       const mergedContainerTexts = mergeAlternativeTexts(
         step.params.containerText,
@@ -1188,6 +1225,7 @@ const conversionTool = {
                 enum: [
                   "navigate",
                   "click",
+                  "skip_if_profile_recently_visited",
                   "branch_if_missing",
                   "branch_if_visible",
                   "hover",
@@ -1272,7 +1310,7 @@ export async function POST(request: NextRequest) {
           content: [
             "You convert human browser instructions into structured JSON for an OpenClaw-based bot.",
             "OpenClaw should execute human-like browser actions from visible labels, roles, page URLs, and page state whenever possible.",
-            "Use only these action kinds: navigate, click, branch_if_missing, branch_if_visible, hover, wait, wait_for_page, move_mouse, scroll, type, press_key, extract_text, assert_visible, custom.",
+            "Use only these action kinds: navigate, click, skip_if_profile_recently_visited, branch_if_missing, branch_if_visible, hover, wait, wait_for_page, move_mouse, scroll, type, press_key, extract_text, assert_visible, custom.",
             "Prefer native-browser-friendly instructions that can be executed from an OpenClaw snapshot and element ref.",
             "Prefer intent-level actions over DOM-mechanical actions.",
             "If the human instruction says to go to a known destination page such as LinkedIn My Network, Feed, Jobs, Notifications, or Messaging, use navigate rather than click, and always set params.url.",
@@ -1295,6 +1333,7 @@ export async function POST(request: NextRequest) {
             "Do not create click or assert_visible steps with only a generic role and no visible text unless you also provide index and enough container context to disambiguate the target.",
             "For known destination pages, do not rely on selectors or page links when the operator intent is clearly navigation.",
             "If an instruction says to open the first profile card inside a named section, do not target the section heading itself. Target a clickable profile/link inside that section using containerText and index.",
+            "If the operator says to check whether scripts have run for the current LinkedIn profile in the last N days and to skip to the next profile when they have, emit skip_if_profile_recently_visited with params.lookbackDays set to N.",
             "When the operator refers to the first, second, third, or other ordinal post shown on the page, target role='article' with params.index set to that ordinal instead of using visible text.",
             "If the operator refers to 'that post', 'the same post', or similar wording immediately after an ordinal post step, inherit the previous post index for the new step.",
             "When the operator refers to controls on a post, map them to the visible post-scoped control labels. Use button 'More' with alternatives such as 'More actions' or 'More options', and use button 'React Like' with alternative 'Like' for the like action.",

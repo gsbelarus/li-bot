@@ -28,6 +28,10 @@ function getOpenAiProjectKey() {
   return process.env.OPENAI_PROJECT_KEY || "";
 }
 
+function getRemoteControllerSecretKey() {
+  return process.env.REMOTE_CONTROLLER_SECRET_KEY || "";
+}
+
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -55,6 +59,17 @@ function scalarStringArray(value: unknown) {
     ? value.map((entry) => scalarString(entry).trim()).filter(Boolean)
     : [];
 }
+
+type BrowserTargetEntry = Record<string, unknown> & {
+  targetId?: unknown;
+  id?: unknown;
+  url?: unknown;
+  title?: unknown;
+  type?: unknown;
+  focused?: unknown;
+  active?: unknown;
+  selected?: unknown;
+};
 
 function boundedPositiveInteger(value: unknown, fallback: number, minimum = 1) {
   if (typeof value !== "number" || !Number.isFinite(value)) {
@@ -115,11 +130,30 @@ interface ExecutionContext {
   taskId?: string;
   engineMode?: ExecutionEngineMode;
   engineStats?: ExecutionEngineStats;
+  profileVisitLookupUrlTemplate?: string;
+  runtimeState?: RuntimeState;
 }
 
 interface ExecuteScriptOptions extends ExecutionContext {
   engineMode?: ExecutionEngineMode;
   targetId?: string;
+}
+
+interface VisitedProfileRecord {
+  profileKey: string;
+  profileUrl: string;
+  visitedAt: string;
+}
+
+interface ProfileCardSelectionState {
+  step: ScriptStep;
+  currentIndex: number;
+  sourcePageUrl: string;
+}
+
+interface RuntimeState {
+  visitedProfiles: Map<string, VisitedProfileRecord>;
+  profileCardSelection: ProfileCardSelectionState | null;
 }
 
 interface OpenClawInvocation {
@@ -182,10 +216,19 @@ interface BranchStepResult {
   action: "branch_if_missing" | "branch_if_visible";
   branchAction: "end_script" | "alert" | null;
   conditionMet: boolean;
+  reason?: string;
   matched?: ResolvedSnapshotRef;
 }
 
 interface AlertStopResult {
+  detected: true;
+  reason: string;
+  stepOrder: number;
+  stepKind: ScriptStep["kind"];
+  instruction: string;
+}
+
+interface EarlyExitResult {
   detected: true;
   reason: string;
   stepOrder: number;
@@ -222,6 +265,113 @@ class SnapshotRefNotFoundError extends Error {
 
 function normalizeSearchText(value: unknown) {
   return String(value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function asBrowserTargetEntry(value: unknown): BrowserTargetEntry | null {
+  return typeof value === "object" && value !== null ? (value as BrowserTargetEntry) : null;
+}
+
+function isTopLevelPageTarget(entry: BrowserTargetEntry) {
+  const type = normalizeSearchText(entry.type);
+  return !type || type === "page" || type === "tab";
+}
+
+function isWebPageUrl(value: unknown) {
+  const url = scalarString(value).trim().toLowerCase();
+  return url.startsWith("http://") || url.startsWith("https://");
+}
+
+function isInternalBrowserUrl(value: unknown) {
+  const url = scalarString(value).trim().toLowerCase();
+  return (
+    url.startsWith("chrome://") ||
+    url.startsWith("chrome-extension://") ||
+    url.startsWith("devtools://")
+  );
+}
+
+function scoreBrowserTarget(entry: BrowserTargetEntry) {
+  const url = scalarString(entry.url);
+  let score = 0;
+
+  if (isTopLevelPageTarget(entry)) {
+    score += 1_000;
+  }
+
+  if (isWebPageUrl(url)) {
+    score += 200;
+  }
+
+  if (/linkedin\.com/i.test(url)) {
+    score += 50;
+  }
+
+  if (scalarBoolean(entry.focused) || scalarBoolean(entry.active) || scalarBoolean(entry.selected)) {
+    score += 25;
+  }
+
+  if (isInternalBrowserUrl(url)) {
+    score -= 150;
+  }
+
+  return score;
+}
+
+function cloneScriptStep(step: ScriptStep): ScriptStep {
+  return {
+    ...step,
+    target: step.target
+      ? {
+        ...step.target,
+        selectors: [...step.target.selectors],
+        alternativeTexts: [...scalarStringArray(step.target.alternativeTexts)],
+      }
+      : null,
+    params: Object.fromEntries(
+      Object.entries(step.params).map(([key, value]) => [key, Array.isArray(value) ? [...value] : value])
+    ),
+  };
+}
+
+function normalizeLinkedInProfileKey(value: unknown) {
+  const raw = scalarString(value).trim();
+
+  if (!raw) {
+    return "";
+  }
+
+  try {
+    const parsed = new URL(raw);
+    const hostname = parsed.hostname.toLowerCase();
+
+    if (!hostname.endsWith("linkedin.com")) {
+      return "";
+    }
+
+    const segments = parsed.pathname
+      .split("/")
+      .map((segment) => segment.trim())
+      .filter(Boolean);
+
+    if (segments.length < 2) {
+      return "";
+    }
+
+    const [profileType, profileSlug] = segments;
+
+    if ((profileType !== "in" && profileType !== "creator") || !profileSlug) {
+      return "";
+    }
+
+    return `/${profileType}/${profileSlug}`.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function normalizeLinkedInProfileUrl(value: unknown) {
+  const profileKey = normalizeLinkedInProfileKey(value);
+  return profileKey ? `https://www.linkedin.com${profileKey}` : "";
 }
 
 function isProfileCardStep(step: ScriptStep) {
@@ -710,12 +860,38 @@ export class OpenClawRuntime {
       throw new Error("No browser tabs were returned by OpenClaw.");
     }
 
-    const active = list.find((entry) => entry?.focused || entry?.active || entry?.selected) || list[0];
+    const candidates = list
+      .map((entry) => asBrowserTargetEntry(entry))
+      .filter((entry): entry is BrowserTargetEntry => Boolean(entry?.targetId || entry?.id));
+
+    if (candidates.length === 0) {
+      throw new Error("Could not determine targetId from OpenClaw tabs output.");
+    }
+
+    const preferredCandidates = candidates.filter((entry) => isTopLevelPageTarget(entry));
+    const rankedCandidates = (preferredCandidates.length > 0 ? preferredCandidates : candidates)
+      .map((entry, index) => ({
+        entry,
+        index,
+        score: scoreBrowserTarget(entry),
+      }))
+      .sort((left, right) => right.score - left.score || left.index - right.index);
+
+    const active = rankedCandidates[0]?.entry;
     const id = active?.targetId || active?.id;
 
     if (!id) {
       throw new Error("Could not determine targetId from OpenClaw tabs output.");
     }
+
+    appendTaskLog(context.taskId, `TAB_SELECTION ${JSON.stringify({
+      selectedTargetId: String(id),
+      selectedType: scalarString(active?.type),
+      selectedUrl: scalarString(active?.url),
+      selectedTitle: scalarString(active?.title),
+      candidateCount: candidates.length,
+      preferredCandidateCount: preferredCandidates.length,
+    })}`);
 
     return {
       id: String(id),
@@ -772,6 +948,264 @@ export class OpenClawRuntime {
       title: string;
       readyState: string;
       scrollY: number;
+    };
+  }
+
+  private getRuntimeState(context: ExecutionContext) {
+    if (!context.runtimeState) {
+      throw new Error("Runtime state is not available for this script execution.");
+    }
+
+    return context.runtimeState;
+  }
+
+  private recordVisitedProfile(context: ExecutionContext, profileUrl: string) {
+    const runtimeState = this.getRuntimeState(context);
+    const normalizedProfileUrl = normalizeLinkedInProfileUrl(profileUrl);
+    const profileKey = normalizeLinkedInProfileKey(normalizedProfileUrl);
+
+    if (!normalizedProfileUrl || !profileKey) {
+      return null;
+    }
+
+    const existing = runtimeState.visitedProfiles.get(profileKey);
+
+    if (existing) {
+      return existing;
+    }
+
+    const visitedProfile = {
+      profileKey,
+      profileUrl: normalizedProfileUrl,
+      visitedAt: new Date().toISOString(),
+    } satisfies VisitedProfileRecord;
+
+    runtimeState.visitedProfiles.set(profileKey, visitedProfile);
+    return visitedProfile;
+  }
+
+  private buildProfileVisitLookupUrl(template: string, profileUrl: string, lookbackDays: number) {
+    if (!template) {
+      return "";
+    }
+
+    return template
+      .replaceAll("{profileUrl}", encodeURIComponent(profileUrl))
+      .replaceAll("{lookbackDays}", encodeURIComponent(String(lookbackDays)));
+  }
+
+  private async fetchRecentProfileVisit(profileUrl: string, lookbackDays: number, context: ExecutionContext) {
+    const template = scalarString(context.profileVisitLookupUrlTemplate).trim();
+    const requestUrl = this.buildProfileVisitLookupUrl(template, profileUrl, lookbackDays);
+
+    if (!requestUrl) {
+      throw new Error("Profile visit lookup URL is not configured for this script execution.");
+    }
+
+    const remoteControllerSecretKey = getRemoteControllerSecretKey();
+
+    if (!remoteControllerSecretKey) {
+      throw new Error("REMOTE_CONTROLLER_SECRET_KEY must be configured for profile history lookups.");
+    }
+
+    const response = await fetch(requestUrl, {
+      method: "GET",
+      headers: {
+        accept: "application/json",
+        "x-remote-controller-secret-key": remoteControllerSecretKey,
+      },
+      cache: "no-store",
+      signal: AbortSignal.timeout(15_000),
+    });
+
+    const payload = await response.json().catch(() => null);
+
+    if (!response.ok || typeof payload !== "object" || payload === null) {
+      throw new Error(
+        `Profile visit lookup failed${response.status ? ` with HTTP ${response.status}` : ""}.`
+      );
+    }
+
+    return payload as {
+      profileUrl?: string;
+      profileKey?: string;
+      lookbackDays?: number;
+      recentlyVisited?: boolean;
+      latestVisitedAt?: string | null;
+    };
+  }
+
+  private async navigateBackToProfileSourcePage(
+    targetId: string,
+    currentProfileUrl: string,
+    sourcePageUrl: string,
+    timeoutMs: number,
+    context: ExecutionContext = {}
+  ) {
+    await this.evaluate(targetId, `() => { window.history.back(); return true; }`, context);
+
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      await sleep(250);
+      const pageState = await this.getPageState(targetId, context);
+      const currentUrl = scalarString(pageState.url);
+
+      if (
+        currentUrl &&
+        currentUrl !== currentProfileUrl &&
+        pageState.readyState === "complete" &&
+        (!sourcePageUrl || currentUrl === sourcePageUrl || !normalizeLinkedInProfileKey(currentUrl))
+      ) {
+        return pageState;
+      }
+    }
+
+    if (sourcePageUrl && sourcePageUrl !== currentProfileUrl) {
+      await this.oc(["navigate", sourcePageUrl, "--target-id", targetId], context);
+      await this.oc(["wait", "--target-id", targetId, "--timeout-ms", String(timeoutMs), "--load", "load"], context);
+      return await this.getPageState(targetId, context);
+    }
+
+    throw new Error("Timed out returning to the profile source page.");
+  }
+
+  private async waitForLinkedInProfilePage(targetId: string, timeoutMs: number, context: ExecutionContext = {}) {
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      const pageState = await this.getPageState(targetId, context);
+      const profileUrl = normalizeLinkedInProfileUrl(pageState.url);
+
+      if (profileUrl && pageState.readyState === "complete") {
+        return {
+          pageState,
+          profileUrl,
+          profileKey: normalizeLinkedInProfileKey(profileUrl),
+        };
+      }
+
+      await sleep(250);
+    }
+
+    throw new Error("Timed out waiting for a LinkedIn profile page to load.");
+  }
+
+  private async openNextProfileCandidate(targetId: string, timeoutMs: number, context: ExecutionContext = {}) {
+    const runtimeState = this.getRuntimeState(context);
+    const selection = runtimeState.profileCardSelection;
+
+    if (!selection) {
+      throw new Error("No profile card selection context is available to choose the next profile.");
+    }
+
+    const nextStep = cloneScriptStep(selection.step);
+    nextStep.params.index = selection.currentIndex + 1;
+
+    try {
+      const resolved = await this.resolveSnapshotRef(targetId, nextStep, context);
+      await this.oc(["click", resolved.ref, "--target-id", targetId], context);
+      runtimeState.profileCardSelection = {
+        ...selection,
+        step: nextStep,
+        currentIndex: Number(nextStep.params.index),
+      };
+      return { resolved, nextIndex: Number(nextStep.params.index) };
+    } catch (error) {
+      if (error instanceof SnapshotRefNotFoundError) {
+        return null;
+      }
+
+      if (error instanceof Error && /Could not resolve an OpenClaw ref/.test(error.message)) {
+        return null;
+      }
+
+      throw error;
+    }
+  }
+
+  private async skipIfProfileRecentlyVisited(
+    targetId: string,
+    step: ScriptStep,
+    context: ExecutionContext = {}
+  ) {
+    const lookbackDays = boundedPositiveInteger(step.params.lookbackDays, 30);
+    const maxSkips = boundedPositiveInteger(step.params.maxSkips, 25);
+    const skippedProfiles: string[] = [];
+
+    for (let attempt = 0; attempt < maxSkips; attempt += 1) {
+      const { pageState, profileUrl, profileKey } = await this.waitForLinkedInProfilePage(
+        targetId,
+        step.timeoutMs,
+        context
+      );
+      this.recordVisitedProfile(context, profileUrl);
+      const lookup = await this.fetchRecentProfileVisit(profileUrl, lookbackDays, context);
+      const recentlyVisited = lookup.recentlyVisited === true;
+
+      appendTaskLog(context.taskId, `PROFILE_VISIT_CHECK ${JSON.stringify({
+        taskId: context.taskId ?? null,
+        checkedAt: new Date().toISOString(),
+        profileUrl,
+        profileKey,
+        lookbackDays,
+        recentlyVisited,
+        latestVisitedAt: lookup.latestVisitedAt ?? null,
+      })}`);
+
+      if (!recentlyVisited) {
+        return {
+          ok: true,
+          action: step.kind,
+          profileUrl,
+          profileKey,
+          lookbackDays,
+          recentlyVisited: false,
+          skippedProfiles,
+          currentPage: pageState,
+        };
+      }
+
+      skippedProfiles.push(profileUrl);
+      const runtimeState = this.getRuntimeState(context);
+      const sourcePageUrl = runtimeState.profileCardSelection?.sourcePageUrl || "";
+
+      await this.navigateBackToProfileSourcePage(
+        targetId,
+        profileUrl,
+        sourcePageUrl,
+        step.timeoutMs,
+        context
+      );
+
+      const nextCandidate = await this.openNextProfileCandidate(targetId, step.timeoutMs, context);
+
+      if (!nextCandidate) {
+        return {
+          ok: true,
+          action: step.kind,
+          profileUrl,
+          profileKey,
+          lookbackDays,
+          recentlyVisited: true,
+          skippedProfiles,
+          exhausted: true,
+          branchAction: "end_script",
+        };
+      }
+
+      await this.waitForLinkedInProfilePage(targetId, step.timeoutMs, context);
+    }
+
+    return {
+      ok: true,
+      action: step.kind,
+      lookbackDays,
+      recentlyVisited: true,
+      skippedProfiles,
+      exhausted: true,
+      branchAction: "end_script",
+      reason: "max_skips_reached",
     };
   }
 
@@ -1469,30 +1903,235 @@ export class OpenClawRuntime {
   }
 
   private async moveMouseRandomly(targetId: string, context: ExecutionContext = {}) {
+    const helpers = this.buildSyntheticMouseCurveHelpers();
+
     return await this.evaluate(
       targetId,
-      `() => {
-        const viewportWidth = Math.max(window.innerWidth || 0, 1);
-        const viewportHeight = Math.max(window.innerHeight || 0, 1);
-        const clientX = Math.floor(Math.random() * Math.max(1, viewportWidth - 1));
-        const clientY = Math.floor(Math.random() * Math.max(1, viewportHeight - 1));
-        const element = document.elementFromPoint(clientX, clientY) || document.body;
-        const eventInit = {
-          bubbles: true,
-          cancelable: true,
-          view: window,
-          clientX,
-          clientY,
-        };
+      `async () => {
+        ${helpers}
+        return await moveSyntheticMouse(() => {
+          const viewportWidth = Math.max(window.innerWidth || 0, 1);
+          const viewportHeight = Math.max(window.innerHeight || 0, 1);
 
-        element.dispatchEvent(new MouseEvent("mouseover", eventInit));
-        element.dispatchEvent(new MouseEvent("mousemove", eventInit));
+          return {
+            x: Math.floor(Math.random() * Math.max(1, viewportWidth - 1)),
+            y: Math.floor(Math.random() * Math.max(1, viewportHeight - 1)),
+          };
+        });
+      }`,
+      context
+    );
+  }
+
+  private buildSyntheticMouseCurveHelpers() {
+    return `
+      const sleep = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
+      const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, value));
+      const randomBetween = (minimum, maximum) => minimum + (Math.random() * (maximum - minimum));
+      const randomInt = (minimum, maximum) => Math.round(randomBetween(minimum, maximum));
+      const easeInOut = (progress) => 0.5 - (Math.cos(Math.PI * progress) / 2);
+      const getBezierPoint = (startPoint, controlPoint1, controlPoint2, endPoint, progress) => {
+        const inverse = 1 - progress;
+        const inverseSquared = inverse * inverse;
+        const inverseCubed = inverseSquared * inverse;
+        const progressSquared = progress * progress;
+        const progressCubed = progressSquared * progress;
 
         return {
-          clientX,
-          clientY,
+          x:
+            (inverseCubed * startPoint.x) +
+            (3 * inverseSquared * progress * controlPoint1.x) +
+            (3 * inverse * progressSquared * controlPoint2.x) +
+            (progressCubed * endPoint.x),
+          y:
+            (inverseCubed * startPoint.y) +
+            (3 * inverseSquared * progress * controlPoint1.y) +
+            (3 * inverse * progressSquared * controlPoint2.y) +
+            (progressCubed * endPoint.y),
+        };
+      };
+      const dispatchPointerEvent = (element, type, eventInit) => {
+        if (typeof PointerEvent === "function") {
+          element.dispatchEvent(new PointerEvent(type, { pointerType: "mouse", isPrimary: true, ...eventInit }));
+        }
+      };
+      const dispatchMouseTransition = (fromElement, toElement, eventInit) => {
+        if (fromElement !== toElement) {
+          dispatchPointerEvent(fromElement, "pointerout", eventInit);
+          fromElement.dispatchEvent(new MouseEvent("mouseout", eventInit));
+          dispatchPointerEvent(toElement, "pointerover", eventInit);
+          toElement.dispatchEvent(new MouseEvent("mouseover", eventInit));
+        }
+      };
+      const dispatchMouseMove = (element, eventInit) => {
+        dispatchPointerEvent(element, "pointermove", eventInit);
+        element.dispatchEvent(new MouseEvent("mousemove", eventInit));
+      };
+      const getStoredPoint = (viewportWidth, viewportHeight) =>
+        window.__remoteControllerSyntheticMousePoint &&
+        typeof window.__remoteControllerSyntheticMousePoint.x === "number" &&
+        typeof window.__remoteControllerSyntheticMousePoint.y === "number"
+          ? {
+            x: clamp(Math.round(window.__remoteControllerSyntheticMousePoint.x), 0, Math.max(0, viewportWidth - 1)),
+            y: clamp(Math.round(window.__remoteControllerSyntheticMousePoint.y), 0, Math.max(0, viewportHeight - 1)),
+          }
+          : {
+            x: Math.floor(viewportWidth / 2),
+            y: Math.floor(viewportHeight / 2),
+          };
+      const moveSyntheticMouse = async (resolveTargetPoint) => {
+        const viewportWidth = Math.max(window.innerWidth || 0, 1);
+        const viewportHeight = Math.max(window.innerHeight || 0, 1);
+        const previousPoint = getStoredPoint(viewportWidth, viewportHeight);
+        const targetPointCandidate = resolveTargetPoint(previousPoint);
+
+        if (!targetPointCandidate || typeof targetPointCandidate.x !== "number" || typeof targetPointCandidate.y !== "number") {
+          return {
+            clientX: previousPoint.x,
+            clientY: previousPoint.y,
+            startX: previousPoint.x,
+            startY: previousPoint.y,
+            steps: 0,
+            settleSteps: 0,
+            moved: false,
+            tagName: (document.elementFromPoint(previousPoint.x, previousPoint.y) || document.body)?.tagName?.toLowerCase?.() || "body",
+          };
+        }
+
+        const targetPoint = {
+          x: clamp(Math.round(targetPointCandidate.x), 0, Math.max(0, viewportWidth - 1)),
+          y: clamp(Math.round(targetPointCandidate.y), 0, Math.max(0, viewportHeight - 1)),
+        };
+        const deltaX = targetPoint.x - previousPoint.x;
+        const deltaY = targetPoint.y - previousPoint.y;
+        const distance = Math.hypot(deltaX, deltaY);
+
+        if (distance < 1) {
+          window.__remoteControllerSyntheticMousePoint = targetPoint;
+          const element = document.elementFromPoint(targetPoint.x, targetPoint.y) || document.body;
+          return {
+            clientX: targetPoint.x,
+            clientY: targetPoint.y,
+            startX: previousPoint.x,
+            startY: previousPoint.y,
+            steps: 0,
+            settleSteps: 0,
+            moved: false,
+            tagName: element instanceof Element ? element.tagName.toLowerCase() : "body",
+          };
+        }
+
+        const steps = Math.max(18, Math.min(42, Math.ceil(distance / 14)));
+        const normalX = -deltaY / distance;
+        const normalY = deltaX / distance;
+        const curveMagnitude = randomBetween(
+          Math.min(14, Math.max(6, distance * 0.08)),
+          Math.min(56, Math.max(18, distance * 0.18))
+        ) * (Math.random() < 0.5 ? -1 : 1);
+        const controlPoint1Ratio = randomBetween(0.18, 0.3);
+        const controlPoint2Ratio = randomBetween(0.7, 0.84);
+        const controlPoint2CurveScale = randomBetween(0.3, 0.7);
+        const controlPoint1 = {
+          x: previousPoint.x + (deltaX * controlPoint1Ratio) + (normalX * curveMagnitude),
+          y: previousPoint.y + (deltaY * controlPoint1Ratio) + (normalY * curveMagnitude),
+        };
+        const controlPoint2 = {
+          x: previousPoint.x + (deltaX * controlPoint2Ratio) + (normalX * curveMagnitude * controlPoint2CurveScale),
+          y: previousPoint.y + (deltaY * controlPoint2Ratio) + (normalY * curveMagnitude * controlPoint2CurveScale),
+        };
+        const trajectory = [];
+        const settleSteps = Math.max(2, Math.min(4, Math.ceil(distance / 160) + 1));
+        const settleRadiusBase = Math.max(1.25, Math.min(5, distance * 0.03));
+
+        for (let step = 1; step <= steps; step += 1) {
+          trajectory.push(getBezierPoint(previousPoint, controlPoint1, controlPoint2, targetPoint, easeInOut(step / steps)));
+        }
+
+        for (let settleStep = 0; settleStep < settleSteps; settleStep += 1) {
+          const settleProgress = (settleStep + 1) / (settleSteps + 1);
+          const settleRadius = settleRadiusBase * (1 - settleProgress);
+          const settleDirection = settleStep % 2 === 0 ? 1 : -1;
+          trajectory.push({
+            x: targetPoint.x + (normalX * settleRadius * settleDirection),
+            y: targetPoint.y + (normalY * settleRadius * settleDirection),
+          });
+        }
+
+        trajectory.push(targetPoint);
+
+        let previousElement = document.elementFromPoint(previousPoint.x, previousPoint.y) || document.body;
+
+        for (const point of trajectory) {
+          const clientX = clamp(Math.round(point.x), 0, Math.max(0, viewportWidth - 1));
+          const clientY = clamp(Math.round(point.y), 0, Math.max(0, viewportHeight - 1));
+          const nextElement = document.elementFromPoint(clientX, clientY) || document.body;
+          const eventInit = {
+            bubbles: true,
+            cancelable: true,
+            view: window,
+            clientX,
+            clientY,
+          };
+
+          dispatchMouseTransition(previousElement, nextElement, eventInit);
+          dispatchMouseMove(nextElement, eventInit);
+          previousElement = nextElement;
+          await sleep(randomInt(10, 22));
+        }
+
+        window.__remoteControllerSyntheticMousePoint = targetPoint;
+        const element = document.elementFromPoint(targetPoint.x, targetPoint.y) || document.body;
+
+        return {
+          clientX: targetPoint.x,
+          clientY: targetPoint.y,
+          startX: previousPoint.x,
+          startY: previousPoint.y,
+          steps,
+          settleSteps,
+          moved: true,
           tagName: element instanceof Element ? element.tagName.toLowerCase() : "body",
         };
+      };
+    `;
+  }
+
+  private async moveMouseToResolvedRef(targetId: string, ref: string, context: ExecutionContext = {}) {
+    const helpers = this.buildSyntheticMouseCurveHelpers();
+
+    return await this.evaluateRef(
+      targetId,
+      ref,
+      `async (el) => {
+        ${helpers}
+        return await moveSyntheticMouse(() => {
+          if (!(el instanceof Element)) {
+            return null;
+          }
+
+          const rect = el.getBoundingClientRect();
+          const viewportWidth = Math.max(window.innerWidth || 0, 1);
+          const viewportHeight = Math.max(window.innerHeight || 0, 1);
+
+          if (rect.width <= 0 && rect.height <= 0) {
+            return {
+              x: Math.floor(viewportWidth / 2),
+              y: Math.floor(viewportHeight / 2),
+            };
+          }
+
+          const paddingX = Math.min(12, Math.max(2, rect.width * 0.15));
+          const paddingY = Math.min(12, Math.max(2, rect.height * 0.15));
+          const minX = clamp(rect.left + paddingX, 0, Math.max(0, viewportWidth - 1));
+          const maxX = clamp(rect.right - paddingX, 0, Math.max(0, viewportWidth - 1));
+          const minY = clamp(rect.top + paddingY, 0, Math.max(0, viewportHeight - 1));
+          const maxY = clamp(rect.bottom - paddingY, 0, Math.max(0, viewportHeight - 1));
+
+          return {
+            x: minX <= maxX ? randomBetween(minX, maxX) : clamp(rect.left + (rect.width / 2), 0, Math.max(0, viewportWidth - 1)),
+            y: minY <= maxY ? randomBetween(minY, maxY) : clamp(rect.top + (rect.height / 2), 0, Math.max(0, viewportHeight - 1)),
+          };
+        });
       }`,
       context
     );
@@ -1961,8 +2600,8 @@ export class OpenClawRuntime {
     if (step.kind === "move_mouse") {
       if (step.target && (step.target.text || step.target.role)) {
         const resolved = await this.resolveSnapshotRef(targetId, step, context);
-        await this.oc(["hover", resolved.ref, "--target-id", targetId], context);
-        return { ok: true, action: step.kind, matched: resolved };
+        const movement = await this.moveMouseToResolvedRef(targetId, resolved.ref, context);
+        return { ok: true, action: step.kind, matched: resolved, movement };
       }
 
       return await this.moveMouseRandomly(targetId, context);
@@ -1970,8 +2609,8 @@ export class OpenClawRuntime {
 
     if (step.kind === "hover") {
       const resolved = await this.resolveSnapshotRef(targetId, step, context);
-      await this.oc(["hover", resolved.ref, "--target-id", targetId], context);
-      return { ok: true, action: step.kind, matched: resolved };
+      const movement = await this.moveMouseToResolvedRef(targetId, resolved.ref, context);
+      return { ok: true, action: step.kind, matched: resolved, movement };
     }
 
     if (step.kind === "scroll") {
@@ -2001,6 +2640,8 @@ export class OpenClawRuntime {
     }
 
     if (step.kind === "click") {
+      const profileCardStep = isProfileCardStep(step);
+      const sourcePageState = profileCardStep ? await this.getPageState(targetId, context) : null;
       const resolved = await this.resolveSnapshotRef(targetId, step, context);
       const skipIfPressed = scalarBoolean(step.params.skipIfPressed, false);
       const activeStateTexts = scalarStringArray(step.params.activeStateTexts);
@@ -2039,6 +2680,14 @@ export class OpenClawRuntime {
 
       await this.oc(args, context);
 
+      if (profileCardStep && sourcePageState?.url) {
+        this.getRuntimeState(context).profileCardSelection = {
+          step: cloneScriptStep(step),
+          currentIndex: this.getCandidateIndex(step),
+          sourcePageUrl: scalarString(sourcePageState.url),
+        };
+      }
+
       if (shouldVerifyPressedAfterClick) {
         const verification = await this.verifyElementPressedStateAfterClick(
           targetId,
@@ -2056,6 +2705,10 @@ export class OpenClawRuntime {
       }
 
       return { ok: true, action: step.kind, matched: resolved };
+    }
+
+    if (step.kind === "skip_if_profile_recently_visited") {
+      return await this.skipIfProfileRecentlyVisited(targetId, step, context);
     }
 
     if (step.kind === "branch_if_missing") {
@@ -2081,6 +2734,9 @@ export class OpenClawRuntime {
           action: step.kind,
           branchAction: onMissing === "end_script" ? "end_script" : null,
           conditionMet: true,
+          reason: onMissing === "end_script"
+            ? `Target was missing for branch step ${step.order}.`
+            : undefined,
         } satisfies BranchStepResult;
       }
     }
@@ -2099,6 +2755,10 @@ export class OpenClawRuntime {
               ? onVisible
               : null,
           conditionMet: true,
+          reason:
+            onVisible === "end_script"
+              ? `Target became visible for branch step ${step.order}.`
+              : undefined,
           matched: resolved,
         } satisfies BranchStepResult;
       } catch (error) {
@@ -2188,12 +2848,16 @@ export class OpenClawRuntime {
   }
 
   private async runScript(script: ScriptInstructions, options: ExecuteScriptOptions = {}) {
-    const { targetId, taskId, engineMode = "deterministic" } = options;
+    const { targetId, taskId, engineMode = "deterministic", profileVisitLookupUrlTemplate } = options;
     const engineStats: ExecutionEngineStats = {
       aiSelections: 0,
       deterministicSelections: 0,
       aiFallbacks: 0,
       aiErrors: 0,
+    };
+    const runtimeState: RuntimeState = {
+      visitedProfiles: new Map<string, VisitedProfileRecord>(),
+      profileCardSelection: null,
     };
     initializeTaskLog(taskId, {
       taskId: taskId ?? null,
@@ -2210,6 +2874,7 @@ export class OpenClawRuntime {
     const stepResults: StepExecutionRecord[] = [];
     let endedEarly = false;
     let alert: AlertStopResult | null = null;
+    let earlyExit: EarlyExitResult | null = null;
 
     for (const step of [...script.steps].sort((left, right) => left.order - right.order)) {
       try {
@@ -2217,6 +2882,8 @@ export class OpenClawRuntime {
           taskId,
           engineMode,
           engineStats,
+          profileVisitLookupUrlTemplate,
+          runtimeState,
         });
         stepResults.push(stepResult);
 
@@ -2253,6 +2920,19 @@ export class OpenClawRuntime {
 
         if (branchAction === "end_script") {
           endedEarly = true;
+          const reason =
+            typeof stepResult.output === "object" &&
+              stepResult.output !== null &&
+              "reason" in stepResult.output
+              ? scalarString((stepResult.output as { reason?: unknown }).reason).trim()
+              : "";
+          earlyExit = {
+            detected: true,
+            reason: reason || "Branch condition ended the script early.",
+            stepOrder: step.order,
+            stepKind: step.kind,
+            instruction: step.instruction,
+          };
           appendTaskLog(taskId, `TASK_BRANCH_END ${JSON.stringify({
             taskId: taskId ?? null,
             endedAt: new Date().toISOString(),
@@ -2261,7 +2941,7 @@ export class OpenClawRuntime {
               kind: step.kind,
               instruction: step.instruction,
             },
-            reason: "target_missing",
+            reason: earlyExit.reason,
           })}`);
           break;
         }
@@ -2306,8 +2986,10 @@ export class OpenClawRuntime {
       startedAt,
       finishedAt: new Date().toISOString(),
       endedEarly,
+      earlyExit,
       alerted: Boolean(alert),
       alert,
+      visitedProfiles: [...runtimeState.visitedProfiles.values()],
       currentPage: await this.getPageState(activeTargetId, { taskId, engineMode, engineStats }),
       steps: stepResults,
     };

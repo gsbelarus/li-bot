@@ -150,6 +150,7 @@ const queue = new TaskQueue(async (task) => {
       engineMode: task.input.engineMode,
       targetId: task.input.targetId,
       taskId: task.id,
+      profileVisitLookupUrlTemplate: task.input.callback?.profileVisitLookupUrlTemplate,
     });
   } finally {
     cursorActivity.stop(task.id);

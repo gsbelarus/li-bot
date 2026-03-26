@@ -10,6 +10,49 @@ const defaultMouseActivityMinIntervalMs = 9000;
 const defaultMouseActivityMaxIntervalMs = 22000;
 const defaultMouseActivityMaxOffsetPx = 48;
 
+const alertDetailsSchema = new Schema(
+  {
+    taskId: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    message: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    reason: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    stepOrder: {
+      type: Number,
+      default: null,
+    },
+    stepKind: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    instruction: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    detectedAt: {
+      type: Date,
+      default: null,
+    },
+  },
+  {
+    _id: false,
+    id: false,
+    versionKey: false,
+  }
+);
+
 const remoteVpsSchema = new Schema(
   {
     name: {
@@ -92,6 +135,10 @@ const remoteVpsSchema = new Schema(
       type: String,
       default: "Awaiting initial controller communication",
       trim: true,
+    },
+    alertDetails: {
+      type: alertDetailsSchema,
+      default: null,
     },
     lastSeenAt: {
       type: Date,

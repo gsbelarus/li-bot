@@ -12,6 +12,8 @@ import {
   RemoteVpsRecord,
   RemoteVpsTimestampWarning,
   ScriptExecutionResult,
+  VpsAlertDetails,
+  VpsNotCompletedDetails,
   VpsEnvironment,
   VpsProtocol,
   VpsStatus,
@@ -35,9 +37,190 @@ const sensitiveKeyPattern = /(password|secret|token|authorization|cookie|apiKey|
 const safeString = (value: unknown, fallback = "") =>
   typeof value === "string" ? value.trim() : fallback;
 
+interface NormalizedVisitedProfile {
+  profileKey: string;
+  profileUrl: string;
+  visitedAt: Date;
+}
+
+function normalizeLinkedInProfileKey(value: unknown) {
+  const raw = safeString(value);
+
+  if (!raw) {
+    return "";
+  }
+
+  try {
+    const parsed = new URL(raw);
+    const hostname = parsed.hostname.toLowerCase();
+
+    if (!hostname.endsWith("linkedin.com")) {
+      return "";
+    }
+
+    const segments = parsed.pathname
+      .split("/")
+      .map((segment) => segment.trim())
+      .filter(Boolean);
+
+    if (segments.length < 2) {
+      return "";
+    }
+
+    const [profileType, profileSlug] = segments;
+
+    if ((profileType !== "in" && profileType !== "creator") || !profileSlug) {
+      return "";
+    }
+
+    return `/${profileType}/${profileSlug}`.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function normalizeLinkedInProfileUrl(value: unknown) {
+  const profileKey = normalizeLinkedInProfileKey(value);
+  return profileKey ? `https://www.linkedin.com${profileKey}` : "";
+}
+
+function extractVisitedProfilesFromResultPayload(payload: unknown) {
+  if (!isPlainObject(payload) || !isPlainObject(payload.result) || !Array.isArray(payload.result.visitedProfiles)) {
+    return [] as NormalizedVisitedProfile[];
+  }
+
+  const visitedProfiles = payload.result.visitedProfiles.reduce<NormalizedVisitedProfile[]>((accumulator, entry) => {
+    if (!isPlainObject(entry)) {
+      return accumulator;
+    }
+
+    const profileUrl = normalizeLinkedInProfileUrl(entry.profileUrl);
+    const profileKey = normalizeLinkedInProfileKey(profileUrl || entry.profileKey);
+
+    if (!profileUrl || !profileKey) {
+      return accumulator;
+    }
+
+    const visitedAtValue = entry.visitedAt instanceof Date ? entry.visitedAt : new Date(entry.visitedAt as string);
+    const visitedAt = Number.isNaN(visitedAtValue.getTime()) ? new Date() : visitedAtValue;
+
+    if (accumulator.some((item) => item.profileKey === profileKey)) {
+      return accumulator;
+    }
+
+    accumulator.push({
+      profileKey,
+      profileUrl,
+      visitedAt,
+    });
+
+    return accumulator;
+  }, []);
+
+  return visitedProfiles;
+}
+
 function normalizeScriptExecutionResult(value: unknown): ScriptExecutionResult | null {
   const normalized = safeString(value) as ScriptExecutionResult;
   return scriptExecutionResultOptions.includes(normalized) ? normalized : null;
+}
+
+function normalizeAlertStepOrder(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : null;
+}
+
+function getControllerTaskAlertDetails(options: {
+  payload: unknown;
+  taskId?: string;
+  detectedAt?: Date | string | null;
+}) {
+  const state = getControllerTaskResultState(options.payload);
+
+  if (!state.alerted || !state.alert) {
+    return null;
+  }
+
+  const detectedAt = toNullableIsoResult("createdAt", options.detectedAt ?? null).value;
+  const reason = safeString(state.alert.reason);
+  const stepKind = safeString(state.alert.stepKind);
+  const instruction = safeString(state.alert.instruction);
+  const stepOrder = normalizeAlertStepOrder(state.alert.stepOrder);
+  const message = reason
+    ? `Alert condition detected: ${reason}`
+    : "Alert condition detected during script execution.";
+
+  return {
+    taskId: safeString(options.taskId),
+    message,
+    reason,
+    stepOrder,
+    stepKind,
+    instruction,
+    detectedAt,
+  } satisfies VpsAlertDetails;
+}
+
+function getControllerTaskNotCompletedDetails(options: {
+  payload: unknown;
+  taskLogText?: string;
+  taskId?: string;
+  detectedAt?: Date | string | null;
+}) {
+  const state = getControllerTaskResultState(options.payload);
+
+  if (!state.endedEarly) {
+    return null;
+  }
+
+  const resultPayload = isPlainObject(options.payload) && isPlainObject(options.payload.result)
+    ? options.payload.result
+    : null;
+  const earlyExit = resultPayload && isPlainObject(resultPayload.earlyExit)
+    ? resultPayload.earlyExit
+    : null;
+  const logMatch = safeString(options.taskLogText).match(/TASK_BRANCH_END\s+(\{[^\r\n]*\})/);
+  const logEntry = (() => {
+    if (!logMatch) {
+      return null;
+    }
+
+    try {
+      const parsed = JSON.parse(logMatch[1]);
+      return isPlainObject(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  })();
+  const stepSource = earlyExit ?? (isPlainObject(logEntry?.step) ? logEntry.step : null);
+  const detectedAtInput =
+    options.detectedAt instanceof Date || typeof options.detectedAt === "string"
+      ? options.detectedAt
+      : typeof logEntry?.endedAt === "string"
+        ? logEntry.endedAt
+        : typeof resultPayload?.finishedAt === "string"
+          ? resultPayload.finishedAt
+          : null;
+  const detectedAt = toNullableIsoResult(
+    "createdAt",
+    detectedAtInput
+  ).value;
+  const reason = safeString(earlyExit?.reason || logEntry?.reason);
+  const stepKind = safeString(earlyExit?.stepKind || stepSource?.kind);
+  const instruction = safeString(earlyExit?.instruction || stepSource?.instruction);
+  const stepOrder = normalizeAlertStepOrder(earlyExit?.stepOrder ?? stepSource?.order);
+  const message = reason
+    ? `Script completed and ended early through branch logic. Cause: ${reason}`
+    : "Script completed and ended early through branch logic.";
+
+  return {
+    taskId: safeString(options.taskId),
+    message,
+    reason,
+    stepOrder,
+    stepKind,
+    instruction,
+    detectedAt,
+  } satisfies VpsNotCompletedDetails;
 }
 
 function maskSecret(secret: string) {
@@ -245,6 +428,11 @@ export function serializeVps(document: RemoteVpsDocument | RemoteVpsRecord | Rec
   );
   const createdAt = toIsoResult("createdAt", source.createdAt as Date | string | null | undefined);
   const updatedAt = toIsoResult("updatedAt", source.updatedAt as Date | string | null | undefined);
+  const alertDetailsSource = isPlainObject(source.alertDetails) ? source.alertDetails : null;
+  const alertDetectedAt = toNullableIsoResult(
+    "updatedAt",
+    alertDetailsSource?.detectedAt as Date | string | null | undefined
+  );
   const timestampWarnings = [
     lastSeenAt.warning,
     lastHealthCheckAt.warning,
@@ -288,6 +476,18 @@ export function serializeVps(document: RemoteVpsDocument | RemoteVpsRecord | Rec
     controllerVersion: safeString(source.controllerVersion),
     status: source.status as VpsStatus,
     statusReason: safeString(source.statusReason),
+    alertDetails: alertDetailsSource
+      ? {
+        taskId: safeString(alertDetailsSource.taskId),
+        message: safeString(alertDetailsSource.message),
+        reason: safeString(alertDetailsSource.reason),
+        stepOrder: normalizeAlertStepOrder(alertDetailsSource.stepOrder),
+        stepKind: safeString(alertDetailsSource.stepKind),
+        instruction: safeString(alertDetailsSource.instruction),
+        detectedAt: alertDetectedAt.value,
+      }
+      : null,
+    lastScriptExecutionResult: normalizeScriptExecutionResult(sourceRecord.lastScriptExecutionResult),
     lastSeenAt: lastSeenAt.value,
     lastHealthCheckAt: lastHealthCheckAt.value,
     lastHealthCheckResult: source.lastHealthCheckResult as
@@ -328,6 +528,13 @@ export function serializeInteractionLog(
   document: Record<string, unknown>
 ): RemoteVpsInteractionLogRecord {
   const createdAt = toIsoResult("createdAt", document.createdAt as Date | string | null | undefined);
+  const notCompletedDetailsSource = isPlainObject(document.notCompletedDetails)
+    ? document.notCompletedDetails
+    : null;
+  const notCompletedDetectedAt = toNullableIsoResult(
+    "createdAt",
+    notCompletedDetailsSource?.detectedAt as Date | string | null | undefined
+  );
 
   return {
     id: String(document._id),
@@ -346,6 +553,17 @@ export function serializeInteractionLog(
     responsePayload: document.responsePayload ?? null,
     result: document.result as LogResult,
     scriptExecutionResult: normalizeScriptExecutionResult(document.scriptExecutionResult),
+    notCompletedDetails: notCompletedDetailsSource
+      ? {
+        taskId: safeString(notCompletedDetailsSource.taskId),
+        message: safeString(notCompletedDetailsSource.message),
+        reason: safeString(notCompletedDetailsSource.reason),
+        stepOrder: normalizeAlertStepOrder(notCompletedDetailsSource.stepOrder),
+        stepKind: safeString(notCompletedDetailsSource.stepKind),
+        instruction: safeString(notCompletedDetailsSource.instruction),
+        detectedAt: notCompletedDetectedAt.value,
+      }
+      : null,
     errorCode: safeString(document.errorCode),
     errorMessage: safeString(document.errorMessage),
     durationMs:
@@ -383,6 +601,22 @@ function normalizeTags(input: unknown) {
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function toNotCompletedDetailsRecord(details: VpsNotCompletedDetails | null | undefined) {
+  if (!details) {
+    return null;
+  }
+
+  return {
+    taskId: details.taskId,
+    message: details.message,
+    reason: details.reason,
+    stepOrder: details.stepOrder,
+    stepKind: details.stepKind,
+    instruction: details.instruction,
+    detectedAt: details.detectedAt ? new Date(details.detectedAt) : null,
+  };
 }
 
 function getControllerTaskResultState(payload: unknown) {
@@ -427,8 +661,14 @@ function getControllerTaskResultLogResult(payload: unknown): LogResult {
 
 function getControllerTaskResultMessage(payload: unknown) {
   const { status, endedEarly, alerted, alert, error } = getControllerTaskResultState(payload);
+  const alertDetails = getControllerTaskAlertDetails({ payload });
+  const notCompletedDetails = getControllerTaskNotCompletedDetails({ payload });
 
   if (status === "completed" && alerted) {
+    if (alertDetails?.message) {
+      return alertDetails.message;
+    }
+
     if (typeof alert?.reason === "string" && alert.reason) {
       return `Alert condition detected: ${alert.reason}`;
     }
@@ -437,9 +677,11 @@ function getControllerTaskResultMessage(payload: unknown) {
   }
 
   if (status === "completed") {
-    return endedEarly
-      ? "Script completed and ended early through branch logic."
-      : "Script completed successfully.";
+    if (endedEarly) {
+      return notCompletedDetails?.message || "Script completed and ended early through branch logic.";
+    }
+
+    return "Script completed successfully.";
   }
 
   if (status === "failed") {
@@ -639,6 +881,14 @@ function buildScriptResultLogDocument(options: {
   initiatedByUserId: string;
   taskLogText: string;
 }) {
+  const visitedProfiles = extractVisitedProfilesFromResultPayload(options.responsePayload);
+  const notCompletedDetails = getControllerTaskNotCompletedDetails({
+    payload: options.responsePayload,
+    taskLogText: options.taskLogText,
+    taskId: options.taskId,
+    detectedAt: new Date(),
+  });
+
   return {
     direction: "internal_event" as const,
     interactionType: "script_result" as const,
@@ -655,10 +905,13 @@ function buildScriptResultLogDocument(options: {
       resultPayload: options.responsePayload,
       taskLogText: options.taskLogText,
     }),
+    notCompletedDetails,
     durationMs: options.durationMs,
     initiatedBy: "operator" as const,
     initiatedByUserId: options.initiatedByUserId,
     taskLogText: options.taskLogText,
+    visitedProfiles,
+    visitedProfileKeys: visitedProfiles.map((entry) => entry.profileKey),
     errorCode:
       getControllerTaskResultState(options.responsePayload).alerted
         ? "TASK_ALERT"
@@ -671,7 +924,10 @@ function buildScriptResultLogDocument(options: {
 
 async function applyAlertStatusFromScriptResult(options: {
   vpsId: string;
+  taskId: string;
   scriptExecutionResult: ScriptExecutionResult | null;
+  responsePayload: unknown;
+  detectedAt?: Date | string | null;
   alertMessage: string;
   updatedBy: string;
 }) {
@@ -679,11 +935,18 @@ async function applyAlertStatusFromScriptResult(options: {
     return;
   }
 
+  const alertDetails = getControllerTaskAlertDetails({
+    payload: options.responsePayload,
+    taskId: options.taskId,
+    detectedAt: options.detectedAt ?? new Date(),
+  });
+
   await RemoteVpsModel.findByIdAndUpdate(options.vpsId, {
     status: "alert",
     statusReason:
       options.alertMessage ||
       "Script execution detected a CAPTCHA or verification screen. Manual review is required.",
+    alertDetails,
     updatedBy: options.updatedBy,
   });
 }
@@ -713,7 +976,10 @@ export async function persistControllerTaskResultLog(options: {
 
   await applyAlertStatusFromScriptResult({
     vpsId: options.vpsId,
+    taskId: options.taskId,
     scriptExecutionResult: document.scriptExecutionResult,
+    responsePayload: options.responsePayload,
+    detectedAt: options.createdAt ?? new Date(),
     alertMessage: document.errorMessage,
     updatedBy: options.initiatedByUserId,
   });
@@ -753,9 +1019,11 @@ export async function persistControllerTaskResultLog(options: {
 function buildStatusUpdate(options: {
   currentStatus: VpsStatus;
   currentReason: string;
+  currentAlertDetails: unknown;
   preserveAlertStatus: boolean;
   nextStatus: VpsStatus;
   nextReason: string;
+  nextAlertDetails?: VpsAlertDetails | null;
 }) {
   if (options.preserveAlertStatus && options.currentStatus === "alert") {
     return {
@@ -763,12 +1031,16 @@ function buildStatusUpdate(options: {
       statusReason:
         options.currentReason ||
         "Script execution detected a CAPTCHA or verification screen. Manual review is required.",
+      alertDetails: isPlainObject(options.currentAlertDetails)
+        ? options.currentAlertDetails
+        : null,
     };
   }
 
   return {
     status: options.nextStatus,
     statusReason: options.nextReason,
+    alertDetails: options.nextStatus === "alert" ? options.nextAlertDetails ?? null : null,
   };
 }
 
@@ -813,6 +1085,50 @@ export async function backfillScriptResultLogsForVps(options: {
     scannedCount: items.length,
     updatedCount,
     skippedCount,
+  };
+}
+
+export async function findRecentProfileVisit(options: {
+  profileUrl: string;
+  lookbackDays: number;
+}) {
+  const profileUrl = normalizeLinkedInProfileUrl(options.profileUrl);
+  const profileKey = normalizeLinkedInProfileKey(profileUrl);
+
+  if (!profileUrl || !profileKey) {
+    return {
+      profileUrl: "",
+      profileKey: "",
+      lookbackDays: options.lookbackDays,
+      recentlyVisited: false,
+      latestVisitedAt: null,
+    };
+  }
+
+  const lookbackDays = Math.max(1, Math.floor(options.lookbackDays || 30));
+  const cutoff = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000);
+  const item = await RemoteVpsInteractionLogModel.findOne({
+    interactionType: "script_result",
+    visitedProfileKeys: profileKey,
+    createdAt: { $gte: cutoff },
+  })
+    .sort({ createdAt: -1 })
+    .select({ createdAt: 1, visitedProfiles: 1 })
+    .lean();
+
+  const matchedVisitedAt = Array.isArray(item?.visitedProfiles)
+    ? item.visitedProfiles.find((entry) => isPlainObject(entry) && safeString(entry.profileKey) === profileKey)
+    : null;
+  const latestVisitedAt = matchedVisitedAt && isPlainObject(matchedVisitedAt)
+    ? toNullableIsoResult("createdAt", matchedVisitedAt.visitedAt as Date | string | null | undefined).value
+    : toNullableIsoResult("createdAt", item?.createdAt as Date | string | null | undefined).value;
+
+  return {
+    profileUrl,
+    profileKey,
+    lookbackDays,
+    recentlyVisited: Boolean(item),
+    latestVisitedAt,
   };
 }
 
@@ -1015,6 +1331,7 @@ export function getListQuery(searchParams: URLSearchParams) {
   const search = safeString(searchParams.get("search"));
   const status = safeString(searchParams.get("status"));
   const environment = safeString(searchParams.get("environment"));
+  const lastScriptExecutionResult = safeString(searchParams.get("lastScriptExecutionResult"));
   const sortField = safeString(searchParams.get("sortField"), "updatedAt");
   const sortDirection = safeString(searchParams.get("sortDirection"), "desc");
 
@@ -1051,7 +1368,17 @@ export function getListQuery(searchParams: URLSearchParams) {
       sortDirection === "asc" ? 1 : -1,
   };
 
-  return { filter, page, pageSize, sort };
+  return {
+    filter,
+    page,
+    pageSize,
+    sort,
+    lastScriptExecutionResult: scriptExecutionResultOptions.includes(
+      lastScriptExecutionResult as ScriptExecutionResult
+    )
+      ? (lastScriptExecutionResult as ScriptExecutionResult)
+      : "",
+  };
 }
 
 export function getLogListQuery(searchParams: URLSearchParams) {
@@ -1119,6 +1446,7 @@ export async function createInteractionLog(entry: {
   responsePayload?: unknown;
   result: LogResult;
   scriptExecutionResult?: ScriptExecutionResult | null;
+  notCompletedDetails?: VpsNotCompletedDetails | null;
   errorCode?: string;
   errorMessage?: string;
   durationMs?: number | null;
@@ -1136,6 +1464,7 @@ export async function createInteractionLog(entry: {
     responseStatusCode: entry.responseStatusCode ?? null,
     responsePayload: sanitizePayload(entry.responsePayload ?? null),
     scriptExecutionResult: entry.scriptExecutionResult ?? null,
+    notCompletedDetails: toNotCompletedDetailsRecord(entry.notCompletedDetails),
     errorCode: entry.errorCode ?? "",
     errorMessage: entry.errorMessage ?? "",
     durationMs: entry.durationMs ?? null,
@@ -1243,10 +1572,11 @@ export async function performControllerProbe(options: {
     const controllerVersion = extractControllerVersion(responsePayload);
     const result: LogResult = response.ok ? "success" : "failed";
     const now = new Date();
-    const current = await RemoteVpsModel.findById(options.vps.id, { status: 1, statusReason: 1 }).lean();
+    const current = await RemoteVpsModel.findById(options.vps.id, { status: 1, statusReason: 1, alertDetails: 1 }).lean();
     const statusUpdate = buildStatusUpdate({
       currentStatus: (current?.status as VpsStatus | undefined) ?? options.vps.status,
       currentReason: safeString(current?.statusReason, options.vps.statusReason),
+      currentAlertDetails: current?.alertDetails,
       preserveAlertStatus: options.preserveAlertStatus !== false,
       nextStatus: options.vps.isEnabled
         ? response.ok
@@ -1304,10 +1634,11 @@ export async function performControllerProbe(options: {
     const now = new Date();
     const timeout = isTimeoutError(error);
     const errorMessage = error instanceof Error ? error.message : "Unknown probe failure";
-    const current = await RemoteVpsModel.findById(options.vps.id, { status: 1, statusReason: 1 }).lean();
+    const current = await RemoteVpsModel.findById(options.vps.id, { status: 1, statusReason: 1, alertDetails: 1 }).lean();
     const statusUpdate = buildStatusUpdate({
       currentStatus: (current?.status as VpsStatus | undefined) ?? options.vps.status,
       currentReason: safeString(current?.statusReason, options.vps.statusReason),
+      currentAlertDetails: current?.alertDetails,
       preserveAlertStatus: options.preserveAlertStatus !== false,
       nextStatus: options.vps.isEnabled ? "offline" : "disabled",
       nextReason: timeout
@@ -1401,10 +1732,11 @@ async function performControllerRequest(options: {
     const controllerVersion = extractControllerVersion(responsePayload);
     const result: LogResult = response.ok ? "success" : "failed";
     const now = new Date();
-    const current = await RemoteVpsModel.findById(options.vps.id, { status: 1, statusReason: 1 }).lean();
+    const current = await RemoteVpsModel.findById(options.vps.id, { status: 1, statusReason: 1, alertDetails: 1 }).lean();
     const statusUpdate = buildStatusUpdate({
       currentStatus: (current?.status as VpsStatus | undefined) ?? options.vps.status,
       currentReason: safeString(current?.statusReason, options.vps.statusReason),
+      currentAlertDetails: current?.alertDetails,
       preserveAlertStatus: options.preserveAlertStatus !== false,
       nextStatus: options.vps.isEnabled ? (response.ok ? "online" : "degraded") : "disabled",
       nextReason: options.vps.isEnabled
@@ -1450,10 +1782,11 @@ async function performControllerRequest(options: {
     const now = new Date();
     const timeout = isTimeoutError(error);
     const errorMessage = error instanceof Error ? error.message : "Unknown controller request failure";
-    const current = await RemoteVpsModel.findById(options.vps.id, { status: 1, statusReason: 1 }).lean();
+    const current = await RemoteVpsModel.findById(options.vps.id, { status: 1, statusReason: 1, alertDetails: 1 }).lean();
     const statusUpdate = buildStatusUpdate({
       currentStatus: (current?.status as VpsStatus | undefined) ?? options.vps.status,
       currentReason: safeString(current?.statusReason, options.vps.statusReason),
+      currentAlertDetails: current?.alertDetails,
       preserveAlertStatus: options.preserveAlertStatus !== false,
       nextStatus: options.vps.isEnabled ? "offline" : "disabled",
       nextReason: timeout
@@ -1513,6 +1846,7 @@ export async function dispatchExecuteScriptCommand(options: {
     maxOffsetPx?: number;
   };
   taskResultWebhookUrlTemplate?: string;
+  profileVisitLookupUrlTemplate?: string;
   initiatedByUserId: string;
 }) {
   if (options.vps.status === "alert") {
@@ -1552,9 +1886,10 @@ export async function dispatchExecuteScriptCommand(options: {
         }
         : undefined,
       script: structuredInstructions,
-      callback: options.taskResultWebhookUrlTemplate
+      callback: options.taskResultWebhookUrlTemplate || options.profileVisitLookupUrlTemplate
         ? {
           taskResultWebhookUrlTemplate: options.taskResultWebhookUrlTemplate,
+          profileVisitLookupUrlTemplate: options.profileVisitLookupUrlTemplate,
         }
         : undefined,
     },

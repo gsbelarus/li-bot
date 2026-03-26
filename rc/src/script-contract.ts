@@ -1,6 +1,7 @@
 export const scriptActionKinds = [
   "navigate",
   "click",
+  "skip_if_profile_recently_visited",
   "branch_if_missing",
   "branch_if_visible",
   "hover",
@@ -50,6 +51,7 @@ export type ExecutionEngineMode = (typeof executionEngineModes)[number];
 
 export interface ExecuteScriptCallbackConfig {
   taskResultWebhookUrlTemplate: string;
+  profileVisitLookupUrlTemplate?: string;
 }
 
 export interface MouseActivityConfig {
@@ -121,13 +123,15 @@ function normalizeCallbackConfig(value: unknown): ExecuteScriptCallbackConfig | 
   }
 
   const taskResultWebhookUrlTemplate = safeString(value.taskResultWebhookUrlTemplate);
+  const profileVisitLookupUrlTemplate = safeString(value.profileVisitLookupUrlTemplate);
 
-  if (!taskResultWebhookUrlTemplate) {
+  if (!taskResultWebhookUrlTemplate && !profileVisitLookupUrlTemplate) {
     return undefined;
   }
 
   return {
     taskResultWebhookUrlTemplate,
+    profileVisitLookupUrlTemplate: profileVisitLookupUrlTemplate || undefined,
   };
 }
 

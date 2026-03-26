@@ -1,6 +1,7 @@
 export const scriptActionKinds = [
   "navigate",
   "click",
+  "skip_if_profile_recently_visited",
   "branch_if_missing",
   "branch_if_visible",
   "hover",

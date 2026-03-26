@@ -92,6 +92,50 @@ function Clamp([int] $value, [int] $minimum, [int] $maximum) {
   return [Math]::Max($minimum, [Math]::Min($maximum, $value))
 }
 
+function Get-RandomDouble([double] $minimum, [double] $maximum) {
+  if ($maximum -le $minimum) {
+    return $minimum
+  }
+
+  return $minimum + ($random.NextDouble() * ($maximum - $minimum))
+}
+
+function New-Point([double] $x, [double] $y) {
+  return [PSCustomObject]@{
+    X = $x
+    Y = $y
+  }
+}
+
+function Lerp([double] $start, [double] $end, [double] $progress) {
+  return $start + (($end - $start) * $progress)
+}
+
+function Ease-InOut([double] $progress) {
+  return 0.5 - ([Math]::Cos([Math]::PI * $progress) / 2)
+}
+
+function Get-CubicBezierPoint($startPoint, $controlPoint1, $controlPoint2, $endPoint, [double] $progress) {
+  $inverse = 1 - $progress
+  $inverseSquared = $inverse * $inverse
+  $inverseCubed = $inverseSquared * $inverse
+  $progressSquared = $progress * $progress
+  $progressCubed = $progressSquared * $progress
+
+  $x =
+    ($inverseCubed * $startPoint.X) +
+    (3 * $inverseSquared * $progress * $controlPoint1.X) +
+    (3 * $inverse * $progressSquared * $controlPoint2.X) +
+    ($progressCubed * $endPoint.X)
+  $y =
+    ($inverseCubed * $startPoint.Y) +
+    (3 * $inverseSquared * $progress * $controlPoint1.Y) +
+    (3 * $inverse * $progressSquared * $controlPoint2.Y) +
+    ($progressCubed * $endPoint.Y)
+
+  return New-Point $x $y
+}
+
 while ($true) {
   Start-Sleep -Milliseconds (Get-RandomInt $minIntervalMs $maxIntervalMs)
 
@@ -106,31 +150,55 @@ while ($true) {
     continue
   }
 
-  $steps = Get-RandomInt $minStepCount $maxStepCount
-  $jitterRange = [Math]::Max(1, [Math]::Floor($maxOffsetPx / 6))
+  $deltaX = [double] ($targetX - $point.X)
+  $deltaY = [double] ($targetY - $point.Y)
+  $distance = [Math]::Sqrt(($deltaX * $deltaX) + ($deltaY * $deltaY))
+
+  if ($distance -lt 1) {
+    continue
+  }
+
+  $distanceStepCap = [Math]::Max(
+    $minStepCount,
+    [Math]::Min($maxStepCount, [int] [Math]::Ceiling($distance / 9))
+  )
+  $steps = Get-RandomInt $minStepCount $distanceStepCap
+  $travelX = $deltaX / $distance
+  $travelY = $deltaY / $distance
+  $normalX = -1 * $travelY
+  $normalY = $travelX
+  $curveMagnitudeMin = [Math]::Min(10.0, [Math]::Max(4.0, $distance * 0.08))
+  $curveMagnitudeMax = [Math]::Min([double] ($maxOffsetPx * 1.7), [Math]::Max(16.0, $distance * 0.18))
+  $curveMagnitude = Get-RandomDouble $curveMagnitudeMin $curveMagnitudeMax
+
+  if ($random.NextDouble() -lt 0.5) {
+    $curveMagnitude = -1 * $curveMagnitude
+  }
+
+  $startPoint = New-Point ([double] $point.X) ([double] $point.Y)
+  $endPoint = New-Point ([double] $targetX) ([double] $targetY)
+  $controlPoint1Ratio = Get-RandomDouble 0.2 0.32
+  $controlPoint2Ratio = Get-RandomDouble 0.68 0.82
+  $controlPoint2CurveScale = Get-RandomDouble 0.35 0.75
+  $controlPoint1X = (Lerp $startPoint.X $endPoint.X $controlPoint1Ratio) + ($normalX * $curveMagnitude)
+  $controlPoint1Y = (Lerp $startPoint.Y $endPoint.Y $controlPoint1Ratio) + ($normalY * $curveMagnitude)
+  $controlPoint2X = (Lerp $startPoint.X $endPoint.X $controlPoint2Ratio) + ($normalX * ($curveMagnitude * $controlPoint2CurveScale))
+  $controlPoint2Y = (Lerp $startPoint.Y $endPoint.Y $controlPoint2Ratio) + ($normalY * ($curveMagnitude * $controlPoint2CurveScale))
+  $controlPoint1 = New-Point $controlPoint1X $controlPoint1Y
+  $controlPoint2 = New-Point $controlPoint2X $controlPoint2Y
+  $trajectory = @()
 
   for ($step = 1; $step -le $steps; $step += 1) {
-    $progress = $step / [double] $steps
+    $progress = Ease-InOut ($step / [double] $steps)
+    $trajectory += ,(Get-CubicBezierPoint $startPoint $controlPoint1 $controlPoint2 $endPoint $progress)
+  }
 
-    if ($progress -lt 0.5) {
-      $ease = 2 * $progress * $progress
-    } else {
-      $ease = 1 - [Math]::Pow(-2 * $progress + 2, 2) / 2
-    }
-
-    if ($step -eq $steps) {
-      $jitterX = 0
-      $jitterY = 0
-    } else {
-      $jitterX = Get-RandomInt (-1 * $jitterRange) $jitterRange
-      $jitterY = Get-RandomInt (-1 * $jitterRange) $jitterRange
-    }
-
-    $nextX = Clamp ([int] [Math]::Round($point.X + (($targetX - $point.X) * $ease) + $jitterX)) $virtualScreen.Left ($virtualScreen.Right - 1)
-    $nextY = Clamp ([int] [Math]::Round($point.Y + (($targetY - $point.Y) * $ease) + $jitterY)) $virtualScreen.Top ($virtualScreen.Bottom - 1)
+  foreach ($pointOnCurve in $trajectory) {
+    $nextX = Clamp ([int] [Math]::Round($pointOnCurve.X)) $virtualScreen.Left ($virtualScreen.Right - 1)
+    $nextY = Clamp ([int] [Math]::Round($pointOnCurve.Y)) $virtualScreen.Top ($virtualScreen.Bottom - 1)
 
     [CursorInterop]::SetCursorPos($nextX, $nextY) | Out-Null
-    Start-Sleep -Milliseconds (Get-RandomInt 14 32)
+    Start-Sleep -Milliseconds (Get-RandomInt 8 16)
   }
 }
 `.trim();

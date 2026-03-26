@@ -8,6 +8,73 @@ import {
   scriptExecutionResultOptions,
 } from "@/lib/remote-vps-shared";
 
+const notCompletedDetailsSchema = new Schema(
+  {
+    taskId: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    message: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    reason: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    stepOrder: {
+      type: Number,
+      default: null,
+    },
+    stepKind: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    instruction: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    detectedAt: {
+      type: Date,
+      default: null,
+    },
+  },
+  {
+    _id: false,
+    id: false,
+    versionKey: false,
+  }
+);
+
+const visitedProfileSchema = new Schema(
+  {
+    profileKey: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    profileUrl: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    visitedAt: {
+      type: Date,
+      required: true,
+    },
+  },
+  {
+    _id: false,
+    id: false,
+    versionKey: false,
+  }
+);
+
 const remoteVpsInteractionLogSchema = new Schema(
   {
     vpsId: {
@@ -63,6 +130,10 @@ const remoteVpsInteractionLogSchema = new Schema(
       enum: scriptExecutionResultOptions,
       default: null,
     },
+    notCompletedDetails: {
+      type: notCompletedDetailsSchema,
+      default: null,
+    },
     errorCode: {
       type: String,
       default: "",
@@ -97,6 +168,14 @@ const remoteVpsInteractionLogSchema = new Schema(
       type: String,
       default: "",
     },
+    visitedProfiles: {
+      type: [visitedProfileSchema],
+      default: [],
+    },
+    visitedProfileKeys: {
+      type: [String],
+      default: [],
+    },
     createdAt: {
       type: Date,
       default: () => new Date(),
@@ -112,6 +191,8 @@ const remoteVpsInteractionLogSchema = new Schema(
 remoteVpsInteractionLogSchema.index({ vpsId: 1, createdAt: -1 });
 remoteVpsInteractionLogSchema.index({ correlationId: 1 });
 remoteVpsInteractionLogSchema.index({ vpsId: 1, result: 1, interactionType: 1, createdAt: -1 });
+remoteVpsInteractionLogSchema.index({ visitedProfileKeys: 1, createdAt: -1 });
+remoteVpsInteractionLogSchema.index({ vpsId: 1, visitedProfileKeys: 1, createdAt: -1 });
 remoteVpsInteractionLogSchema.index({ createdAt: 1 }, { expireAfterSeconds: 60 * 60 * 24 * 180 });
 
 export type RemoteVpsInteractionLogDocument = InferSchemaType<

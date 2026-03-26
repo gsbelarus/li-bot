@@ -68,11 +68,13 @@ export async function PATCH(
         ? "Re-enabled. Awaiting fresh controller communication."
         : current.statusReason
       : "Record disabled by operator.";
+    const nextAlertDetails = nextStatus === "alert" ? current.alertDetails ?? null : null;
 
     current.set({
       ...payload,
       status: nextStatus,
       statusReason: nextStatusReason,
+      alertDetails: nextAlertDetails,
       updatedBy: actor,
     });
 
@@ -123,6 +125,7 @@ export async function DELETE(
     isEnabled: false,
     status: "disabled",
     statusReason: "Soft deleted by operator.",
+    alertDetails: null,
     updatedBy: getActorFromRequest(request),
   });
 
