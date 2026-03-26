@@ -51,6 +51,7 @@ import {
 } from "@mui/x-data-grid-premium";
 
 import { ControlCenterSidebar } from "@/components/control-center-sidebar";
+import { controlCenterSections } from "@/lib/control-center-navigation";
 import {
   RemoteVpsInteractionLogRecord,
   RemoteVpsRecord,
@@ -2132,11 +2133,7 @@ export function RemoteVpsControlCenter() {
       <ControlCenterSidebar
         title="Remote Fleet"
         description="Registry for endpoints, diagnostics, and notes."
-        sections={[
-          { href: "/", label: "Remote VPS", description: "Registry and diagnostics" },
-          { href: "/scripts", label: "Scripts", description: "Authoring and conversion" },
-          { href: "/logs", label: "Logs", description: "System-wide retained logs" },
-        ]}
+        sections={controlCenterSections}
         activeHref="/"
         footerTitle="Registry posture"
         footerBody={`${listData.totalCount} active records with retained logs.`}

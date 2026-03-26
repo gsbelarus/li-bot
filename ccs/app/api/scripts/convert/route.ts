@@ -1,13 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import OpenAI from "openai";
 
 import { normalizeStructuredInstructions } from "@/lib/scripts";
+import { createOpenAiClient, getConfiguredOpenAiModel, getOpenAiApiKey } from "@/lib/openai-server";
 import type { ScriptInstructions, ScriptStep } from "@/lib/scripts-shared";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const { OPENAI_API_KEY, OPENAI_PROJECT_KEY } = process.env;
 const alternativeConnectorPattern = /\b(?:or|alternatively|sometimes)\b/i;
 const alternativeSplitPattern = /\s*(?:,|\bor\b|\balternatively\b)\s*/i;
 
@@ -1247,7 +1246,7 @@ const conversionTool = {
 };
 
 export async function POST(request: NextRequest) {
-  if (!OPENAI_API_KEY) {
+  if (!getOpenAiApiKey()) {
     return NextResponse.json(
       { error: "Missing OPENAI_API_KEY environment variable." },
       { status: 500 }
@@ -1261,14 +1260,11 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "plainText is required." }, { status: 400 });
   }
 
-  const client = new OpenAI({
-    apiKey: OPENAI_API_KEY,
-    project: OPENAI_PROJECT_KEY,
-  });
+  const client = createOpenAiClient();
 
   try {
     const completion = await client.chat.completions.create({
-      model: "gpt-4.1-mini",
+      model: getConfiguredOpenAiModel(),
       temperature: 0.2,
       messages: [
         {

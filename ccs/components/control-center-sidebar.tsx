@@ -4,11 +4,7 @@ import Link from "next/link";
 
 import { Box, List, ListItemButton, ListItemText, Typography } from "@mui/material";
 
-interface SidebarSection {
-  href: string;
-  label: string;
-  description: string;
-}
+import { ControlCenterSection } from "@/lib/control-center-navigation";
 
 export function ControlCenterSidebar({
   title,
@@ -20,7 +16,7 @@ export function ControlCenterSidebar({
 }: {
   title: string;
   description: string;
-  sections: SidebarSection[];
+  sections: ControlCenterSection[];
   activeHref: string;
   footerTitle: string;
   footerBody: string;

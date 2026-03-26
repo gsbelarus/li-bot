@@ -50,6 +50,7 @@ import { json } from "@codemirror/lang-json";
 import ReactMarkdown from "react-markdown";
 
 import { ControlCenterSidebar } from "@/components/control-center-sidebar";
+import { controlCenterSections } from "@/lib/control-center-navigation";
 import {
   ScriptConvertResponse,
   ScriptEngineMode,
@@ -809,11 +810,7 @@ export function ScriptsControlCenter() {
       <ControlCenterSidebar
         title="Automation Scripts"
         description="Manage reusable scripts and convert notes into JSON."
-        sections={[
-          { href: "/", label: "Remote VPS", description: "Registry and diagnostics" },
-          { href: "/scripts", label: "Scripts", description: "Authoring and conversion" },
-          { href: "/logs", label: "Logs", description: "System-wide retained logs" },
-        ]}
+        sections={controlCenterSections}
         activeHref="/scripts"
         footerTitle="Script library"
         footerBody={`${listData.totalCount} scripts tracked. ${listData.items.filter((item) => !item.isDisabled).length} enabled on this page.`}

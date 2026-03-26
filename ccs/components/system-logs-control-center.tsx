@@ -38,6 +38,7 @@ import {
 import { json } from "@codemirror/lang-json";
 
 import { ControlCenterSidebar } from "@/components/control-center-sidebar";
+import { controlCenterSections } from "@/lib/control-center-navigation";
 import {
   SystemLogListResponse,
   SystemLogRecord,
@@ -659,11 +660,7 @@ export function SystemLogsControlCenter() {
       <ControlCenterSidebar
         title="Operations"
         description="Global diagnostics, scripts, and remote endpoints."
-        sections={[
-          { href: "/", label: "Remote VPS", description: "Registry and diagnostics" },
-          { href: "/scripts", label: "Scripts", description: "Authoring and conversion" },
-          { href: "/logs", label: "Logs", description: "System-wide retained logs" },
-        ]}
+        sections={controlCenterSections}
         activeHref="/logs"
         footerTitle="Log retention"
         footerBody={`${listData.totalCount} logs match the current filter.`}
