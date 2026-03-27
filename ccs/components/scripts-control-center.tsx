@@ -8,6 +8,8 @@ import AddRoundedIcon from "@mui/icons-material/AddRounded";
 import ArrowBackRoundedIcon from "@mui/icons-material/ArrowBackRounded";
 import AutoAwesomeRoundedIcon from "@mui/icons-material/AutoAwesomeRounded";
 import DeleteOutlineRoundedIcon from "@mui/icons-material/DeleteOutlineRounded";
+import ExpandLessRoundedIcon from "@mui/icons-material/ExpandLessRounded";
+import ExpandMoreRoundedIcon from "@mui/icons-material/ExpandMoreRounded";
 import SaveRoundedIcon from "@mui/icons-material/SaveRounded";
 import SearchRoundedIcon from "@mui/icons-material/SearchRounded";
 import VisibilityRoundedIcon from "@mui/icons-material/VisibilityRounded";
@@ -48,23 +50,42 @@ import { json } from "@codemirror/lang-json";
 import ReactMarkdown from "react-markdown";
 
 import { ControlCenterSidebar } from "@/components/control-center-sidebar";
+import { controlCenterSections } from "@/lib/control-center-navigation";
 import {
   ScriptConvertResponse,
+  ScriptEngineMode,
   ScriptListResponse,
   ScriptMutationResponse,
   ScriptRecord,
   createEmptyScriptInstructions,
+  scriptEngineModes,
 } from "@/lib/scripts-shared";
 
 type ScreenState = { kind: "list" } | { kind: "create" } | { kind: "details"; scriptId: string };
-type ScriptFormErrors = Partial<Record<"name" | "plainText" | "form", string>>;
+type ScriptFormErrors = Partial<Record<"name" | "plainText" | "structuredInstructions" | "engineMode" | "form", string>>;
 
 interface ScriptFormValues {
   name: string;
   description: string;
   plainText: string;
   structuredInstructions: ScriptRecord["structuredInstructions"];
+  engineMode: ScriptEngineMode;
   isDisabled: boolean;
+}
+
+const scriptEngineModeLabels: Record<ScriptEngineMode, string> = {
+  deterministic: "Deterministic",
+  ai_driven: "AI-driven",
+};
+
+const scriptEngineModeDescriptions: Record<ScriptEngineMode, string> = {
+  deterministic: "Uses the current deterministic resolver and execution engine.",
+  ai_driven: "Uses AI-guided snapshot target selection in rc while keeping action execution deterministic. rc falls back to deterministic matching only when AI selection is unavailable or does not produce a usable target.",
+};
+
+interface ValidationResult {
+  isValid: boolean;
+  parsedStructuredInstructions?: ScriptFormValues["structuredInstructions"];
 }
 
 const operatorId = "operator@control-center";
@@ -83,8 +104,23 @@ function toFormValues(record?: ScriptRecord | null): ScriptFormValues {
     plainText: record?.plainText ?? "",
     structuredInstructions:
       record?.structuredInstructions ?? createEmptyScriptInstructions(),
+    engineMode: record?.engineMode ?? "deterministic",
     isDisabled: record?.isDisabled ?? false,
   };
+}
+
+function toStructuredInstructionsText(value: ScriptFormValues["structuredInstructions"]) {
+  return JSON.stringify(value, null, 2);
+}
+
+function parseStructuredInstructionsText(value: string) {
+  const parsed = JSON.parse(value) as ScriptFormValues["structuredInstructions"];
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Structured instructions must be a JSON object.");
+  }
+
+  return parsed;
 }
 
 async function requestJson<T>(input: string, init?: RequestInit): Promise<T> {
@@ -140,8 +176,12 @@ function ScriptDetailScreen({
   onDeleted: (item: ScriptRecord) => void;
 }) {
   const [values, setValues] = useState<ScriptFormValues>(toFormValues(record));
+  const [structuredInstructionsText, setStructuredInstructionsText] = useState(() =>
+    toStructuredInstructionsText(toFormValues(record).structuredInstructions)
+  );
   const [errors, setErrors] = useState<ScriptFormErrors>({});
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [isDetailsExpanded, setIsDetailsExpanded] = useState(true);
   const [markdownTab, setMarkdownTab] = useState<"source" | "preview">("source");
   const [isSaving, startSaving] = useTransition();
   const [isConverting, startConverting] = useTransition();
@@ -152,8 +192,9 @@ function ScriptDetailScreen({
     setValues((current) => ({ ...current, [key]: value }));
   };
 
-  function validate() {
+  function validate(): ValidationResult {
     const nextErrors: ScriptFormErrors = {};
+    let parsedStructuredInstructions: ScriptFormValues["structuredInstructions"] | undefined;
 
     if (!values.name.trim()) {
       nextErrors.name = "Script name is required.";
@@ -163,14 +204,64 @@ function ScriptDetailScreen({
       nextErrors.plainText = "Script markdown is required.";
     }
 
+    try {
+      const nextStructuredInstructions = parseStructuredInstructionsText(structuredInstructionsText);
+      parsedStructuredInstructions = nextStructuredInstructions;
+      setValues((current) => ({
+        ...current,
+        structuredInstructions: nextStructuredInstructions,
+      }));
+    } catch (error) {
+      nextErrors.structuredInstructions =
+        error instanceof Error ? error.message : "Structured instructions must be valid JSON.";
+    }
+
     setErrors(nextErrors);
-    return Object.keys(nextErrors).length === 0;
+    return {
+      isValid: Object.keys(nextErrors).length === 0,
+      parsedStructuredInstructions,
+    };
+  }
+
+  function handleStructuredInstructionsChange(value: string) {
+    setStructuredInstructionsText(value);
+
+    try {
+      const parsedStructuredInstructions = parseStructuredInstructionsText(value);
+      setValues((current) => ({
+        ...current,
+        structuredInstructions: parsedStructuredInstructions,
+      }));
+      setErrors((current) => {
+        if (!current.structuredInstructions) {
+          return current;
+        }
+
+        return {
+          ...current,
+          structuredInstructions: undefined,
+        };
+      });
+    } catch (error) {
+      setErrors((current) => ({
+        ...current,
+        structuredInstructions:
+          error instanceof Error ? error.message : "Structured instructions must be valid JSON.",
+      }));
+    }
   }
 
   function handleSave() {
-    if (!validate()) {
+    const validation = validate();
+
+    if (!validation.isValid || !validation.parsedStructuredInstructions) {
       return;
     }
+
+    const payload: ScriptFormValues = {
+      ...values,
+      structuredInstructions: validation.parsedStructuredInstructions,
+    };
 
     startSaving(async () => {
       try {
@@ -178,7 +269,7 @@ function ScriptDetailScreen({
         const method = hasExistingRecord ? "PATCH" : "POST";
         const response = await requestJson<ScriptMutationResponse>(endpoint, {
           method,
-          body: JSON.stringify(values),
+          body: JSON.stringify(payload),
         });
         onSaved(response.item, response.message);
       } catch (error) {
@@ -208,6 +299,7 @@ function ScriptDetailScreen({
           ...current,
           structuredInstructions: response.structuredInstructions,
         }));
+        setStructuredInstructionsText(toStructuredInstructionsText(response.structuredInstructions));
         setErrors({});
       } catch {
         setErrors({ form: "Unable to convert markdown to structured instructions." });
@@ -252,7 +344,27 @@ function ScriptDetailScreen({
                 Edit markdown, convert it to JSON, and manage status.
               </Typography>
             </Box>
-            <Stack direction="row" spacing={0.75} sx={{ flexShrink: 0, alignItems: "center" }}>
+            <Stack direction={{ xs: "column", md: "row" }} spacing={0.75} sx={{ flexShrink: 0, alignItems: { xs: "stretch", md: "center" } }}>
+              <FormControlLabel
+                sx={{ mr: 0.5 }}
+                control={
+                  <Switch
+                    checked={!values.isDisabled}
+                    onChange={(event) => updateField("isDisabled", !event.target.checked)}
+                  />
+                }
+                label={values.isDisabled ? "Script disabled" : "Script enabled"}
+              />
+              {hasExistingRecord ? (
+                <Button
+                  variant="text"
+                  color="error"
+                  startIcon={<DeleteOutlineRoundedIcon />}
+                  onClick={() => setDeleteOpen(true)}
+                >
+                  Delete script
+                </Button>
+              ) : null}
               <Button variant="outlined" startIcon={<ArrowBackRoundedIcon />} onClick={onBack}>
                 Back
               </Button>
@@ -293,39 +405,60 @@ function ScriptDetailScreen({
           <Card sx={{ flexShrink: 0 }}>
             <CardContent sx={{ p: 2 }}>
               <Stack spacing={1.25}>
-                <TextField
-                  label="Script name"
-                  value={values.name}
-                  onChange={(event) => updateField("name", event.target.value)}
-                  error={Boolean(errors.name)}
-                  helperText={errors.name}
-                  required
-                />
-                <TextField
-                  label="Description"
-                  value={values.description}
-                  onChange={(event) => updateField("description", event.target.value)}
-                  multiline
-                  minRows={2}
-                />
-                <FormControlLabel
-                  control={
-                    <Switch
-                      checked={!values.isDisabled}
-                      onChange={(event) => updateField("isDisabled", !event.target.checked)}
-                    />
-                  }
-                  label={values.isDisabled ? "Script disabled" : "Script enabled"}
-                />
-                {hasExistingRecord ? (
-                  <Button
-                    variant="text"
-                    color="error"
-                    startIcon={<DeleteOutlineRoundedIcon />}
-                    onClick={() => setDeleteOpen(true)}
+                <Stack direction="row" spacing={0.75} alignItems="center" justifyContent="space-between">
+                  <Typography variant="h6" sx={{ minWidth: 0 }}>
+                    {values.name.trim() || "Script details"}
+                  </Typography>
+                  <IconButton
+                    aria-label={isDetailsExpanded ? "Collapse script details" : "Expand script details"}
+                    onClick={() => setIsDetailsExpanded((current) => !current)}
                   >
-                    Delete script
-                  </Button>
+                    {isDetailsExpanded ? <ExpandLessRoundedIcon /> : <ExpandMoreRoundedIcon />}
+                  </IconButton>
+                </Stack>
+
+                {!isDetailsExpanded ? (
+                  <Typography color="text.secondary">
+                    Edit script&apos;s name, description and engine mode...
+                  </Typography>
+                ) : null}
+
+                {isDetailsExpanded ? (
+                  <>
+                    <TextField
+                      label="Script name"
+                      value={values.name}
+                      onChange={(event) => updateField("name", event.target.value)}
+                      error={Boolean(errors.name)}
+                      helperText={errors.name}
+                      required
+                    />
+                    <TextField
+                      label="Description"
+                      value={values.description}
+                      onChange={(event) => updateField("description", event.target.value)}
+                      multiline
+                      minRows={2}
+                    />
+                    <FormControl fullWidth error={Boolean(errors.engineMode)}>
+                      <InputLabel id="script-engine-mode-label">Engine mode</InputLabel>
+                      <Select
+                        labelId="script-engine-mode-label"
+                        label="Engine mode"
+                        value={values.engineMode}
+                        onChange={(event) => updateField("engineMode", event.target.value as ScriptEngineMode)}
+                      >
+                        {scriptEngineModes.map((mode) => (
+                          <MenuItem key={mode} value={mode}>
+                            {scriptEngineModeLabels[mode]}
+                          </MenuItem>
+                        ))}
+                      </Select>
+                      <Typography variant="caption" color={errors.engineMode ? "error" : "text.secondary"} sx={{ mt: 0.75, px: 1.75 }}>
+                        {errors.engineMode || scriptEngineModeDescriptions[values.engineMode]}
+                      </Typography>
+                    </FormControl>
+                  </>
                 ) : null}
               </Stack>
             </CardContent>
@@ -347,12 +480,24 @@ function ScriptDetailScreen({
                 {markdownTab === "source" ? (
                   <Box
                     sx={{
+                      flex: 1,
                       height: "100%",
                       minHeight: 0,
                       border: "1px solid rgba(28, 25, 23, 0.08)",
                       borderRadius: "7px",
-                      overflow: "hidden",
+                      overflow: "auto",
+                      "& .cm-editor": {
+                        height: "auto",
+                        minHeight: "100%",
+                      },
+                      "& .cm-scroller": {
+                        overflow: "auto",
+                      },
+                      "& .cm-content, & .cm-line": {
+                        whiteSpace: "pre",
+                      },
                     }}
+                    tabIndex={0}
                   >
                     <CodeMirror
                       value={values.plainText}
@@ -363,7 +508,6 @@ function ScriptDetailScreen({
                         foldGutter: false,
                       }}
                       theme="light"
-                      height="100%"
                     />
                   </Box>
                 ) : (
@@ -371,7 +515,32 @@ function ScriptDetailScreen({
                     variant="outlined"
                     sx={{ height: "100%", overflowY: "auto", p: 1.25, borderRadius: "7px" }}
                   >
-                    <Box sx={{ "& p, & li": { color: "text.secondary" } }}>
+                    <Box
+                      sx={{
+                        color: "text.secondary",
+                        "& p": { color: "text.secondary", my: 0.75 },
+                        "& ol": {
+                          my: 0.75,
+                          pl: 3,
+                          listStyleType: "decimal",
+                          listStylePosition: "outside",
+                        },
+                        "& ul": {
+                          my: 0.75,
+                          pl: 3,
+                          listStyleType: "disc",
+                          listStylePosition: "outside",
+                        },
+                        "& li": {
+                          color: "text.secondary",
+                          display: "list-item",
+                          mb: 0.35,
+                        },
+                        "& li > p": {
+                          my: 0,
+                        },
+                      }}
+                    >
                       <ReactMarkdown>{values.plainText || "Nothing to preview yet."}</ReactMarkdown>
                     </Box>
                   </Card>
@@ -381,8 +550,8 @@ function ScriptDetailScreen({
           </Card>
         </Stack>
 
-        <Card sx={{ minHeight: 0, overflow: "hidden" }}>
-          <CardContent sx={{ height: "100%", display: "flex", flexDirection: "column", gap: 1.25, minHeight: 0, overflow: "hidden", p: 2 }}>
+        <Card sx={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+          <CardContent sx={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", gap: 1.25, overflow: "hidden", p: 2 }}>
             <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={2}>
               <Box>
                 <Typography variant="h6">Structured instructions</Typography>
@@ -392,18 +561,39 @@ function ScriptDetailScreen({
               </Box>
               <Chip label={`${values.structuredInstructions.steps.length} steps`} />
             </Stack>
-            <Box sx={{ flex: 1, minHeight: 0, borderRadius: "7px", overflow: "hidden", border: "1px solid rgba(28, 25, 23, 0.08)" }}>
+            {errors.structuredInstructions ? (
+              <Alert severity="error">{errors.structuredInstructions}</Alert>
+            ) : null}
+            <Box
+              sx={{
+                flex: 1,
+                minHeight: 0,
+                borderRadius: "7px",
+                overflow: "auto",
+                border: "1px solid rgba(28, 25, 23, 0.08)",
+                "& .cm-editor": {
+                  height: "auto",
+                  minHeight: "100%",
+                },
+                "& .cm-scroller": {
+                  overflow: "auto",
+                },
+                "& .cm-content, & .cm-line": {
+                  whiteSpace: "pre",
+                },
+              }}
+              tabIndex={0}
+            >
               <CodeMirror
-                value={JSON.stringify(values.structuredInstructions, null, 2)}
+                value={structuredInstructionsText}
+                onChange={handleStructuredInstructionsChange}
                 extensions={[json()]}
-                editable={false}
                 basicSetup={{
                   lineNumbers: true,
                   foldGutter: false,
                   highlightActiveLine: false,
                 }}
                 theme="light"
-                height="100%"
               />
             </Box>
           </CardContent>
@@ -553,6 +743,19 @@ export function ScriptsControlCenter() {
     () => [
       { field: "name", headerName: "Name", flex: 1, minWidth: 200 },
       {
+        field: "engineMode",
+        headerName: "Engine",
+        minWidth: 150,
+        renderCell: ({ row }) => (
+          <Chip
+            size="small"
+            label={scriptEngineModeLabels[row.engineMode]}
+            color={row.engineMode === "ai_driven" ? "warning" : "default"}
+            variant={row.engineMode === "ai_driven" ? "filled" : "outlined"}
+          />
+        ),
+      },
+      {
         field: "description",
         headerName: "Description",
         flex: 1.2,
@@ -607,10 +810,7 @@ export function ScriptsControlCenter() {
       <ControlCenterSidebar
         title="Automation Scripts"
         description="Manage reusable scripts and convert notes into JSON."
-        sections={[
-          { href: "/", label: "Remote VPS", description: "Registry and diagnostics" },
-          { href: "/scripts", label: "Scripts", description: "Authoring and conversion" },
-        ]}
+        sections={controlCenterSections}
         activeHref="/scripts"
         footerTitle="Script library"
         footerBody={`${listData.totalCount} scripts tracked. ${listData.items.filter((item) => !item.isDisabled).length} enabled on this page.`}

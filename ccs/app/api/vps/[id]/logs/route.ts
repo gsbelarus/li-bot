@@ -47,3 +47,23 @@ export async function GET(
     pageSize,
   });
 }
+
+export async function DELETE(
+  _request: NextRequest,
+  context: { params: Promise<{ id: string }> }
+) {
+  await connectToDatabase();
+  const id = await getId(context);
+  const item = await findVpsById(id, true);
+
+  if (!item) {
+    return NextResponse.json({ error: "VPS record not found." }, { status: 404 });
+  }
+
+  const result = await RemoteVpsInteractionLogModel.deleteMany({ vpsId: id });
+
+  return NextResponse.json({
+    deletedCount: result.deletedCount ?? 0,
+    message: "Interaction logs cleared.",
+  });
+}

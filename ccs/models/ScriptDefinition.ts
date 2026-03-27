@@ -1,6 +1,6 @@
 import { InferSchemaType, Model, Schema, model, models } from "mongoose";
 
-import { createEmptyScriptInstructions } from "@/lib/scripts-shared";
+import { createEmptyScriptInstructions, scriptEngineModes } from "@/lib/scripts-shared";
 
 const scriptDefinitionSchema = new Schema(
   {
@@ -22,6 +22,12 @@ const scriptDefinitionSchema = new Schema(
       type: Schema.Types.Mixed,
       required: true,
       default: () => createEmptyScriptInstructions(),
+    },
+    engineMode: {
+      type: String,
+      enum: scriptEngineModes,
+      default: "deterministic",
+      required: true,
     },
     isDisabled: {
       type: Boolean,

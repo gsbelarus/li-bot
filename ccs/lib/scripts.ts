@@ -5,12 +5,14 @@ import ScriptDefinitionModel, {
 } from "@/models/ScriptDefinition";
 import {
   ScriptActionKind,
+  ScriptEngineMode,
   ScriptInstructions,
   ScriptRecord,
   ScriptStep,
   ScriptTimestampWarning,
   ScriptTarget,
   createEmptyScriptInstructions,
+  scriptEngineModes,
   scriptActionKinds,
 } from "@/lib/scripts-shared";
 
@@ -118,12 +120,35 @@ function normalizeTarget(value: unknown): ScriptTarget | null {
     selectors,
     text: safeString(value.text),
     role: safeString(value.role),
+    alternativeTexts: Array.isArray(value.alternativeTexts)
+      ? value.alternativeTexts.map((entry) => safeString(entry)).filter(Boolean)
+      : [],
   };
 }
 
 function normalizeStep(value: unknown, index: number): ScriptStep {
   const source = isPlainObject(value) ? value : {};
   const kind = safeString(source.kind, "custom") as ScriptActionKind;
+  const fallbackDelayAfterMs =
+    kind === "navigate" ||
+      kind === "go_back" ||
+      kind === "set_runtime_value" ||
+      kind === "increment_runtime_value" ||
+      kind === "wait" ||
+      kind === "wait_for_page" ||
+      kind === "branch_if_runtime_value" ||
+      kind === "jump" ||
+      kind === "inspect_linkedin_latest_post" ||
+      kind === "select_linkedin_post_candidate" ||
+      kind === "generate_comment" ||
+      kind === "branch_if_missing" ||
+      kind === "branch_if_visible" ||
+      kind === "return_to_profile_source" ||
+      kind === "open_next_profile_candidate" ||
+      kind === "log_runtime_value" ||
+      kind === "log_processed_post"
+      ? 0
+      : 1000;
   const params = isPlainObject(source.params)
     ? Object.entries(source.params).reduce<ScriptStep["params"]>((accumulator, [key, entry]) => {
       if (
@@ -133,6 +158,8 @@ function normalizeStep(value: unknown, index: number): ScriptStep {
         entry === null
       ) {
         accumulator[key] = entry;
+      } else if (Array.isArray(entry) && entry.every((item) => typeof item === "string")) {
+        accumulator[key] = entry.map((item) => safeString(item)).filter(Boolean);
       }
 
       return accumulator;
@@ -146,7 +173,7 @@ function normalizeStep(value: unknown, index: number): ScriptStep {
     delayAfterMs:
       Number.isFinite(source.delayAfterMs) && Number(source.delayAfterMs) >= 0
         ? Number(source.delayAfterMs)
-        : 1000,
+        : fallbackDelayAfterMs,
     timeoutMs:
       Number.isFinite(source.timeoutMs) && Number(source.timeoutMs) > 0
         ? Number(source.timeoutMs)
@@ -154,6 +181,11 @@ function normalizeStep(value: unknown, index: number): ScriptStep {
     target: normalizeTarget(source.target),
     params,
   };
+}
+
+function normalizeEngineMode(value: unknown): ScriptEngineMode {
+  const mode = safeString(value, "deterministic") as ScriptEngineMode;
+  return scriptEngineModes.includes(mode) ? mode : "deterministic";
 }
 
 export function normalizeStructuredInstructions(
@@ -195,6 +227,7 @@ export function serializeScript(
       source.structuredInstructions,
       safeString(source.description)
     ),
+    engineMode: normalizeEngineMode(source.engineMode),
     isDisabled: Boolean(source.isDisabled),
     createdAt: createdAt.value,
     updatedAt: updatedAt.value,
@@ -209,6 +242,7 @@ export interface ScriptPayload {
   description: string;
   plainText: string;
   structuredInstructions: ScriptInstructions;
+  engineMode: ScriptEngineMode;
   isDisabled: boolean;
 }
 
@@ -229,6 +263,7 @@ export function validateScriptPayload(input: unknown): ScriptPayload {
   const description = safeString(input.description);
   const plainText = typeof input.plainText === "string" ? input.plainText.trim() : "";
   const isDisabled = parseBooleanInput(input.isDisabled, false);
+  const engineMode = normalizeEngineMode(input.engineMode);
   const structuredInstructions = normalizeStructuredInstructions(
     input.structuredInstructions,
     description || name
@@ -256,6 +291,7 @@ export function validateScriptPayload(input: unknown): ScriptPayload {
     description,
     plainText,
     structuredInstructions,
+    engineMode,
     isDisabled: isDisabled.value,
   };
 }
@@ -322,6 +358,7 @@ export function createDefaultScriptPayload(): ScriptPayload {
     description: "",
     plainText: "",
     structuredInstructions: createEmptyScriptInstructions(),
+    engineMode: "deterministic",
     isDisabled: false,
   };
 }

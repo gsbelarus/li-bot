@@ -1,10 +1,59 @@
 import { InferSchemaType, Model, Schema, model, models } from "mongoose";
 
 import {
+  openClawDaemonStatusOptions,
+  openClawGatewayStatusOptions,
   vpsEnvironmentOptions,
   vpsProtocolOptions,
   vpsStatusOptions,
 } from "@/lib/remote-vps-shared";
+
+const defaultMouseActivityMinIntervalMs = 9000;
+const defaultMouseActivityMaxIntervalMs = 22000;
+const defaultMouseActivityMaxOffsetPx = 48;
+
+const alertDetailsSchema = new Schema(
+  {
+    taskId: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    message: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    reason: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    stepOrder: {
+      type: Number,
+      default: null,
+    },
+    stepKind: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    instruction: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    detectedAt: {
+      type: Date,
+      default: null,
+    },
+  },
+  {
+    _id: false,
+    id: false,
+    versionKey: false,
+  }
+);
 
 const remoteVpsSchema = new Schema(
   {
@@ -45,6 +94,29 @@ const remoteVpsSchema = new Schema(
       required: true,
       trim: true,
     },
+    defaultMouseActivityEnabled: {
+      type: Boolean,
+      default: false,
+      required: true,
+    },
+    defaultMouseActivityMinIntervalMs: {
+      type: Number,
+      default: defaultMouseActivityMinIntervalMs,
+      min: 250,
+      required: true,
+    },
+    defaultMouseActivityMaxIntervalMs: {
+      type: Number,
+      default: defaultMouseActivityMaxIntervalMs,
+      min: 250,
+      required: true,
+    },
+    defaultMouseActivityMaxOffsetPx: {
+      type: Number,
+      default: defaultMouseActivityMaxOffsetPx,
+      min: 1,
+      required: true,
+    },
     controllerSecretKey: {
       type: String,
       default: "",
@@ -54,6 +126,23 @@ const remoteVpsSchema = new Schema(
       type: String,
       default: "",
       trim: true,
+    },
+    openClawDaemonStatus: {
+      type: String,
+      enum: openClawDaemonStatusOptions,
+      default: "unknown",
+      required: true,
+    },
+    openClawVersion: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    openClawGatewayStatus: {
+      type: String,
+      enum: openClawGatewayStatusOptions,
+      default: "unknown",
+      required: true,
     },
     status: {
       type: String,
@@ -65,6 +154,10 @@ const remoteVpsSchema = new Schema(
       type: String,
       default: "Awaiting initial controller communication",
       trim: true,
+    },
+    alertDetails: {
+      type: alertDetailsSchema,
+      default: null,
     },
     lastSeenAt: {
       type: Date,
@@ -118,6 +211,19 @@ const remoteVpsSchema = new Schema(
     timestamps: true,
   }
 );
+
+remoteVpsSchema.pre("validate", function enforceMouseIntervalOrdering() {
+  if (
+    typeof this.defaultMouseActivityMinIntervalMs === "number" &&
+    typeof this.defaultMouseActivityMaxIntervalMs === "number" &&
+    this.defaultMouseActivityMaxIntervalMs < this.defaultMouseActivityMinIntervalMs
+  ) {
+    this.invalidate(
+      "defaultMouseActivityMaxIntervalMs",
+      "Default maximum mouse interval must be greater than or equal to the default minimum interval."
+    );
+  }
+});
 
 remoteVpsSchema.index({ isDeleted: 1, name: 1 });
 remoteVpsSchema.index({ isDeleted: 1, status: 1, environment: 1 });

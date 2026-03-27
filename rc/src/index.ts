@@ -1,9 +1,27 @@
-import express, { type NextFunction, type Request, type Response } from "express";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
+import express, { type NextFunction, type Request, type Response } from "express";
+import dotenv from "dotenv";
+
+import { CursorActivityController } from "./cursor-activity.js";
 import { log, serializeError } from "./logger.js";
 import { OpenClawRuntime } from "./openclaw.js";
-import { validateExecuteScriptCommandPayload } from "./script-contract.js";
-import { TaskQueue } from "./task-queue.js";
+import { validateControllerCommandPayload } from "./script-contract.js";
+import { TaskQueue, type TaskRecord } from "./task-queue.js";
+
+const currentFilePath = fileURLToPath(import.meta.url);
+const currentDirectory = dirname(currentFilePath);
+const projectRoot = resolve(currentDirectory, "..");
+const taskLogsDirectory = resolve(projectRoot, "logs");
+
+dotenv.config({ path: resolve(projectRoot, ".env") });
+dotenv.config({ path: resolve(projectRoot, ".env.local"), override: true });
+
+console.log(
+  `[rc] OPENAI_API_KEY=${process.env.OPENAI_API_KEY ? "set" : "not set"}; OPENAI_PROJECT_KEY=${process.env.OPENAI_PROJECT_KEY ? "set" : "not set"}`
+);
 
 const port = Number(process.env.PORT || 3100);
 const remoteControllerSecretKey = process.env.REMOTE_CONTROLLER_SECRET_KEY || "";
@@ -11,18 +29,148 @@ const controllerVersion = process.env.npm_package_version || "0.1.0";
 const maxRetainedTasks = Number(process.env.REMOTE_CONTROLLER_MAX_RETAINED_TASKS || 200);
 const finishedTaskTtlMs = Number(process.env.REMOTE_CONTROLLER_FINISHED_TASK_TTL_MS || 6 * 60 * 60 * 1000);
 const taskCleanupIntervalMs = Number(process.env.REMOTE_CONTROLLER_TASK_CLEANUP_INTERVAL_MS || 5 * 60 * 1000);
+const resultLogChunkSize = Math.max(200, Number(process.env.REMOTE_CONTROLLER_RESULT_LOG_CHUNK_SIZE || 600));
+const resultLogMaxChars = Math.max(resultLogChunkSize, Number(process.env.REMOTE_CONTROLLER_RESULT_LOG_MAX_CHARS || 120_000));
+const resultWebhookTimeoutMs = Math.max(
+  1_000,
+  Number(process.env.REMOTE_CONTROLLER_RESULT_WEBHOOK_TIMEOUT_MS || 15_000)
+);
 
 if (!remoteControllerSecretKey) {
   throw new Error("REMOTE_CONTROLLER_SECRET_KEY must be configured.");
 }
 
 const runtime = new OpenClawRuntime();
+const cursorActivity = new CursorActivityController();
+
+function buildCompletedTaskResultPayload(task: TaskRecord) {
+  if (task.status === "failed") {
+    return {
+      taskId: task.id,
+      command: task.command,
+      status: task.status,
+      error: task.failure ?? task.error,
+      result: task.result,
+      taskLog: buildTaskLogPayload(task.id),
+    };
+  }
+
+  return {
+    taskId: task.id,
+    command: task.command,
+    status: task.status,
+    result: task.result,
+    taskLog: buildTaskLogPayload(task.id),
+  };
+}
+
+function resolveTaskResultWebhookUrl(task: TaskRecord) {
+  const template = task.input.callback?.taskResultWebhookUrlTemplate?.trim() || "";
+
+  if (!template) {
+    return "";
+  }
+
+  return template.replace("{taskId}", encodeURIComponent(task.id));
+}
+
+function createWebhookTimeoutError(timeoutMs: number) {
+  const error = new Error(`Webhook request timed out after ${timeoutMs}ms.`);
+  error.name = "WebhookTimeoutError";
+  return error;
+}
+
+async function publishTaskResultToWebhook(task: TaskRecord) {
+  const webhookUrl = resolveTaskResultWebhookUrl(task);
+
+  if (!webhookUrl || (task.status !== "completed" && task.status !== "failed")) {
+    return;
+  }
+
+  const payload = buildCompletedTaskResultPayload(task);
+  const abortController = new AbortController();
+  const timeoutError = createWebhookTimeoutError(resultWebhookTimeoutMs);
+  const timeoutHandle = setTimeout(() => {
+    abortController.abort(timeoutError);
+  }, resultWebhookTimeoutMs);
+
+  timeoutHandle.unref?.();
+
+  try {
+    const response = await fetch(webhookUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-remote-controller-secret-key": remoteControllerSecretKey,
+      },
+      body: JSON.stringify(payload),
+      signal: abortController.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Webhook responded with HTTP ${response.status}.`);
+    }
+
+    log("info", "task.result_webhook.delivered", {
+      taskId: task.id,
+      status: task.status,
+      webhookUrl,
+    });
+  } catch (error) {
+    if (abortController.signal.aborted && abortController.signal.reason === timeoutError) {
+      log("warn", "task.result_webhook.timeout", {
+        taskId: task.id,
+        status: task.status,
+        webhookUrl,
+        timeoutMs: resultWebhookTimeoutMs,
+        error: serializeError(timeoutError),
+      });
+      return;
+    }
+
+    log("warn", "task.result_webhook.failed", {
+      taskId: task.id,
+      status: task.status,
+      webhookUrl,
+      error: serializeError(error),
+    });
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+}
+
 const queue = new TaskQueue(async (task) => {
-  return runtime.executeScript(task.input.script, task.input.targetId);
+  if (task.input.command === "executeScript") {
+    cursorActivity.start(task.id, {
+      enabled: task.input.mouseActivityEnabled,
+      minIntervalMs: task.input.mouseActivityConfig?.minIntervalMs,
+      maxIntervalMs: task.input.mouseActivityConfig?.maxIntervalMs,
+      maxOffsetPx: task.input.mouseActivityConfig?.maxOffsetPx,
+    });
+
+    try {
+      return await runtime.executeScript(task.input.script, {
+        engineMode: task.input.engineMode,
+        targetId: task.input.targetId,
+        taskId: task.id,
+        profileVisitLookupUrlTemplate: task.input.callback?.profileVisitLookupUrlTemplate,
+        postHistoryLookupUrlTemplate: task.input.callback?.postHistoryLookupUrlTemplate,
+      });
+    } finally {
+      cursorActivity.stop(task.id);
+    }
+  }
+
+  if (task.input.command === "openclawUpdate") {
+    return runtime.updateOpenClaw({ taskId: task.id });
+  }
+
+  return runtime.restartGateway({ taskId: task.id });
 }, {
   maxRetainedTasks,
   finishedTaskTtlMs,
   cleanupIntervalMs: taskCleanupIntervalMs,
+  onTaskFinished: publishTaskResultToWebhook,
 });
 
 class RequestValidationError extends Error {
@@ -56,6 +204,56 @@ function getProvidedSecret(request: Request) {
   }
 
   return "";
+}
+
+function buildTaskLogPayload(taskId: string) {
+  const logPath = resolve(taskLogsDirectory, `${taskId}.log`);
+  const unavailablePayload = {
+    available: false,
+    path: `logs/${taskId}.log`,
+    chunkSize: resultLogChunkSize,
+    chunkCount: 0,
+    totalChars: 0,
+    truncated: false,
+    chunks: {},
+  };
+
+  if (!existsSync(logPath)) {
+    return unavailablePayload;
+  }
+
+  try {
+    const fullText = readFileSync(logPath, "utf8");
+    const truncated = fullText.length > resultLogMaxChars;
+    const text = truncated ? fullText.slice(0, resultLogMaxChars) : fullText;
+    const chunks: Record<string, string> = {};
+
+    for (let index = 0; index < text.length; index += resultLogChunkSize) {
+      const chunkNumber = Math.floor(index / resultLogChunkSize) + 1;
+      chunks[String(chunkNumber)] = text.slice(index, index + resultLogChunkSize);
+    }
+
+    return {
+      available: true,
+      path: `logs/${taskId}.log`,
+      chunkSize: resultLogChunkSize,
+      chunkCount: Object.keys(chunks).length,
+      totalChars: fullText.length,
+      truncated,
+      chunks,
+    };
+  } catch (error) {
+    log("warn", "task.log.read_failed", {
+      taskId,
+      logPath,
+      error: serializeError(error),
+    });
+
+    return {
+      ...unavailablePayload,
+      error: "Task log could not be read.",
+    };
+  }
 }
 
 const app = express();
@@ -108,22 +306,42 @@ app.get("/", (_request, response) => {
 });
 
 app.get("/health", (_request, response) => {
-  response.json({
-    status: "ok",
-    version: controllerVersion,
-    queue: queue.getStats(),
+  void (async () => {
+    const openclaw = await runtime.getHealthSnapshot();
+    const isHealthy =
+      openclaw.daemonStatus === "running" && openclaw.gatewayStatus !== "unreachable";
+
+    response.status(isHealthy ? 200 : 503).json({
+      status: isHealthy ? "ok" : "degraded",
+      version: controllerVersion,
+      queue: queue.getStats(),
+      openclaw,
+    });
+  })().catch((error) => {
+    response.status(500).json({
+      status: "error",
+      version: controllerVersion,
+      error: error instanceof Error ? error.message : "Health check failed.",
+    });
   });
 });
 
 app.post("/api/commands", (request, response, next) => {
   try {
-    const payload = validateExecuteScriptCommandPayload(request.body);
+    const payload = validateControllerCommandPayload(request.body);
     const task = queue.enqueue(payload);
 
-    log("info", "command.enqueued", {
+    const eventPayload: Record<string, unknown> = {
       taskId: task.id,
       command: payload.command,
-      stepCount: payload.script.steps.length,
+    };
+
+    if (payload.command === "executeScript") {
+      eventPayload.stepCount = payload.script.steps.length;
+    }
+
+    log("info", "command.enqueued", {
+      ...eventPayload,
     });
 
     response.status(202).json({
@@ -157,7 +375,7 @@ app.get("/api/commands/:taskId/status", (request, response) => {
     createdAt: task.createdAt,
     startedAt: task.startedAt,
     finishedAt: task.finishedAt,
-    error: task.error,
+    error: task.failure ?? task.error,
   });
 });
 
@@ -179,19 +397,11 @@ app.get("/api/commands/:taskId/results", (request, response) => {
   }
 
   if (task.status === "failed") {
-    response.status(200).json({
-      taskId: task.id,
-      status: task.status,
-      error: task.error,
-    });
+    response.status(200).json(buildCompletedTaskResultPayload(task));
     return;
   }
 
-  response.json({
-    taskId: task.id,
-    status: task.status,
-    result: task.result,
-  });
+  response.json(buildCompletedTaskResultPayload(task));
 });
 
 app.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => {
