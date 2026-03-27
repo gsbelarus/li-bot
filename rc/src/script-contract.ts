@@ -69,7 +69,7 @@ export type ExecutionEngineMode = (typeof executionEngineModes)[number];
 export type ControllerCommand = (typeof controllerCommandOptions)[number];
 
 export interface CommandCallbackConfig {
-  taskResultWebhookUrlTemplate: string;
+  taskResultWebhookUrlTemplate?: string;
   profileVisitLookupUrlTemplate?: string;
   postHistoryLookupUrlTemplate?: string;
 }

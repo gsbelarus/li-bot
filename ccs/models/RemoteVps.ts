@@ -212,6 +212,19 @@ const remoteVpsSchema = new Schema(
   }
 );
 
+remoteVpsSchema.pre("validate", function enforceMouseIntervalOrdering() {
+  if (
+    typeof this.defaultMouseActivityMinIntervalMs === "number" &&
+    typeof this.defaultMouseActivityMaxIntervalMs === "number" &&
+    this.defaultMouseActivityMaxIntervalMs < this.defaultMouseActivityMinIntervalMs
+  ) {
+    this.invalidate(
+      "defaultMouseActivityMaxIntervalMs",
+      "Default maximum mouse interval must be greater than or equal to the default minimum interval."
+    );
+  }
+});
+
 remoteVpsSchema.index({ isDeleted: 1, name: 1 });
 remoteVpsSchema.index({ isDeleted: 1, status: 1, environment: 1 });
 remoteVpsSchema.index({ protocol: 1, host: 1, port: 1, isDeleted: 1 });
