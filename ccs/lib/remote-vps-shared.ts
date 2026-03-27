@@ -16,6 +16,20 @@ export const vpsEnvironmentOptions = [
 
 export const vpsProtocolOptions = ["http", "https"] as const;
 
+export const openClawDaemonStatusOptions = [
+  "running",
+  "not_installed",
+  "error",
+  "unknown",
+] as const;
+
+export const openClawGatewayStatusOptions = [
+  "reachable",
+  "unreachable",
+  "not_configured",
+  "unknown",
+] as const;
+
 export const logDirectionOptions = [
   "outbound_request",
   "inbound_response",
@@ -53,6 +67,8 @@ export const initiatedByOptions = ["system", "operator", "scheduler"] as const;
 export type VpsStatus = (typeof vpsStatusOptions)[number];
 export type VpsEnvironment = (typeof vpsEnvironmentOptions)[number];
 export type VpsProtocol = (typeof vpsProtocolOptions)[number];
+export type OpenClawDaemonStatus = (typeof openClawDaemonStatusOptions)[number];
+export type OpenClawGatewayStatus = (typeof openClawGatewayStatusOptions)[number];
 export type LogDirection = (typeof logDirectionOptions)[number];
 export type LogInteractionType = (typeof logInteractionTypeOptions)[number];
 export type LogResult = (typeof logResultOptions)[number];
@@ -103,6 +119,9 @@ export interface RemoteVpsRecord {
   hasControllerSecret: boolean;
   controllerSecretKeyMasked: string;
   controllerVersion: string;
+  openClawDaemonStatus: OpenClawDaemonStatus;
+  openClawVersion: string;
+  openClawGatewayStatus: OpenClawGatewayStatus;
   status: VpsStatus;
   statusReason: string;
   alertDetails: VpsAlertDetails | null;

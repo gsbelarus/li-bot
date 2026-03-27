@@ -1,6 +1,8 @@
 import { InferSchemaType, Model, Schema, model, models } from "mongoose";
 
 import {
+  openClawDaemonStatusOptions,
+  openClawGatewayStatusOptions,
   vpsEnvironmentOptions,
   vpsProtocolOptions,
   vpsStatusOptions,
@@ -124,6 +126,23 @@ const remoteVpsSchema = new Schema(
       type: String,
       default: "",
       trim: true,
+    },
+    openClawDaemonStatus: {
+      type: String,
+      enum: openClawDaemonStatusOptions,
+      default: "unknown",
+      required: true,
+    },
+    openClawVersion: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    openClawGatewayStatus: {
+      type: String,
+      enum: openClawGatewayStatusOptions,
+      default: "unknown",
+      required: true,
     },
     status: {
       type: String,

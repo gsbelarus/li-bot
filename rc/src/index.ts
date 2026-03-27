@@ -296,10 +296,23 @@ app.get("/", (_request, response) => {
 });
 
 app.get("/health", (_request, response) => {
-  response.json({
-    status: "ok",
-    version: controllerVersion,
-    queue: queue.getStats(),
+  void (async () => {
+    const openclaw = await runtime.getHealthSnapshot();
+    const isHealthy =
+      openclaw.daemonStatus === "running" && openclaw.gatewayStatus !== "unreachable";
+
+    response.status(isHealthy ? 200 : 503).json({
+      status: isHealthy ? "ok" : "degraded",
+      version: controllerVersion,
+      queue: queue.getStats(),
+      openclaw,
+    });
+  })().catch((error) => {
+    response.status(500).json({
+      status: "error",
+      version: controllerVersion,
+      error: error instanceof Error ? error.message : "Health check failed.",
+    });
   });
 });
 

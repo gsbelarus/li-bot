@@ -126,6 +126,15 @@ export interface StepExecutionRecord {
   output: unknown;
 }
 
+export type OpenClawDaemonStatus = "running" | "not_installed" | "error" | "unknown";
+export type OpenClawGatewayStatus = "reachable" | "unreachable" | "not_configured" | "unknown";
+
+export interface OpenClawHealthSnapshot {
+  daemonStatus: OpenClawDaemonStatus;
+  version: string;
+  gatewayStatus: OpenClawGatewayStatus;
+}
+
 interface ExecutionContext {
   taskId?: string;
   engineMode?: ExecutionEngineMode;
@@ -757,6 +766,43 @@ function shouldAutoScrollSearch(step: ScriptStep) {
   return hasIndexedArticleTarget;
 }
 
+function isLegacyLinkedInPostCandidateSelectionStep(step: ScriptStep) {
+  if (step.kind !== "scroll") {
+    return false;
+  }
+
+  if (normalizeSearchText(step.target?.role) !== "article") {
+    return false;
+  }
+
+  const instruction = normalizeSearchText(step.instruction);
+
+  if (!/first post|processed before|less than\s+\d+\s*(?:months?|days?)|older than\s+\d+\s*(?:months?|days?)/.test(instruction)) {
+    return false;
+  }
+
+  return (
+    typeof step.params.maxAgeDays === "number" ||
+    scalarBoolean(step.params.requireUnprocessed, false) ||
+    normalizeRuntimeKey(step.params.outputKey) === "selectedPost"
+  );
+}
+
+function isLikelyLinkedInPostContainer(role: string, name: string, context: string) {
+  const normalizedRole = normalizeSearchText(role);
+  const combined = `${normalizeSearchText(name)} ${normalizeSearchText(context)}`;
+
+  if (normalizedRole === "article") {
+    return true;
+  }
+
+  if (normalizedRole !== "listitem" && normalizedRole !== "generic") {
+    return false;
+  }
+
+  return /\bfeed post\b|\breactions?\b|\bcomments?\b|\breposts?\b|\bvisibility:\b|\bfollowers\b|open control menu for post|reaction button state|\blike\b.*\bcomment\b|\bcomment\b.*\brepost\b/.test(combined);
+}
+
 function appendTaskLog(taskId: string | undefined, message: string) {
   if (!taskId || !isTaskLoggingEnabled()) {
     return;
@@ -803,6 +849,175 @@ export class OpenClawRuntime {
   private readonly aiSnapshotExcerptChars = Math.max(1200, Number(process.env.OPENCLAW_AI_SNAPSHOT_EXCERPT_CHARS || 2500));
   private windowsInvocation: OpenClawInvocation | null = null;
   private openAiClient: OpenAI | null | undefined;
+
+  private runOpenClawSync(args: string[]) {
+    const invocation = this.resolveOpenClawInvocation();
+
+    return spawnSync(invocation.command, [...invocation.commandArgsPrefix, ...args], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+      timeout: 5000,
+    });
+  }
+
+  private extractVersionText(output: string) {
+    return output
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean) || "";
+  }
+
+  private getDaemonStatusFromError(error: unknown): OpenClawDaemonStatus {
+    if (error && typeof error === "object") {
+      const code = "code" in error ? scalarString((error as { code?: unknown }).code) : "";
+      const message = "message" in error ? scalarString((error as { message?: unknown }).message) : "";
+
+      if (code === "ENOENT" || /not recognized as an internal or external command/i.test(message)) {
+        return "not_installed";
+      }
+    }
+
+    return "error";
+  }
+
+  private detectOpenClawVersion() {
+    const versionAttempts: string[][] = [["-v"], ["--version"], ["version"]];
+    let lastFailure: OpenClawDaemonStatus = "unknown";
+
+    for (const args of versionAttempts) {
+      try {
+        const result = this.runOpenClawSync(args);
+        const stdout = scalarString(result.stdout).trim();
+        const stderr = scalarString(result.stderr).trim();
+        const combinedOutput = [stdout, stderr].filter(Boolean).join("\n");
+
+        if (result.error) {
+          lastFailure = this.getDaemonStatusFromError(result.error);
+          continue;
+        }
+
+        if (typeof result.status === "number" && result.status !== 0) {
+          lastFailure = stdout || stderr ? "error" : lastFailure;
+          continue;
+        }
+
+        return {
+          daemonStatus: "running" as const,
+          version: this.extractVersionText(combinedOutput),
+        };
+      } catch (error) {
+        lastFailure = this.getDaemonStatusFromError(error);
+      }
+    }
+
+    return {
+      daemonStatus: lastFailure === "unknown" ? "error" : lastFailure,
+      version: "",
+    };
+  }
+
+  private parseGatewayStatusOutput(output: string): OpenClawGatewayStatus {
+    const normalized = output.toLowerCase();
+
+    if (!normalized.trim()) {
+      return "unknown";
+    }
+
+    if (
+      /rpc probe:\s*ok/.test(normalized) ||
+      /listening:/.test(normalized) ||
+      /runtime:\s*running/.test(normalized)
+    ) {
+      return "reachable";
+    }
+
+    if (
+      /not configured/.test(normalized) ||
+      /service:\s*not registered/.test(normalized) ||
+      /probe target:\s*(n\/a|none|-)/.test(normalized)
+    ) {
+      return "not_configured";
+    }
+
+    if (
+      /rpc probe:\s*(failed|error|timeout|unreachable)/.test(normalized) ||
+      /runtime:\s*(stopped|not running|failed|error)/.test(normalized)
+    ) {
+      return "unreachable";
+    }
+
+    return "unknown";
+  }
+
+  private detectGatewayStatusFromCli(): OpenClawGatewayStatus {
+    const attempts: string[][] = [["gateway", "status"], ["status"]];
+
+    for (const args of attempts) {
+      try {
+        const result = this.runOpenClawSync(args);
+        const stdout = scalarString(result.stdout).trim();
+        const stderr = scalarString(result.stderr).trim();
+        const combinedOutput = [stdout, stderr].filter(Boolean).join("\n");
+        const parsed = this.parseGatewayStatusOutput(combinedOutput);
+
+        if (parsed !== "unknown") {
+          return parsed;
+        }
+      } catch {
+        // Fall back to env-based probe below.
+      }
+    }
+
+    return "unknown";
+  }
+
+  private async checkGatewayStatus(): Promise<OpenClawGatewayStatus> {
+    const cliStatus = this.detectGatewayStatusFromCli();
+
+    if (cliStatus !== "unknown") {
+      return cliStatus;
+    }
+
+    const gatewayUrl = this.gatewayUrl.trim();
+
+    if (!gatewayUrl) {
+      return "not_configured";
+    }
+
+    try {
+      const response = await fetch(gatewayUrl, {
+        method: "GET",
+        headers: this.gatewayToken
+          ? {
+            authorization: `Bearer ${this.gatewayToken}`,
+          }
+          : undefined,
+        signal: AbortSignal.timeout(5000),
+      });
+
+      await response.body?.cancel?.();
+
+      return response.status >= 100 ? "reachable" : "unreachable";
+    } catch {
+      return "unreachable";
+    }
+  }
+
+  async getHealthSnapshot(): Promise<OpenClawHealthSnapshot> {
+    const daemon = this.detectOpenClawVersion();
+
+    return {
+      daemonStatus: daemon.daemonStatus,
+      version: daemon.version,
+      gatewayStatus:
+        daemon.daemonStatus === "running"
+          ? await this.checkGatewayStatus()
+          : this.gatewayUrl.trim()
+            ? "unknown"
+            : "not_configured",
+    };
+  }
 
   executeScript(script: ScriptInstructions, options?: string | ExecuteScriptOptions) {
     if (typeof options === "string") {
@@ -1200,11 +1415,23 @@ export class OpenClawRuntime {
   }
 
   private getSelectedPostIndex(step: ScriptStep, context: ExecutionContext) {
-    if (!isSelectedPostReferenceStep(step)) {
+    const selectedPost = this.getSelectedPost(context);
+
+    if (!selectedPost) {
       return 0;
     }
 
-    return this.getSelectedPost(context)?.postIndex ?? 0;
+    if (isSelectedPostReferenceStep(step)) {
+      return selectedPost.postIndex;
+    }
+
+    const role = normalizeSearchText(step.target?.role);
+
+    if (role === "article" && !hasExplicitTargetIndex(step)) {
+      return selectedPost.postIndex;
+    }
+
+    return 0;
   }
 
   private recordProcessedPost(context: ExecutionContext, record: Omit<ProcessedPostRecord, "processedAt"> & {
@@ -1695,15 +1922,17 @@ export class OpenClawRuntime {
         const role = normalizeSearchText(meta.role);
         const name = normalizeSearchText(meta.name);
 
-        if (roleNeedle && role !== roleNeedle) {
-          return null;
-        }
-
         const lineIndex = refLines.get(ref) ?? Number.MAX_SAFE_INTEGER;
         const nearbyContext = normalizeSearchText(
           lines.slice(Math.max(0, lineIndex - 40), Math.min(lines.length, lineIndex + 6)).join(" ")
         );
         const localContext = buildLineWindow(lines, lineIndex, 8, 18);
+        const matchesArticleRole = roleNeedle === "article" && isLikelyLinkedInPostContainer(role, name, localContext);
+
+        if (roleNeedle && role !== roleNeedle && !matchesArticleRole) {
+          return null;
+        }
+
         const hasAnyPostContext = /\bfeed post number \d+\b/.test(nearbyContext);
         const hasDesiredPostContext = Boolean(postContextNeedle) && nearbyContext.includes(postContextNeedle);
         const hasListItemAncestor = hasNearbyLineMatch(lines, lineIndex, 8, 0, /\blistitem\b/);
@@ -1727,7 +1956,7 @@ export class OpenClawRuntime {
         let score = 0;
 
         if (roleNeedle) {
-          score += 40;
+          score += matchesArticleRole && role !== "article" ? 25 : 40;
         }
 
         if (targetTextPatterns.length > 0) {
@@ -1799,6 +2028,10 @@ export class OpenClawRuntime {
           }
         }
 
+        if (matchesArticleRole) {
+          score += 60;
+        }
+
         return {
           ref,
           role,
@@ -1848,22 +2081,23 @@ export class OpenClawRuntime {
       .map(([ref, meta]) => {
         const role = normalizeSearchText(meta.role);
 
-        if (roleNeedle && role !== roleNeedle) {
-          return null;
-        }
-
         const name = scalarString(meta.name);
         const normalizedName = normalizeSearchText(name);
-
-        if (profileCardStep && isHeaderActionLink(normalizedName)) {
-          return null;
-        }
 
         const lineIndex = refLines.get(ref) ?? Number.MAX_SAFE_INTEGER;
         const nearbyContext = buildLineWindow(lines, lineIndex, 10, 24);
         const sourceLine = scalarString(lines[lineIndex]).trim();
         const expandableContentControl = isExpandableContentControl(name, nearbyContext);
         const likelyPostActionMenuControl = isLikelyPostActionMenuControl(name, nearbyContext);
+        const matchesArticleRole = roleNeedle === "article" && isLikelyLinkedInPostContainer(role, normalizedName, nearbyContext);
+
+        if (roleNeedle && role !== roleNeedle && !matchesArticleRole) {
+          return null;
+        }
+
+        if (profileCardStep && isHeaderActionLink(normalizedName)) {
+          return null;
+        }
 
         if (postActionMenuStep && expandableContentControl) {
           return null;
@@ -1872,7 +2106,7 @@ export class OpenClawRuntime {
         let score = 0;
 
         if (roleNeedle) {
-          score += 35;
+          score += matchesArticleRole && role !== "article" ? 20 : 35;
         }
 
         if (targetTextPatterns.length > 0) {
@@ -1919,6 +2153,10 @@ export class OpenClawRuntime {
           if (/open reactions menu/.test(`${normalizedName} ${nearbyContext}`)) {
             score -= 120;
           }
+        }
+
+        if (matchesArticleRole) {
+          score += 60;
         }
 
         return {
@@ -2819,6 +3057,10 @@ export class OpenClawRuntime {
   }
 
   private async performScrollStep(targetId: string, step: ScriptStep, context: ExecutionContext = {}) {
+    if (isLegacyLinkedInPostCandidateSelectionStep(step)) {
+      return await this.selectLinkedInPostCandidate(targetId, step, context);
+    }
+
     if (step.target && (step.target.text || step.target.role)) {
       const resolved = await this.resolveSnapshotRef(targetId, step, context);
       await this.oc([

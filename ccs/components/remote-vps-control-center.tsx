@@ -713,6 +713,36 @@ function scriptExecutionResultColor(
   }
 }
 
+function formatHealthBadgeLabel(value: string) {
+  return value ? value.replace(/_/g, " ") : "unknown";
+}
+
+function openClawDaemonStatusColor(status: RemoteVpsRecord["openClawDaemonStatus"]) {
+  switch (status) {
+    case "running":
+      return "success" as const;
+    case "not_installed":
+      return "warning" as const;
+    case "error":
+      return "error" as const;
+    default:
+      return "default" as const;
+  }
+}
+
+function openClawGatewayStatusColor(status: RemoteVpsRecord["openClawGatewayStatus"]) {
+  switch (status) {
+    case "reachable":
+      return "success" as const;
+    case "unreachable":
+      return "error" as const;
+    case "not_configured":
+      return "warning" as const;
+    default:
+      return "default" as const;
+  }
+}
+
 function getRecentScriptRunSummary(logs: RemoteVpsInteractionLogRecord[]) {
   const scriptResultLogs = logs.filter(
     (log) => log.interactionType === "script_result" && Boolean(log.scriptExecutionResult)
@@ -1738,6 +1768,40 @@ export function RemoteVpsControlCenter() {
         valueGetter: (_value, row) => row.controllerVersion || "-",
       },
       {
+        field: "openClawDaemonStatus",
+        headerName: "OpenClaw daemon",
+        minWidth: 148,
+        sortable: false,
+        renderCell: ({ row }) => (
+          <Chip
+            label={formatHealthBadgeLabel(row.openClawDaemonStatus)}
+            color={openClawDaemonStatusColor(row.openClawDaemonStatus)}
+            size="small"
+            variant={row.openClawDaemonStatus === "running" ? "filled" : "outlined"}
+          />
+        ),
+      },
+      {
+        field: "openClawVersion",
+        headerName: "OpenClaw",
+        minWidth: 120,
+        valueGetter: (_value, row) => row.openClawVersion || "-",
+      },
+      {
+        field: "openClawGatewayStatus",
+        headerName: "Gateway",
+        minWidth: 132,
+        sortable: false,
+        renderCell: ({ row }) => (
+          <Chip
+            label={formatHealthBadgeLabel(row.openClawGatewayStatus)}
+            color={openClawGatewayStatusColor(row.openClawGatewayStatus)}
+            size="small"
+            variant={row.openClawGatewayStatus === "reachable" ? "filled" : "outlined"}
+          />
+        ),
+      },
+      {
         field: "actions",
         headerName: "Actions",
         sortable: false,
@@ -2421,6 +2485,12 @@ export function RemoteVpsControlCenter() {
                       columnHeaderHeight={40}
                       rows={listData.items}
                       columns={listColumns}
+                      initialState={{
+                        pinnedColumns: {
+                          left: ["name", "host", "status"],
+                          right: ["actions"],
+                        },
+                      }}
                       getRowId={(row) => row.id}
                       loading={listLoading || isNavigating}
                       disableRowSelectionOnClick
@@ -2651,6 +2721,18 @@ export function RemoteVpsControlCenter() {
                               <DetailField
                                 label="Controller version"
                                 value={selectedVps.controllerVersion || "-"}
+                              />
+                              <DetailField
+                                label="OpenClaw daemon"
+                                value={formatHealthBadgeLabel(selectedVps.openClawDaemonStatus)}
+                              />
+                              <DetailField
+                                label="OpenClaw version"
+                                value={selectedVps.openClawVersion || "-"}
+                              />
+                              <DetailField
+                                label="OpenClaw gateway"
+                                value={formatHealthBadgeLabel(selectedVps.openClawGatewayStatus)}
                               />
                               <DetailField label="Created by" value={selectedVps.createdBy} />
                               <DetailField label="Updated by" value={selectedVps.updatedBy} />

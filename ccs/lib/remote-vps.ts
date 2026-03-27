@@ -7,6 +7,8 @@ import RemoteVpsModel, { RemoteVpsDocument } from "@/models/RemoteVps";
 import {
   LogInteractionType,
   LogResult,
+  OpenClawDaemonStatus,
+  OpenClawGatewayStatus,
   RemoteVpsInteractionLogRecord,
   RemoteVpsInteractionLogTimestampWarning,
   RemoteVpsRecord,
@@ -17,6 +19,8 @@ import {
   VpsEnvironment,
   VpsProtocol,
   VpsStatus,
+  openClawDaemonStatusOptions,
+  openClawGatewayStatusOptions,
   logInteractionTypeOptions,
   logResultOptions,
   scriptExecutionResultOptions,
@@ -207,6 +211,16 @@ function extractProcessedPostsFromResultPayload(payload: unknown) {
 function normalizeScriptExecutionResult(value: unknown): ScriptExecutionResult | null {
   const normalized = safeString(value) as ScriptExecutionResult;
   return scriptExecutionResultOptions.includes(normalized) ? normalized : null;
+}
+
+function normalizeOpenClawDaemonStatus(value: unknown): OpenClawDaemonStatus {
+  const normalized = safeString(value) as OpenClawDaemonStatus;
+  return openClawDaemonStatusOptions.includes(normalized) ? normalized : "unknown";
+}
+
+function normalizeOpenClawGatewayStatus(value: unknown): OpenClawGatewayStatus {
+  const normalized = safeString(value) as OpenClawGatewayStatus;
+  return openClawGatewayStatusOptions.includes(normalized) ? normalized : "unknown";
 }
 
 function normalizeAlertStepOrder(value: unknown) {
@@ -558,6 +572,9 @@ export function serializeVps(document: RemoteVpsDocument | RemoteVpsRecord | Rec
     hasControllerSecret: Boolean(controllerSecretKey),
     controllerSecretKeyMasked: maskSecret(controllerSecretKey),
     controllerVersion: safeString(source.controllerVersion),
+    openClawDaemonStatus: normalizeOpenClawDaemonStatus(source.openClawDaemonStatus),
+    openClawVersion: safeString(source.openClawVersion),
+    openClawGatewayStatus: normalizeOpenClawGatewayStatus(source.openClawGatewayStatus),
     status: source.status as VpsStatus,
     statusReason: safeString(source.statusReason),
     alertDetails: alertDetailsSource
@@ -1652,6 +1669,31 @@ function extractControllerVersion(payload: unknown) {
   return "";
 }
 
+function extractOpenClawHealth(payload: unknown) {
+  if (!isPlainObject(payload)) {
+    return null;
+  }
+
+  const openclaw = isPlainObject(payload.openclaw) ? payload.openclaw : null;
+  const daemonStatus = normalizeOpenClawDaemonStatus(
+    openclaw?.daemonStatus ?? payload.openClawDaemonStatus
+  );
+  const version = safeString(openclaw?.version ?? payload.openClawVersion);
+  const gatewayStatus = normalizeOpenClawGatewayStatus(
+    openclaw?.gatewayStatus ?? payload.openClawGatewayStatus
+  );
+
+  if (!openclaw && !version && daemonStatus === "unknown" && gatewayStatus === "unknown") {
+    return null;
+  }
+
+  return {
+    daemonStatus,
+    version,
+    gatewayStatus,
+  };
+}
+
 function isTimeoutError(error: unknown) {
   if (error instanceof Error) {
     return error.name === "TimeoutError" || error.name === "AbortError";
@@ -1698,6 +1740,7 @@ export async function performControllerProbe(options: {
     const durationMs = Date.now() - startedAt;
     const responsePayload = await parseResponsePayload(response);
     const controllerVersion = extractControllerVersion(responsePayload);
+    const openClawHealth = extractOpenClawHealth(responsePayload);
     const result: LogResult = response.ok ? "success" : "failed";
     const now = new Date();
     const current = await RemoteVpsModel.findById(options.vps.id, { status: 1, statusReason: 1, alertDetails: 1 }).lean();
@@ -1747,6 +1790,9 @@ export async function performControllerProbe(options: {
       lastHealthCheckAt: now,
       lastHealthCheckResult: response.ok ? "success" : "failed",
       controllerVersion: controllerVersion || options.vps.controllerVersion,
+      openClawDaemonStatus: openClawHealth?.daemonStatus ?? options.vps.openClawDaemonStatus,
+      openClawVersion: openClawHealth?.version || options.vps.openClawVersion,
+      openClawGatewayStatus: openClawHealth?.gatewayStatus ?? options.vps.openClawGatewayStatus,
       updatedBy: options.initiatedByUserId,
     });
 
