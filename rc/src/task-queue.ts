@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import type { ExecuteScriptCommandPayload } from "./script-contract.js";
+import type { ControllerCommandPayload } from "./script-contract.js";
 
 export type TaskStatus = "pending" | "in_progress" | "completed" | "failed";
 
@@ -15,7 +15,7 @@ export interface TaskFailureDetails {
 
 export interface TaskRecord {
   id: string;
-  command: ExecuteScriptCommandPayload["command"];
+  command: ControllerCommandPayload["command"];
   status: TaskStatus;
   createdAt: string;
   startedAt: string | null;
@@ -23,7 +23,7 @@ export interface TaskRecord {
   result: unknown;
   error: string | null;
   failure: TaskFailureDetails | null;
-  input: ExecuteScriptCommandPayload;
+  input: ControllerCommandPayload;
 }
 
 interface TaskQueueOptions {
@@ -105,7 +105,7 @@ export class TaskQueue {
     this.cleanupTimer.unref();
   }
 
-  enqueue(input: ExecuteScriptCommandPayload) {
+  enqueue(input: ControllerCommandPayload) {
     this.prune();
 
     const task: TaskRecord = {

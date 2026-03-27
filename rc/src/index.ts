@@ -8,7 +8,7 @@ import dotenv from "dotenv";
 import { CursorActivityController } from "./cursor-activity.js";
 import { log, serializeError } from "./logger.js";
 import { OpenClawRuntime } from "./openclaw.js";
-import { validateExecuteScriptCommandPayload } from "./script-contract.js";
+import { validateControllerCommandPayload } from "./script-contract.js";
 import { TaskQueue, type TaskRecord } from "./task-queue.js";
 
 const currentFilePath = fileURLToPath(import.meta.url);
@@ -47,6 +47,7 @@ function buildCompletedTaskResultPayload(task: TaskRecord) {
   if (task.status === "failed") {
     return {
       taskId: task.id,
+      command: task.command,
       status: task.status,
       error: task.failure ?? task.error,
       result: task.result,
@@ -56,6 +57,7 @@ function buildCompletedTaskResultPayload(task: TaskRecord) {
 
   return {
     taskId: task.id,
+    command: task.command,
     status: task.status,
     result: task.result,
     taskLog: buildTaskLogPayload(task.id),
@@ -138,24 +140,32 @@ async function publishTaskResultToWebhook(task: TaskRecord) {
 }
 
 const queue = new TaskQueue(async (task) => {
-  cursorActivity.start(task.id, {
-    enabled: task.input.mouseActivityEnabled,
-    minIntervalMs: task.input.mouseActivityConfig?.minIntervalMs,
-    maxIntervalMs: task.input.mouseActivityConfig?.maxIntervalMs,
-    maxOffsetPx: task.input.mouseActivityConfig?.maxOffsetPx,
-  });
-
-  try {
-    return await runtime.executeScript(task.input.script, {
-      engineMode: task.input.engineMode,
-      targetId: task.input.targetId,
-      taskId: task.id,
-      profileVisitLookupUrlTemplate: task.input.callback?.profileVisitLookupUrlTemplate,
-      postHistoryLookupUrlTemplate: task.input.callback?.postHistoryLookupUrlTemplate,
+  if (task.input.command === "executeScript") {
+    cursorActivity.start(task.id, {
+      enabled: task.input.mouseActivityEnabled,
+      minIntervalMs: task.input.mouseActivityConfig?.minIntervalMs,
+      maxIntervalMs: task.input.mouseActivityConfig?.maxIntervalMs,
+      maxOffsetPx: task.input.mouseActivityConfig?.maxOffsetPx,
     });
-  } finally {
-    cursorActivity.stop(task.id);
+
+    try {
+      return await runtime.executeScript(task.input.script, {
+        engineMode: task.input.engineMode,
+        targetId: task.input.targetId,
+        taskId: task.id,
+        profileVisitLookupUrlTemplate: task.input.callback?.profileVisitLookupUrlTemplate,
+        postHistoryLookupUrlTemplate: task.input.callback?.postHistoryLookupUrlTemplate,
+      });
+    } finally {
+      cursorActivity.stop(task.id);
+    }
   }
+
+  if (task.input.command === "openclawUpdate") {
+    return runtime.updateOpenClaw({ taskId: task.id });
+  }
+
+  return runtime.restartGateway({ taskId: task.id });
 }, {
   maxRetainedTasks,
   finishedTaskTtlMs,
@@ -318,13 +328,20 @@ app.get("/health", (_request, response) => {
 
 app.post("/api/commands", (request, response, next) => {
   try {
-    const payload = validateExecuteScriptCommandPayload(request.body);
+    const payload = validateControllerCommandPayload(request.body);
     const task = queue.enqueue(payload);
 
-    log("info", "command.enqueued", {
+    const eventPayload: Record<string, unknown> = {
       taskId: task.id,
       command: payload.command,
-      stepCount: payload.script.steps.length,
+    };
+
+    if (payload.command === "executeScript") {
+      eventPayload.stepCount = payload.script.steps.length;
+    }
+
+    log("info", "command.enqueued", {
+      ...eventPayload,
     });
 
     response.status(202).json({

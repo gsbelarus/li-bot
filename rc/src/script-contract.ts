@@ -59,10 +59,16 @@ export interface ScriptInstructions {
 }
 
 export const executionEngineModes = ["deterministic", "ai_driven"] as const;
+export const controllerCommandOptions = [
+  "executeScript",
+  "openclawUpdate",
+  "openclawGatewayRestart",
+] as const;
 
 export type ExecutionEngineMode = (typeof executionEngineModes)[number];
+export type ControllerCommand = (typeof controllerCommandOptions)[number];
 
-export interface ExecuteScriptCallbackConfig {
+export interface CommandCallbackConfig {
   taskResultWebhookUrlTemplate: string;
   profileVisitLookupUrlTemplate?: string;
   postHistoryLookupUrlTemplate?: string;
@@ -81,8 +87,23 @@ export interface ExecuteScriptCommandPayload {
   mouseActivityEnabled?: boolean;
   mouseActivityConfig?: MouseActivityConfig;
   targetId?: string;
-  callback?: ExecuteScriptCallbackConfig;
+  callback?: CommandCallbackConfig;
 }
+
+export interface OpenClawUpdateCommandPayload {
+  command: "openclawUpdate";
+  callback?: CommandCallbackConfig;
+}
+
+export interface OpenClawGatewayRestartCommandPayload {
+  command: "openclawGatewayRestart";
+  callback?: CommandCallbackConfig;
+}
+
+export type ControllerCommandPayload =
+  | ExecuteScriptCommandPayload
+  | OpenClawUpdateCommandPayload
+  | OpenClawGatewayRestartCommandPayload;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -131,7 +152,7 @@ function normalizeMouseActivityConfig(value: unknown): MouseActivityConfig | und
   return Object.keys(config).length > 0 ? config : undefined;
 }
 
-function normalizeCallbackConfig(value: unknown): ExecuteScriptCallbackConfig | undefined {
+function normalizeCallbackConfig(value: unknown): CommandCallbackConfig | undefined {
   if (!isPlainObject(value)) {
     return undefined;
   }
@@ -243,15 +264,31 @@ export function normalizeStructuredInstructions(value: unknown): ScriptInstructi
   };
 }
 
-export function validateExecuteScriptCommandPayload(
+export function validateControllerCommandPayload(
   value: unknown
-): ExecuteScriptCommandPayload {
+): ControllerCommandPayload {
   if (!isPlainObject(value)) {
     throw new Error("Request body must be a JSON object.");
   }
 
-  if (value.command !== "executeScript") {
-    throw new Error("Only the executeScript command is supported.");
+  if (!controllerCommandOptions.includes(value.command as ControllerCommand)) {
+    throw new Error(
+      "Supported commands are executeScript, openclawUpdate, and openclawGatewayRestart."
+    );
+  }
+
+  if (value.command === "openclawUpdate") {
+    return {
+      command: "openclawUpdate",
+      callback: normalizeCallbackConfig(value.callback),
+    };
+  }
+
+  if (value.command === "openclawGatewayRestart") {
+    return {
+      command: "openclawGatewayRestart",
+      callback: normalizeCallbackConfig(value.callback),
+    };
   }
 
   return {

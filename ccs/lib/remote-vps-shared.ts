@@ -39,11 +39,18 @@ export const logDirectionOptions = [
 export const logInteractionTypeOptions = [
   "health_check",
   "command_dispatch",
+  "command_result",
   "status_pull",
   "script_result",
   "configuration_update",
   "registration",
   "manual_test",
+] as const;
+
+export const controllerCommandOptions = [
+  "executeScript",
+  "openclawUpdate",
+  "openclawGatewayRestart",
 ] as const;
 
 export const logResultOptions = [
@@ -71,6 +78,7 @@ export type OpenClawDaemonStatus = (typeof openClawDaemonStatusOptions)[number];
 export type OpenClawGatewayStatus = (typeof openClawGatewayStatusOptions)[number];
 export type LogDirection = (typeof logDirectionOptions)[number];
 export type LogInteractionType = (typeof logInteractionTypeOptions)[number];
+export type ControllerCommand = (typeof controllerCommandOptions)[number];
 export type LogResult = (typeof logResultOptions)[number];
 export type ScriptExecutionResult = (typeof scriptExecutionResultOptions)[number];
 export type InitiatedBy = (typeof initiatedByOptions)[number];

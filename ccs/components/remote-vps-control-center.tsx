@@ -109,6 +109,7 @@ interface ControllerTaskStatusResponse {
 
 interface ControllerTaskResultResponse {
   taskId: string;
+  command?: string;
   status: "pending" | "in_progress" | "completed" | "failed";
   message?: string;
   result?: unknown;
@@ -117,6 +118,7 @@ interface ControllerTaskResultResponse {
 }
 
 type TaskEngineMode = "deterministic" | "ai_driven";
+type RemoteMaintenanceCommand = "openclawUpdate" | "openclawGatewayRestart";
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -608,6 +610,80 @@ function getTaskCompletionSnackbarMessage(
   return summary
     ? `Script "${scriptName}" completed on ${vpsName}. ${summary}`
     : `Script "${scriptName}" completed on ${vpsName}.`;
+}
+
+function getGenericCommandResultSummary(payload: unknown) {
+  if (!isPlainObject(payload) || !isPlainObject(payload.result)) {
+    return "";
+  }
+
+  const result = payload.result;
+  const summary =
+    typeof result.summary === "string"
+      ? result.summary.trim()
+      : typeof result.message === "string"
+        ? result.message.trim()
+        : "";
+
+  if (summary) {
+    return summary;
+  }
+
+  const openclaw = isPlainObject(result.openclaw)
+    ? result.openclaw
+    : isPlainObject(result.health)
+      ? result.health
+      : null;
+
+  if (!openclaw) {
+    return "";
+  }
+
+  const parts: string[] = [];
+
+  if (typeof openclaw.version === "string" && openclaw.version.trim()) {
+    parts.push(`version ${openclaw.version.trim()}`);
+  }
+
+  if (typeof openclaw.daemonStatus === "string" && openclaw.daemonStatus.trim()) {
+    parts.push(`daemon ${formatHealthBadgeLabel(openclaw.daemonStatus)}`);
+  }
+
+  if (typeof openclaw.gatewayStatus === "string" && openclaw.gatewayStatus.trim()) {
+    parts.push(`gateway ${formatHealthBadgeLabel(openclaw.gatewayStatus)}`);
+  }
+
+  return parts.length > 0 ? `OpenClaw health: ${parts.join(" | ")}.` : "";
+}
+
+function getControllerTaskSummary(payload: unknown) {
+  return getTaskResultSummary(payload) || getGenericCommandResultSummary(payload);
+}
+
+function getControllerCommandLabel(command: RemoteMaintenanceCommand | "executeScript" | string | null | undefined) {
+  switch (command) {
+    case "executeScript":
+      return "Script";
+    case "openclawUpdate":
+      return "OpenClaw update";
+    case "openclawGatewayRestart":
+      return "OpenClaw gateway restart";
+    default:
+      return "Remote command";
+  }
+}
+
+function getMaintenanceCommandCompletionSnackbarMessage(
+  payload: ControllerTaskResultResponse,
+  command: RemoteMaintenanceCommand,
+  vpsName: string
+) {
+  const summary = getControllerTaskSummary(payload);
+  const label = getControllerCommandLabel(command);
+
+  return summary
+    ? `${label} completed on ${vpsName}. ${summary}`
+    : `${label} completed on ${vpsName}.`;
 }
 
 function getTaskLogText(payload: unknown) {
@@ -1806,7 +1882,7 @@ export function RemoteVpsControlCenter() {
         headerName: "Actions",
         sortable: false,
         filterable: false,
-        minWidth: 176,
+        minWidth: 248,
         renderCell: ({ row }) => (
           <Stack direction="row" spacing={0.25}>
             <Tooltip title="View details">
@@ -1836,6 +1912,30 @@ export function RemoteVpsControlCenter() {
                   onClick={() => openExecuteScriptDialog(row)}
                 >
                   <PlayArrowRoundedIcon fontSize="small" />
+                </IconButton>
+              </span>
+            </Tooltip>
+            <Tooltip title="Update OpenClaw">
+              <span>
+                <IconButton
+                  size="small"
+                  sx={{ p: 0.4 }}
+                  disabled={actionVpsId === row.id || !row.isEnabled}
+                  onClick={() => void triggerMaintenanceCommand(row, "openclawUpdate")}
+                >
+                  <SyncRoundedIcon fontSize="small" />
+                </IconButton>
+              </span>
+            </Tooltip>
+            <Tooltip title="Restart gateway">
+              <span>
+                <IconButton
+                  size="small"
+                  sx={{ p: 0.4 }}
+                  disabled={actionVpsId === row.id || !row.isEnabled}
+                  onClick={() => void triggerMaintenanceCommand(row, "openclawGatewayRestart")}
+                >
+                  <RefreshRoundedIcon fontSize="small" />
                 </IconButton>
               </span>
             </Tooltip>
@@ -1972,10 +2072,11 @@ export function RemoteVpsControlCenter() {
     setExecuteDialogMouseMaxOffsetPx(mouseDefaults.maxOffsetPx);
   }
 
-  async function pollScriptExecution(options: {
+  async function pollControllerTask(options: {
     vpsId: string;
     taskId: string;
-    scriptName: string;
+    command: "executeScript" | RemoteMaintenanceCommand;
+    displayName: string;
     vpsName: string;
   }) {
     const pollId = nextScriptPollIdRef.current + 1;
@@ -1989,7 +2090,7 @@ export function RemoteVpsControlCenter() {
         if (attempts >= SCRIPT_POLL_MAX_ATTEMPTS || Date.now() - startedAt >= SCRIPT_POLL_TIMEOUT_MS) {
           if (isScriptPollActive(pollId)) {
             setSnackbar(
-              `Stopped tracking script "${options.scriptName}" on ${options.vpsName} after ${Math.round(
+              `Stopped tracking ${options.displayName} on ${options.vpsName} after ${Math.round(
                 SCRIPT_POLL_TIMEOUT_MS / 60000
               )} minutes. Check interaction logs for the latest status.`
             );
@@ -2021,7 +2122,7 @@ export function RemoteVpsControlCenter() {
         if (statusResponse.status === "failed") {
           if (isScriptPollActive(pollId)) {
             setSnackbar(
-              `Script "${options.scriptName}" failed on ${options.vpsName}: ${getControllerTaskErrorMessage(statusResponse.error)}`
+              `${options.displayName} failed on ${options.vpsName}: ${getControllerTaskErrorMessage(statusResponse.error)}`
             );
             setRefreshToken((value) => value + 1);
           }
@@ -2038,10 +2139,18 @@ export function RemoteVpsControlCenter() {
         }
 
         if (resultResponse.status === "completed") {
-          setSnackbar(getTaskCompletionSnackbarMessage(resultResponse, options.scriptName, options.vpsName));
+          setSnackbar(
+            options.command === "executeScript"
+              ? getTaskCompletionSnackbarMessage(resultResponse, options.displayName, options.vpsName)
+              : getMaintenanceCommandCompletionSnackbarMessage(
+                resultResponse,
+                options.command,
+                options.vpsName
+              )
+          );
         } else {
           const message = getControllerTaskErrorMessage(resultResponse.error);
-          setSnackbar(`Script \"${options.scriptName}\" failed on ${options.vpsName}: ${message}`);
+          setSnackbar(`${options.displayName} failed on ${options.vpsName}: ${message}`);
         }
 
         setRefreshToken((value) => value + 1);
@@ -2056,7 +2165,7 @@ export function RemoteVpsControlCenter() {
       }
 
       if (isScriptPollActive(pollId)) {
-        setSnackbar(`Unable to finish tracking script \"${options.scriptName}\" on ${options.vpsName}. Check interaction logs.`);
+        setSnackbar(`Unable to finish tracking ${options.displayName} on ${options.vpsName}. Check interaction logs.`);
         setRefreshToken((value) => value + 1);
       }
     } finally {
@@ -2139,10 +2248,11 @@ export function RemoteVpsControlCenter() {
       setSnackbar(`Started script \"${selectedScript.name}\" on ${executeDialogVps.name}.`);
       setRefreshToken((value) => value + 1);
 
-      void pollScriptExecution({
+      void pollControllerTask({
         vpsId: executeDialogVps.id,
         taskId: response.taskId,
-        scriptName: selectedScript.name,
+        command: "executeScript",
+        displayName: selectedScript.name,
         vpsName: executeDialogVps.name,
       });
     } catch (error) {
@@ -2152,6 +2262,39 @@ export function RemoteVpsControlCenter() {
       setExecuteDialogMouseMinIntervalMs(String(DEFAULT_MOUSE_ACTIVITY_MIN_INTERVAL_MS));
       setExecuteDialogMouseMaxIntervalMs(String(DEFAULT_MOUSE_ACTIVITY_MAX_INTERVAL_MS));
       setExecuteDialogMouseMaxOffsetPx(String(DEFAULT_MOUSE_ACTIVITY_MAX_OFFSET_PX));
+    }
+  }
+
+  async function triggerMaintenanceCommand(vps: RemoteVpsRecord, command: RemoteMaintenanceCommand) {
+    const commandLabel = getControllerCommandLabel(command);
+    setActionVpsId(vps.id);
+
+    try {
+      const response = await requestJson<ControllerTaskStatusResponse>(
+        `/api/vps/${vps.id}/commands`,
+        {
+          method: "POST",
+          body: JSON.stringify({ command }),
+        }
+      );
+
+      if (!response.taskId) {
+        throw new Error("Remote controller did not return a task ID.");
+      }
+
+      setSnackbar(`${commandLabel} started on ${vps.name}.`);
+      setRefreshToken((value) => value + 1);
+
+      void pollControllerTask({
+        vpsId: vps.id,
+        taskId: response.taskId,
+        command,
+        displayName: commandLabel,
+        vpsName: vps.name,
+      });
+    } catch (error) {
+      setSnackbar(`${commandLabel} failed to start on ${vps.name}: ${getControllerTaskErrorMessage(error)}`);
+      setActionVpsId((current) => (current === vps.id ? null : current));
     }
   }
 
@@ -2760,68 +2903,99 @@ export function RemoteVpsControlCenter() {
                           </Stack>
                         </Box>
                         <Divider />
-                        <Stack direction="row" spacing={1} flexWrap="wrap" sx={{ mt: "auto" }}>
-                          <Button
-                            variant="contained"
-                            startIcon={<EditRoundedIcon />}
-                            onClick={() => setScreen({ kind: "edit", vpsId: selectedVps.id })}
-                          >
-                            Edit
-                          </Button>
-                          <Button
-                            variant="outlined"
-                            startIcon={<PlayArrowRoundedIcon />}
-                            disabled={
-                              actionVpsId === selectedVps.id ||
-                              !selectedVps.isEnabled ||
-                              selectedVps.status === "alert"
-                            }
-                            onClick={() => openExecuteScriptDialog(selectedVps)}
-                          >
-                            Execute script
-                          </Button>
-                          {selectedVps.status === "alert" ? (
+                        <Stack spacing={1} sx={{ mt: "auto" }}>
+                          <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
                             <Button
+                              size="small"
                               variant="contained"
-                              color="error"
+                              startIcon={<EditRoundedIcon />}
+                              onClick={() => setScreen({ kind: "edit", vpsId: selectedVps.id })}
+                            >
+                              Edit
+                            </Button>
+                            <Button
+                              size="small"
+                              variant="outlined"
+                              startIcon={<PlayArrowRoundedIcon />}
+                              disabled={
+                                actionVpsId === selectedVps.id ||
+                                !selectedVps.isEnabled ||
+                                selectedVps.status === "alert"
+                              }
+                              onClick={() => openExecuteScriptDialog(selectedVps)}
+                            >
+                              Execute script
+                            </Button>
+                            <Button
+                              size="small"
+                              variant="outlined"
+                              startIcon={<SyncRoundedIcon />}
+                              disabled={actionVpsId === selectedVps.id || !selectedVps.isEnabled}
+                              onClick={() => void triggerMaintenanceCommand(selectedVps, "openclawUpdate")}
+                            >
+                              Update OpenClaw
+                            </Button>
+                            <Button
+                              size="small"
+                              variant="outlined"
+                              startIcon={<RefreshRoundedIcon />}
+                              disabled={actionVpsId === selectedVps.id || !selectedVps.isEnabled}
+                              onClick={() =>
+                                void triggerMaintenanceCommand(selectedVps, "openclawGatewayRestart")
+                              }
+                            >
+                              Restart gateway
+                            </Button>
+                          </Stack>
+                          <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+                            {selectedVps.status === "alert" ? (
+                              <Button
+                                size="small"
+                                variant="contained"
+                                color="error"
+                                startIcon={<SyncRoundedIcon />}
+                                disabled={actionVpsId === selectedVps.id}
+                                onClick={() => void clearAlertStatus(selectedVps.id)}
+                              >
+                                Clear alert
+                              </Button>
+                            ) : null}
+                            <Button
+                              size="small"
+                              variant="outlined"
+                              startIcon={<LanRoundedIcon />}
+                              disabled={actionVpsId === selectedVps.id}
+                              onClick={() => void triggerProbe(selectedVps.id, "test-connection")}
+                            >
+                              Test connection
+                            </Button>
+                            <Button
+                              size="small"
+                              variant="outlined"
                               startIcon={<SyncRoundedIcon />}
                               disabled={actionVpsId === selectedVps.id}
-                              onClick={() => void clearAlertStatus(selectedVps.id)}
+                              onClick={() => void triggerProbe(selectedVps.id, "health-check")}
                             >
-                              Clear alert
+                              Health check
                             </Button>
-                          ) : null}
-                          <Button
-                            variant="outlined"
-                            startIcon={<LanRoundedIcon />}
-                            disabled={actionVpsId === selectedVps.id}
-                            onClick={() => void triggerProbe(selectedVps.id, "test-connection")}
-                          >
-                            Test connection
-                          </Button>
-                          <Button
-                            variant="outlined"
-                            startIcon={<SyncRoundedIcon />}
-                            disabled={actionVpsId === selectedVps.id}
-                            onClick={() => void triggerProbe(selectedVps.id, "health-check")}
-                          >
-                            Health check
-                          </Button>
-                          <Button
-                            variant="outlined"
-                            startIcon={<HistoryRoundedIcon />}
-                            onClick={() => openLogsScreen(selectedVps.id)}
-                          >
-                            Open logs
-                          </Button>
-                          <Button
-                            variant="text"
-                            color="error"
-                            startIcon={<DeleteOutlineRoundedIcon />}
-                            onClick={() => setDeleteTarget(selectedVps)}
-                          >
-                            Delete
-                          </Button>
+                            <Button
+                              size="small"
+                              variant="outlined"
+                              startIcon={<HistoryRoundedIcon />}
+                              onClick={() => openLogsScreen(selectedVps.id)}
+                            >
+                              Open logs
+                            </Button>
+                            <Button
+                              size="small"
+                              variant="text"
+                              color="error"
+                              startIcon={<DeleteOutlineRoundedIcon />}
+                              onClick={() => setDeleteTarget(selectedVps)}
+                            >
+                              Delete
+                            </Button>
+                          </Stack>
                         </Stack>
                       </Stack>
                     </CardContent>
@@ -3292,7 +3466,7 @@ export function RemoteVpsControlCenter() {
                 label="Step resolution"
                 value={getTaskStepResolutionSummary(selectedLog.responsePayload) || "-"}
               />
-              <DetailField label="Task summary" value={getTaskResultSummary(selectedLog.responsePayload) || "-"} />
+              <DetailField label="Task summary" value={getControllerTaskSummary(selectedLog.responsePayload) || "-"} />
               <PayloadBlock title="Request payload" value={selectedLog.requestPayload} />
               <PayloadBlock title="Response payload" value={selectedLog.responsePayload} />
               {formatTaskStepResolutionIndicators(selectedLog.responsePayload).length > 0 ? (

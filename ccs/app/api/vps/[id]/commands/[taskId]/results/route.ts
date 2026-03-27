@@ -6,6 +6,7 @@ import {
   findVpsById,
   getActorFromRequest,
   getControllerConnectionDetails,
+  persistControllerCommandResultLog,
   getProvidedControllerSecret,
   persistControllerTaskResultLog,
 } from "@/lib/remote-vps";
@@ -66,14 +67,25 @@ export async function POST(
     return NextResponse.json({ error: "Result payload must be a JSON object." }, { status: 400 });
   }
 
-  await persistControllerTaskResultLog({
-    vpsId: id,
-    taskId,
-    responseStatusCode: 200,
-    responsePayload: body,
-    initiatedByUserId: "system@remote-controller",
-    createdAt: new Date(),
-  });
+  if ((body as { command?: unknown }).command === "executeScript") {
+    await persistControllerTaskResultLog({
+      vpsId: id,
+      taskId,
+      responseStatusCode: 200,
+      responsePayload: body,
+      initiatedByUserId: "system@remote-controller",
+      createdAt: new Date(),
+    });
+  } else {
+    await persistControllerCommandResultLog({
+      vpsId: id,
+      taskId,
+      responseStatusCode: 200,
+      responsePayload: body,
+      initiatedByUserId: "system@remote-controller",
+      createdAt: new Date(),
+    });
+  }
 
   return NextResponse.json({ ok: true }, { status: 202 });
 }

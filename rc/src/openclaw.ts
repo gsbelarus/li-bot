@@ -135,6 +135,16 @@ export interface OpenClawHealthSnapshot {
   gatewayStatus: OpenClawGatewayStatus;
 }
 
+export interface OpenClawMaintenanceCommandResult {
+  commandLine: string;
+  summary: string;
+  startedAt: string;
+  finishedAt: string;
+  stdout: string;
+  stderr: string;
+  openclaw: OpenClawHealthSnapshot;
+}
+
 interface ExecutionContext {
   taskId?: string;
   engineMode?: ExecutionEngineMode;
@@ -1019,6 +1029,100 @@ export class OpenClawRuntime {
     };
   }
 
+  async updateOpenClaw(options: { taskId?: string } = {}) {
+    const taskId = options.taskId;
+    const steps = [
+      ["gateway", "stop"],
+      ["update"],
+      ["gateway", "start"],
+    ] as const;
+    const commandLine = steps.map((args) => `openclaw ${args.join(" ")}`).join(" && ");
+    const startedAt = new Date().toISOString();
+    const stdoutParts: string[] = [];
+    const stderrParts: string[] = [];
+    let gatewayStopped = false;
+
+    initializeTaskLog(taskId, {
+      taskId: taskId ?? null,
+      receivedAt: startedAt,
+      commandLine,
+      steps: steps.map((args) => ({ args, commandLine: `openclaw ${args.join(" ")}` })),
+    });
+
+    try {
+      const stopExecution = await this.runOpenClawCommand([...steps[0]], { taskId });
+      gatewayStopped = true;
+      stdoutParts.push(stopExecution.stdout);
+      stderrParts.push(stopExecution.stderr);
+
+      const updateExecution = await this.runOpenClawCommand([...steps[1]], { taskId });
+      stdoutParts.push(updateExecution.stdout);
+      stderrParts.push(updateExecution.stderr);
+
+      const startExecution = await this.runOpenClawCommand([...steps[2]], { taskId });
+      gatewayStopped = false;
+      stdoutParts.push(startExecution.stdout);
+      stderrParts.push(startExecution.stderr);
+
+      await sleep(2000);
+
+      const openclaw = await this.getHealthSnapshot();
+      const result = {
+        commandLine,
+        summary: "OpenClaw update completed successfully after restarting the gateway.",
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        stdout: stdoutParts.filter(Boolean).join("\n\n"),
+        stderr: stderrParts.filter(Boolean).join("\n\n"),
+        openclaw,
+      } satisfies OpenClawMaintenanceCommandResult;
+
+      appendTaskLog(taskId, `TASK_RESULT ${JSON.stringify(result)}`);
+      return result;
+    } catch (error) {
+      if (gatewayStopped) {
+        try {
+          const recoveryExecution = await this.runOpenClawCommand(["gateway", "start"], { taskId });
+          stdoutParts.push(recoveryExecution.stdout);
+          stderrParts.push(recoveryExecution.stderr);
+          appendTaskLog(taskId, `RECOVERY ${JSON.stringify({
+            taskId: taskId ?? null,
+            action: "gateway_start_after_failed_update",
+            recoveredAt: new Date().toISOString(),
+          })}`);
+        } catch (recoveryError) {
+          appendTaskLog(taskId, `RECOVERY_ERROR ${JSON.stringify({
+            taskId: taskId ?? null,
+            action: "gateway_start_after_failed_update",
+            failedAt: new Date().toISOString(),
+            error: serializeUnknownError(recoveryError),
+          })}`);
+
+          if (error instanceof Error && recoveryError instanceof Error) {
+            error.message = `${error.message} Gateway restart recovery also failed: ${recoveryError.message}`;
+          }
+        }
+      }
+
+      appendTaskLog(taskId, `TASK_ERROR ${JSON.stringify({
+        taskId: taskId ?? null,
+        failedAt: new Date().toISOString(),
+        commandLine,
+        error: serializeUnknownError(error),
+      })}`);
+
+      throw error;
+    }
+  }
+
+  async restartGateway(options: { taskId?: string } = {}) {
+    return this.runMaintenanceCommand(["gateway", "restart"], {
+      taskId: options.taskId,
+      summary: "OpenClaw gateway restart completed successfully.",
+      settleDelayMs: 2000,
+    });
+  }
+
   executeScript(script: ScriptInstructions, options?: string | ExecuteScriptOptions) {
     if (typeof options === "string") {
       return this.runScript(script, { targetId: options, engineMode: "deterministic" });
@@ -1226,6 +1330,130 @@ export class OpenClawRuntime {
     }
 
     return stdout ? JSON.parse(stdout) : null;
+  }
+
+  private async runMaintenanceCommand(
+    args: string[],
+    options: {
+      taskId?: string;
+      summary: string;
+      settleDelayMs?: number;
+    }
+  ): Promise<OpenClawMaintenanceCommandResult> {
+    const { taskId } = options;
+    const commandLine = `openclaw ${args.join(" ")}`;
+    const startedAt = new Date().toISOString();
+
+    initializeTaskLog(taskId, {
+      taskId: taskId ?? null,
+      receivedAt: startedAt,
+      commandLine,
+      args,
+    });
+
+    try {
+      const execution = await this.runOpenClawCommand(args, { taskId });
+
+      if ((options.settleDelayMs ?? 0) > 0) {
+        await sleep(options.settleDelayMs ?? 0);
+      }
+
+      const openclaw = await this.getHealthSnapshot();
+      const result = {
+        commandLine,
+        summary: options.summary,
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        stdout: execution.stdout,
+        stderr: execution.stderr,
+        openclaw,
+      } satisfies OpenClawMaintenanceCommandResult;
+
+      appendTaskLog(taskId, `TASK_RESULT ${JSON.stringify(result)}`);
+      return result;
+    } catch (error) {
+      appendTaskLog(taskId, `TASK_ERROR ${JSON.stringify({
+        taskId: taskId ?? null,
+        failedAt: new Date().toISOString(),
+        commandLine,
+        error: serializeUnknownError(error),
+      })}`);
+
+      throw error;
+    }
+  }
+
+  private async runOpenClawCommand(
+    args: string[],
+    options: { taskId?: string } = {}
+  ) {
+    const invocation = this.resolveOpenClawInvocation();
+    const command = invocation.command;
+    const commandArgs = [...invocation.commandArgsPrefix, ...args];
+
+    console.log(
+      `[openclaw] ${command} ${maskCommandArgs(commandArgs)
+        .map((entry) => (entry.includes(" ") ? JSON.stringify(entry) : entry))
+        .join(" ")}`
+    );
+    appendTaskLog(
+      options.taskId,
+      `COMMAND ${JSON.stringify({
+        command,
+        commandArgs: maskCommandArgs(commandArgs),
+      })}`
+    );
+
+    const stdoutChunks: string[] = [];
+    const stderrChunks: string[] = [];
+    const child = spawn(command, commandArgs, {
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+
+    child.stdout.on("data", (chunk: string) => {
+      stdoutChunks.push(chunk);
+    });
+
+    child.stderr.on("data", (chunk: string) => {
+      stderrChunks.push(chunk);
+    });
+
+    const exitCode = await new Promise<number>((resolve, reject) => {
+      child.once("error", (error) => {
+        reject(error);
+      });
+
+      child.once("close", (code) => {
+        resolve(code ?? 0);
+      });
+    });
+
+    const stdout = stdoutChunks.join("").trim();
+    const stderr = stderrChunks.join("").trim();
+
+    appendTaskLog(
+      options.taskId,
+      `RESPONSE ${JSON.stringify({
+        command,
+        commandArgs: maskCommandArgs(commandArgs),
+        exitCode,
+        stdout,
+        stderr,
+      })}`
+    );
+
+    if (exitCode !== 0) {
+      throw new Error((stderr || stdout || `OpenClaw exited with code ${exitCode}.`).trim());
+    }
+
+    return {
+      stdout,
+      stderr,
+    };
   }
 
   private async getFocusedTab(context: ExecutionContext = {}) {

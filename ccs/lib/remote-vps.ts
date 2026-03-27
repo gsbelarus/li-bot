@@ -5,6 +5,7 @@ import { Types } from "mongoose";
 import RemoteVpsInteractionLogModel from "@/models/RemoteVpsInteractionLog";
 import RemoteVpsModel, { RemoteVpsDocument } from "@/models/RemoteVps";
 import {
+  ControllerCommand,
   LogInteractionType,
   LogResult,
   OpenClawDaemonStatus,
@@ -19,6 +20,7 @@ import {
   VpsEnvironment,
   VpsProtocol,
   VpsStatus,
+  controllerCommandOptions,
   openClawDaemonStatusOptions,
   openClawGatewayStatusOptions,
   logInteractionTypeOptions,
@@ -895,7 +897,52 @@ interface ControllerTaskDispatchContext {
   script: unknown;
 }
 
-async function findCommandDispatchContext(vpsId: string, taskId: string) {
+interface ControllerCommandDispatchLogContext {
+  correlationId: string;
+  requestPayload: Record<string, unknown> | null;
+}
+
+function normalizeControllerCommand(value: unknown): ControllerCommand | null {
+  const normalized = safeString(value) as ControllerCommand;
+  return controllerCommandOptions.includes(normalized) ? normalized : null;
+}
+
+function isScriptCommand(command: ControllerCommand | null) {
+  return command === "executeScript";
+}
+
+function getControllerCommandLabel(command: ControllerCommand | null) {
+  switch (command) {
+    case "executeScript":
+      return "Script execution";
+    case "openclawUpdate":
+      return "OpenClaw update";
+    case "openclawGatewayRestart":
+      return "OpenClaw gateway restart";
+    default:
+      return "Remote command";
+  }
+}
+
+function extractControllerCommandFromPayload(payload: unknown) {
+  if (!isPlainObject(payload)) {
+    return null;
+  }
+
+  const directCommand = normalizeControllerCommand(payload.command);
+
+  if (directCommand) {
+    return directCommand;
+  }
+
+  if (isPlainObject(payload.result)) {
+    return normalizeControllerCommand(payload.result.command);
+  }
+
+  return null;
+}
+
+async function findCommandDispatchLogContext(vpsId: string, taskId: string) {
   const dispatchResponseLog = await RemoteVpsInteractionLogModel.findOne({
     vpsId,
     interactionType: "command_dispatch",
@@ -918,11 +965,22 @@ async function findCommandDispatchContext(vpsId: string, taskId: string) {
     .sort({ createdAt: -1 })
     .lean();
 
-  if (!dispatchRequestLog || !isPlainObject(dispatchRequestLog.requestPayload)) {
+  return {
+    correlationId: dispatchResponseLog.correlationId,
+    requestPayload: isPlainObject(dispatchRequestLog?.requestPayload)
+      ? dispatchRequestLog.requestPayload
+      : null,
+  } satisfies ControllerCommandDispatchLogContext;
+}
+
+async function findCommandDispatchContext(vpsId: string, taskId: string) {
+  const dispatchContext = await findCommandDispatchLogContext(vpsId, taskId);
+
+  if (!dispatchContext?.requestPayload) {
     return null;
   }
 
-  const requestPayload = dispatchRequestLog.requestPayload;
+  const requestPayload = dispatchContext.requestPayload;
 
   return {
     scriptId: safeString(requestPayload.scriptId),
@@ -970,6 +1028,82 @@ function buildScriptResultRequestPayload(
       maxOffsetPx: null,
     },
     script: dispatchContext?.script ?? null,
+  };
+}
+
+function getControllerCommandResultMessage(payload: unknown) {
+  const { status, error } = getControllerTaskResultState(payload);
+  const command = extractControllerCommandFromPayload(payload);
+  const commandLabel = getControllerCommandLabel(command);
+  const resultPayload = isPlainObject(payload) && isPlainObject(payload.result)
+    ? payload.result
+    : null;
+  const summary = safeString(resultPayload?.summary || resultPayload?.message);
+
+  if (status === "completed") {
+    return summary || `${commandLabel} completed successfully.`;
+  }
+
+  if (status === "failed") {
+    if (typeof error === "string") {
+      return error;
+    }
+
+    if (isPlainObject(error) && typeof error.message === "string") {
+      return error.message;
+    }
+
+    return `${commandLabel} failed.`;
+  }
+
+  if (status === "pending" || status === "in_progress") {
+    return `${commandLabel} results are not available yet.`;
+  }
+
+  return `${commandLabel} result payload was not recognized.`;
+}
+
+function buildCommandResultLogDocument(options: {
+  taskId: string;
+  dispatchContext: ControllerCommandDispatchLogContext | null;
+  responseStatusCode: number | null;
+  responsePayload: unknown;
+  durationMs: number | null;
+  initiatedByUserId: string;
+  taskLogText: string;
+}) {
+  const requestPayload = options.dispatchContext?.requestPayload ?? null;
+
+  return {
+    direction: "internal_event" as const,
+    interactionType: "command_result" as const,
+    requestMethod: "GET",
+    requestPath: `/api/commands/${encodeURIComponent(options.taskId)}/results`,
+    requestPayload: sanitizePayload(
+      requestPayload
+        ? {
+          ...requestPayload,
+          taskId: options.taskId,
+        }
+        : {
+          taskId: options.taskId,
+          command: extractControllerCommandFromPayload(options.responsePayload),
+        }
+    ),
+    responseStatusCode: options.responseStatusCode,
+    responsePayload: sanitizePayload(options.responsePayload),
+    result: getControllerTaskResultLogResult(options.responsePayload),
+    scriptExecutionResult: null,
+    notCompletedDetails: null,
+    durationMs: options.durationMs,
+    initiatedBy: "operator" as const,
+    initiatedByUserId: options.initiatedByUserId,
+    taskLogText: options.taskLogText,
+    errorCode:
+      getControllerTaskResultState(options.responsePayload).status === "failed"
+        ? "COMMAND_FAILED"
+        : "",
+    errorMessage: getControllerCommandResultMessage(options.responsePayload),
   };
 }
 
@@ -1066,6 +1200,17 @@ export async function persistControllerTaskResultLog(options: {
   logId?: string;
   createdAt?: Date;
 }) {
+  const dispatchLogContext = await findCommandDispatchLogContext(options.vpsId, options.taskId);
+  const command = normalizeControllerCommand(dispatchLogContext?.requestPayload?.command)
+    ?? extractControllerCommandFromPayload(options.responsePayload);
+
+  if (!isScriptCommand(command)) {
+    return persistControllerCommandResultLog({
+      ...options,
+      dispatchContext: dispatchLogContext,
+    });
+  }
+
   const dispatchContext = await findCommandDispatchContext(options.vpsId, options.taskId);
   const taskLogText = options.taskLogText ?? getTaskLogText(options.responsePayload);
   const document = buildScriptResultLogDocument({
@@ -1118,6 +1263,103 @@ export async function persistControllerTaskResultLog(options: {
       setDefaultsOnInsert: true,
     }
   );
+}
+
+export async function persistControllerCommandResultLog(options: {
+  vpsId: string;
+  taskId: string;
+  responseStatusCode?: number | null;
+  responsePayload: unknown;
+  durationMs?: number | null;
+  initiatedByUserId: string;
+  taskLogText?: string;
+  logId?: string;
+  createdAt?: Date;
+  dispatchContext?: ControllerCommandDispatchLogContext | null;
+}) {
+  const dispatchContext = options.dispatchContext
+    ?? await findCommandDispatchLogContext(options.vpsId, options.taskId);
+  const taskLogText = options.taskLogText ?? getTaskLogText(options.responsePayload);
+  const document = buildCommandResultLogDocument({
+    taskId: options.taskId,
+    dispatchContext,
+    responseStatusCode: options.responseStatusCode ?? null,
+    responsePayload: options.responsePayload,
+    durationMs: options.durationMs ?? null,
+    initiatedByUserId: options.initiatedByUserId,
+    taskLogText,
+  });
+  const openClawHealth = extractOpenClawHealth(options.responsePayload);
+  const current = await RemoteVpsModel.findById(options.vpsId, {
+    status: 1,
+    statusReason: 1,
+    alertDetails: 1,
+    openClawDaemonStatus: 1,
+    openClawVersion: 1,
+    openClawGatewayStatus: 1,
+  }).lean();
+  const currentStatus = (current?.status as VpsStatus | undefined) ?? "unknown";
+  const statusUpdate = buildStatusUpdate({
+    currentStatus,
+    currentReason: safeString(current?.statusReason),
+    currentAlertDetails: current?.alertDetails,
+    preserveAlertStatus: true,
+    nextStatus:
+      currentStatus === "disabled"
+        ? "disabled"
+        : document.result === "failed"
+          ? "degraded"
+          : currentStatus === "unknown"
+            ? "online"
+            : currentStatus,
+    nextReason:
+      document.result === "failed"
+        ? document.errorMessage || "Remote command failed."
+        : safeString(current?.statusReason) || "Remote command completed successfully.",
+  });
+
+  if (options.logId) {
+    await RemoteVpsInteractionLogModel.findOneAndUpdate(
+      { _id: options.logId, vpsId: options.vpsId },
+      { $set: document },
+      { returnDocument: "after" }
+    );
+  } else {
+    await RemoteVpsInteractionLogModel.findOneAndUpdate(
+      {
+        vpsId: options.vpsId,
+        correlationId: options.taskId,
+        direction: "internal_event",
+        interactionType: "command_result",
+      },
+      {
+        $set: document,
+        $setOnInsert: {
+          vpsId: options.vpsId,
+          correlationId: options.taskId,
+          createdAt: options.createdAt ?? new Date(),
+        },
+      },
+      {
+        upsert: true,
+        returnDocument: "after",
+        setDefaultsOnInsert: true,
+      }
+    );
+  }
+
+  await RemoteVpsModel.findByIdAndUpdate(options.vpsId, {
+    ...statusUpdate,
+    lastSeenAt: document.result === "success" ? options.createdAt ?? new Date() : undefined,
+    openClawDaemonStatus:
+      openClawHealth?.daemonStatus ??
+      normalizeOpenClawDaemonStatus(current?.openClawDaemonStatus),
+    openClawVersion: openClawHealth?.version || safeString(current?.openClawVersion),
+    openClawGatewayStatus:
+      openClawHealth?.gatewayStatus ??
+      normalizeOpenClawGatewayStatus(current?.openClawGatewayStatus),
+    updatedBy: options.initiatedByUserId,
+  });
 }
 
 function buildStatusUpdate(options: {
@@ -1674,13 +1916,27 @@ function extractOpenClawHealth(payload: unknown) {
     return null;
   }
 
-  const openclaw = isPlainObject(payload.openclaw) ? payload.openclaw : null;
+  const resultPayload = isPlainObject(payload.result) ? payload.result : null;
+  const nestedHealth = isPlainObject(resultPayload?.openclaw)
+    ? resultPayload.openclaw
+    : isPlainObject(resultPayload?.health)
+      ? resultPayload.health
+      : null;
+  const openclaw = isPlainObject(payload.openclaw)
+    ? payload.openclaw
+    : nestedHealth;
   const daemonStatus = normalizeOpenClawDaemonStatus(
-    openclaw?.daemonStatus ?? payload.openClawDaemonStatus
+    openclaw?.daemonStatus ??
+    resultPayload?.openClawDaemonStatus ??
+    payload.openClawDaemonStatus
   );
-  const version = safeString(openclaw?.version ?? payload.openClawVersion);
+  const version = safeString(
+    openclaw?.version ?? resultPayload?.openClawVersion ?? payload.openClawVersion
+  );
   const gatewayStatus = normalizeOpenClawGatewayStatus(
-    openclaw?.gatewayStatus ?? payload.openClawGatewayStatus
+    openclaw?.gatewayStatus ??
+    resultPayload?.openClawGatewayStatus ??
+    payload.openClawGatewayStatus
   );
 
   if (!openclaw && !version && daemonStatus === "unknown" && gatewayStatus === "unknown") {
@@ -2103,17 +2359,75 @@ export async function fetchControllerTaskResults(options: {
     initiatedByUserId: options.initiatedByUserId,
   });
 
-  await persistControllerTaskResultLog({
-    vpsId: options.vps.id,
-    taskId: options.taskId,
-    responseStatusCode: response.responseStatusCode,
-    responsePayload: response.responsePayload,
-    durationMs: response.durationMs,
-    initiatedByUserId: options.initiatedByUserId,
-    createdAt: new Date(),
-  });
+  const command = extractControllerCommandFromPayload(response.responsePayload);
+
+  if (isScriptCommand(command)) {
+    await persistControllerTaskResultLog({
+      vpsId: options.vps.id,
+      taskId: options.taskId,
+      responseStatusCode: response.responseStatusCode,
+      responsePayload: response.responsePayload,
+      durationMs: response.durationMs,
+      initiatedByUserId: options.initiatedByUserId,
+      createdAt: new Date(),
+    });
+  } else {
+    await persistControllerCommandResultLog({
+      vpsId: options.vps.id,
+      taskId: options.taskId,
+      responseStatusCode: response.responseStatusCode,
+      responsePayload: response.responsePayload,
+      durationMs: response.durationMs,
+      initiatedByUserId: options.initiatedByUserId,
+      createdAt: new Date(),
+    });
+  }
 
   return response;
+}
+
+export async function dispatchOpenClawUpdateCommand(options: {
+  vps: ControllerConnectionDetails;
+  taskResultWebhookUrlTemplate?: string;
+  initiatedByUserId: string;
+}) {
+  return performControllerRequest({
+    vps: options.vps,
+    interactionType: "command_dispatch",
+    requestMethod: "POST",
+    requestPath: "/api/commands",
+    requestPayload: {
+      command: "openclawUpdate",
+      callback: options.taskResultWebhookUrlTemplate
+        ? {
+          taskResultWebhookUrlTemplate: options.taskResultWebhookUrlTemplate,
+        }
+        : undefined,
+    },
+    initiatedByUserId: options.initiatedByUserId,
+  });
+}
+
+export async function dispatchOpenClawGatewayRestartCommand(options: {
+  vps: ControllerConnectionDetails;
+  taskResultWebhookUrlTemplate?: string;
+  initiatedByUserId: string;
+}) {
+  return performControllerRequest({
+    vps: options.vps,
+    interactionType: "command_dispatch",
+    requestMethod: "POST",
+    requestPath: "/api/commands",
+    requestPayload: {
+      command: "openclawGatewayRestart",
+      callback: options.taskResultWebhookUrlTemplate
+        ? {
+          taskResultWebhookUrlTemplate: options.taskResultWebhookUrlTemplate,
+        }
+        : undefined,
+    },
+    initiatedByUserId: options.initiatedByUserId,
+  });
 }
 
 export async function clearVpsAlertStatus(options: {

@@ -4,6 +4,8 @@ import { connectToDatabase } from "@/lib/mongodb";
 import {
   AlertLockedVpsError,
   dispatchExecuteScriptCommand,
+  dispatchOpenClawGatewayRestartCommand,
+  dispatchOpenClawUpdateCommand,
   findVpsById,
   getActorFromRequest,
   getControllerConnectionDetails,
@@ -32,15 +34,53 @@ export async function POST(
 
   const body = await request.json().catch(() => null);
 
-  if (!body || typeof body !== "object" || body.command !== "executeScript") {
+  if (!body || typeof body !== "object") {
     return NextResponse.json(
-      { error: "Only the executeScript command is currently supported." },
+      {
+        error:
+          "Supported commands are executeScript, openclawUpdate, and openclawGatewayRestart.",
+      },
       { status: 400 }
     );
   }
 
   try {
     const controller = getControllerConnectionDetails(item);
+    const taskResultWebhookUrlTemplate = `${request.nextUrl.origin}/api/vps/${id}/commands/{taskId}/results`;
+    const command = (body as { command?: unknown }).command;
+
+    if (command === "openclawUpdate") {
+      const response = await dispatchOpenClawUpdateCommand({
+        vps: controller,
+        taskResultWebhookUrlTemplate,
+        initiatedByUserId: getActorFromRequest(request),
+      });
+
+      const status = response.responseStatusCode ?? (response.result === "timeout" ? 504 : 502);
+      return NextResponse.json(response.responsePayload ?? response, { status });
+    }
+
+    if (command === "openclawGatewayRestart") {
+      const response = await dispatchOpenClawGatewayRestartCommand({
+        vps: controller,
+        taskResultWebhookUrlTemplate,
+        initiatedByUserId: getActorFromRequest(request),
+      });
+
+      const status = response.responseStatusCode ?? (response.result === "timeout" ? 504 : 502);
+      return NextResponse.json(response.responsePayload ?? response, { status });
+    }
+
+    if (command !== "executeScript") {
+      return NextResponse.json(
+        {
+          error:
+            "Supported commands are executeScript, openclawUpdate, and openclawGatewayRestart.",
+        },
+        { status: 400 }
+      );
+    }
+
     const rawMouseConfig = (body as { mouseActivityConfig?: unknown }).mouseActivityConfig;
     const requestMouseConfig =
       rawMouseConfig && typeof rawMouseConfig === "object" && !Array.isArray(rawMouseConfig)
@@ -94,7 +134,7 @@ export async function POST(
           : controller.defaultMouseActivityEnabled,
       mouseActivityConfig,
       script: (body as { script?: unknown }).script,
-      taskResultWebhookUrlTemplate: `${request.nextUrl.origin}/api/vps/${id}/commands/{taskId}/results`,
+      taskResultWebhookUrlTemplate,
       profileVisitLookupUrlTemplate:
         `${request.nextUrl.origin}/api/vps/${id}/profile-history/check` +
         `?profileUrl={profileUrl}&lookbackDays={lookbackDays}`,
